@@ -4,14 +4,13 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: thumbnail-grabber:latest
+    image: ghcr.io/reckertiii/thumbnailgrabber:latest
     ports:
       - "8000:8000"
-    env_file:
-      - .env
     environment:
-      - TG_OUTPUT_DIR=/app/captures
       - TG_STREAM_SOURCE=${TG_STREAM_SOURCE:-0}
+      - TG_OUTPUT_DIR=/app/captures
+      - TZ=${TZ:-America/New_York}
     volumes:
       - ./captures:/app/captures
       - ./models:/app/models

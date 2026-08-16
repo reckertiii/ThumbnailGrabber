@@ -10,7 +10,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PORT=8000 \
     HOST=0.0.0.0
 
-# Install required system runtime libraries for OpenCV, MediaPipe, and FFMPEG
+# Install required system runtime libraries for OpenCV, MediaPipe, FFMPEG, and Timezone support
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     libglib2.0-0 \
@@ -18,6 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     curl \
     ca-certificates \
+    tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
