@@ -1,0 +1,1040 @@
+import cv2
+import numpy as np
+import math
+import os
+import time
+import urllib.request
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Optional, Tuple, Dict, Any, List
+
+os.environ["GLOG_minloglevel"] = "2"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
+import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
+
+from config import QualityWeights, QualityThresholds
+from preference_model import UserPreferenceModel
+
+# Standard 21 Hand Landmark skeleton connections
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),           # Thumb
+    (0, 5), (5, 6), (6, 7), (7, 8),           # Index finger
+    (5, 9), (9, 10), (10, 11), (11, 12),      # Middle finger
+    (9, 13), (13, 14), (14, 15), (15, 16),    # Ring finger
+    (13, 17), (0, 17), (17, 18), (18, 19), (19, 20) # Pinky
+]
+
+@dataclass
+class SingleFaceAnalysis:
+    person_id: int = 1
+    bbox: Tuple[int, int, int, int] = (0, 0, 0, 0)
+    score: float = 0.0
+    is_qualified: bool = False
+    is_selected: bool = True       # Whether this person is actively selected for scoring
+    
+    # Angles (degrees)
+    yaw_deg: float = 0.0
+    pitch_deg: float = 0.0
+    roll_deg: float = 0.0
+    
+    # Shoulder / Posture Metrics
+    shoulder_tilt_deg: float = 0.0
+    is_shoulders_level: bool = True
+    is_shoulder_tilted: bool = False
+    shoulder_detected: bool = False
+    shoulder_score: float = 1.0
+    shoulder_points: Optional[Tuple[Tuple[int, int], Tuple[int, int]]] = None
+    
+    # Metrics
+    avg_ear: float = 0.35
+    is_blinking: bool = False
+    smile_ratio: float = 0.50
+    is_smiling: bool = False
+    is_awkward_expression: bool = False
+    is_looking_down: bool = False
+    mar: float = 0.20
+    
+    # Score Breakdown
+    head_pose_score: float = 0.0
+    eye_openness_score: float = 0.0
+    expression_score: float = 0.0
+    shoulder_pose_score: float = 1.0
+    sharpness_score: float = 0.0
+    exposure_score: float = 1.0
+    centering_score: float = 0.5
+    
+    laplacian_variance: float = 0.0
+    face_brightness: float = 128.0
+    mesh_points: Optional[np.ndarray] = None
+
+@dataclass
+class AnalysisResult:
+    face_detected: bool = False
+    people_detected_count: int = 0
+    target_person_count: int = 1
+    overall_score: float = 0.0
+    smoothed_score: float = 0.0    # EMA-smoothed composite score
+    ml_score: float = 0.5          # Machine learning preference model score (0.0 - 1.0)
+    ml_trained: bool = False       # Whether ML model is trained
+    is_qualified: bool = False
+    is_stable: bool = False        # Whether score is stable (low variance over recent frames)
+    
+    # Primary (First) Face Detailed Breakdown (for backward compatibility & single-person telemetry)
+    head_pose_score: float = 0.0
+    eye_openness_score: float = 0.0
+    expression_score: float = 0.0
+    shoulder_pose_score: float = 1.0
+    sharpness_score: float = 0.0
+    hand_pose_score: float = 1.0
+    exposure_score: float = 1.0
+    centering_score: float = 0.5
+    
+    # Angles (Primary Face)
+    yaw_deg: float = 0.0
+    pitch_deg: float = 0.0
+    roll_deg: float = 0.0
+    
+    # Shoulder / Posture Metrics (Primary Face)
+    shoulder_tilt_deg: float = 0.0
+    is_shoulders_level: bool = True
+    is_shoulder_tilted: bool = False
+    shoulder_detected: bool = False
+    shoulder_points: Optional[Tuple[Tuple[int, int], Tuple[int, int]]] = None
+    
+    # Metrics (Primary Face)
+    left_ear: float = 0.35
+    right_ear: float = 0.35
+    avg_ear: float = 0.35
+    is_blinking: bool = False
+    
+    mar: float = 0.20
+    smile_ratio: float = 0.50
+    is_smiling: bool = False
+    is_awkward_expression: bool = False
+    
+    laplacian_variance: float = 0.0
+    face_brightness: float = 128.0
+    hands_covering_face: bool = False
+    is_hand_blurry: bool = False
+    is_hand_weird: bool = False
+    is_looking_down: bool = False
+    hands_detected_count: int = 0
+    
+    # Primary Face Bounding Box & Landmarks
+    face_bbox: Optional[Tuple[int, int, int, int]] = None
+    mesh_points: Optional[np.ndarray] = None
+    hand_skeletons: Optional[List[List[Tuple[int, int]]]] = field(default_factory=list)
+    pose_skeletons: Optional[List[Dict[str, Any]]] = field(default_factory=list)
+    
+    # List of all analyzed individual faces (up to 6)
+    faces: List[SingleFaceAnalysis] = field(default_factory=list)
+
+class PersonQualityAnalyzer:
+    YUNET_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+    YUNET_PATH = os.path.join(os.getcwd(), "models", "yunet.onnx")
+    
+    HAND_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+    HAND_MODEL_PATH = os.path.join(os.getcwd(), "models", "hand_landmarker.task")
+
+    POSE_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
+    POSE_MODEL_PATH = os.path.join(os.getcwd(), "models", "pose_landmarker_lite.task")
+
+    def __init__(self, weights: Optional[QualityWeights] = None, thresholds: Optional[QualityThresholds] = None,
+                 ema_alpha: float = 0.3, stability_window: int = 10, stability_threshold: float = 0.08,
+                 blink_suppression_ms: int = 300, max_people_target: int = 1,
+                 selected_person_ids: Optional[List[int]] = None):
+        self.weights = weights or QualityWeights()
+        self.thresholds = thresholds or QualityThresholds()
+        self.max_people_target = max(1, min(6, max_people_target))  # Clamp between 1 and 6
+        self.selected_person_ids: set = set(selected_person_ids if selected_person_ids is not None else [1, 2, 3, 4, 5, 6])
+        
+        # User Preference ML Model (Scikit-Learn)
+        self.preference_model = UserPreferenceModel()
+        
+        # Temporal smoothing state
+        self._ema_alpha = ema_alpha
+        self._ema_score: Optional[float] = None
+        
+        # Score stability tracking
+        self._stability_window = stability_window
+        self._stability_threshold = stability_threshold
+        self._recent_scores: deque = deque(maxlen=stability_window)
+        
+        # Blink suppression
+        self._blink_suppression_ms = blink_suppression_ms
+        self._last_blink_time: float = 0.0
+        self._blink_suppressed: bool = False
+        
+        # Consecutive qualified frame counter
+        self._consecutive_qualified: int = 0
+        
+        # Face detection persistence (caches up to 6 faces)
+        self._face_persistence_frames: int = 8
+        self._frames_since_last_face: int = 999
+        self._last_detected_faces: List[np.ndarray] = []
+        self._smooth_bboxes: Dict[int, Tuple[float, float, float, float]] = {}  # Per-person EMA smoothed bboxes
+        self._bbox_ema_alpha: float = 0.20
+        
+        self._ensure_models_exist()
+        
+        # Calibrated YuNet score threshold (0.45) + robust skin chroma check for 100% human face recognition
+        self.detector = cv2.FaceDetectorYN.create(
+            self.YUNET_PATH, "", (320, 320), score_threshold=0.45, nms_threshold=0.3
+        )
+        self.current_input_size = (320, 320)
+        
+        # Initialize MediaPipe HandLandmarker
+        self.hand_landmarker = None
+        try:
+            base_options = mp_python.BaseOptions(model_asset_path=self.HAND_MODEL_PATH)
+            hand_options = mp_vision.HandLandmarkerOptions(
+                base_options=base_options,
+                num_hands=2,
+                min_hand_detection_confidence=0.4,
+                min_hand_presence_confidence=0.4,
+                min_tracking_confidence=0.4
+            )
+            self.hand_landmarker = mp_vision.HandLandmarker.create_from_options(hand_options)
+        except Exception as e:
+            print(f"[PersonQualityAnalyzer] Warning initializing HandLandmarker: {e}")
+
+        # Initialize MediaPipe PoseLandmarker
+        self.pose_landmarker = None
+        try:
+            pose_base_options = mp_python.BaseOptions(model_asset_path=self.POSE_MODEL_PATH)
+            pose_options = mp_vision.PoseLandmarkerOptions(
+                base_options=pose_base_options,
+                num_poses=6,
+                min_pose_detection_confidence=0.35,
+                min_pose_presence_confidence=0.35,
+                min_tracking_confidence=0.35
+            )
+            self.pose_landmarker = mp_vision.PoseLandmarker.create_from_options(pose_options)
+        except Exception as e:
+            print(f"[PersonQualityAnalyzer] Warning initializing PoseLandmarker: {e}")
+        
+        # 3D Canonical Head Model for solvePnP
+        self.model_3d_points = np.array([
+            (0.0, 0.0, 0.0),             # Nose tip
+            (0.0, -330.0, -65.0),        # Chin
+            (-225.0, 170.0, -135.0),     # Right eye center
+            (225.0, 170.0, -135.0),      # Left eye center
+            (-150.0, -150.0, -125.0),    # Right mouth corner
+            (150.0, -150.0, -125.0)      # Left mouth corner
+        ], dtype=np.float64)
+
+    def _ensure_models_exist(self):
+        os.makedirs(os.path.join(os.getcwd(), "models"), exist_ok=True)
+        if not os.path.exists(self.YUNET_PATH):
+            print(f"[PersonQualityAnalyzer] Downloading YuNet Face Detector to '{self.YUNET_PATH}'...")
+            try:
+                urllib.request.urlretrieve(self.YUNET_URL, self.YUNET_PATH)
+            except Exception as e:
+                print(f"Error downloading YuNet: {e}")
+
+        if not os.path.exists(self.HAND_MODEL_PATH):
+            print(f"[PersonQualityAnalyzer] Downloading MediaPipe HandLandmarker to '{self.HAND_MODEL_PATH}'...")
+            try:
+                urllib.request.urlretrieve(self.HAND_MODEL_URL, self.HAND_MODEL_PATH)
+            except Exception as e:
+                print(f"Error downloading HandLandmarker: {e}")
+
+        if not os.path.exists(self.POSE_MODEL_PATH):
+            print(f"[PersonQualityAnalyzer] Downloading MediaPipe PoseLandmarker to '{self.POSE_MODEL_PATH}'...")
+            try:
+                urllib.request.urlretrieve(self.POSE_MODEL_URL, self.POSE_MODEL_PATH)
+            except Exception as e:
+                print(f"Error downloading PoseLandmarker: {e}")
+
+    @staticmethod
+    def compute_shoulder_tilt_angle(pt_left: Tuple[float, float], pt_right: Tuple[float, float]) -> float:
+        """Computes the absolute angle in degrees of the shoulder line relative to horizontal.
+        
+        0.0° is perfectly level.
+        """
+        dx = abs(float(pt_right[0]) - float(pt_left[0]))
+        dy = abs(float(pt_right[1]) - float(pt_left[1]))
+        if dx < 1e-6:
+            return 90.0 if dy > 0 else 0.0
+        angle_rad = math.atan2(dy, dx)
+        return round(math.degrees(angle_rad), 1)
+
+    def compute_shoulder_score(self, tilt_deg: float) -> Tuple[float, bool]:
+        """Returns (shoulder_score: float, is_level: bool) based on max_shoulder_tilt_deg threshold."""
+        max_tilt = max(1.0, self.thresholds.max_shoulder_tilt_deg)
+        is_level = tilt_deg <= max_tilt
+        if tilt_deg <= 3.0:
+            score = 1.0
+        elif tilt_deg <= max_tilt:
+            score = 1.0 - 0.35 * ((tilt_deg - 3.0) / max(0.1, max_tilt - 3.0))
+        else:
+            score = max(0.0, 0.65 - 0.65 * ((tilt_deg - max_tilt) / max_tilt))
+        return round(max(0.0, min(1.0, score)), 2), is_level
+
+    def _finalize_face_score(self, f_res: SingleFaceAnalysis):
+        """Calculates single face composite score and qualification after all metrics (including shoulders) are set."""
+        w = self.weights
+        raw_score = (
+            w.head_pose * f_res.head_pose_score +
+            w.eye_openness * f_res.eye_openness_score +
+            w.expression * f_res.expression_score +
+            w.shoulder_pose * f_res.shoulder_pose_score +
+            w.sharpness * f_res.sharpness_score +
+            w.hand_pose * 1.0 +
+            w.exposure * f_res.exposure_score +
+            w.centering * f_res.centering_score
+        )
+
+        if f_res.is_looking_down:
+            raw_score *= 0.50
+        if f_res.is_blinking:
+            raw_score *= 0.25
+        if f_res.is_awkward_expression:
+            raw_score *= 0.35
+        if f_res.is_shoulder_tilted:
+            raw_score *= 0.65
+        if f_res.laplacian_variance < self.thresholds.min_sharpness_laplacian:
+            raw_score *= 0.75
+
+        f_res.score = round(max(0.0, min(1.0, raw_score)), 3)
+        f_res.is_qualified = (
+            f_res.score >= self.thresholds.min_overall_score and
+            abs(f_res.yaw_deg) <= self.thresholds.max_yaw_deg and
+            not f_res.is_blinking and
+            not f_res.is_looking_down and
+            not f_res.is_awkward_expression and
+            f_res.is_shoulders_level
+        )
+
+    def analyze_frame(self, frame: np.ndarray) -> AnalysisResult:
+        result = AnalysisResult()
+        result.target_person_count = self.max_people_target
+        orig_h, orig_w, c = frame.shape
+        if orig_h == 0 or orig_w == 0:
+            return result
+        
+        # Downscale frame for analysis (max width 640)
+        target_w = 640
+        if orig_w > target_w:
+            scale = target_w / float(orig_w)
+            target_h = int(orig_h * scale)
+            proc_frame = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+        else:
+            scale = 1.0
+            target_h, target_w = orig_h, orig_w
+            proc_frame = frame
+
+        # Update YuNet detector input size
+        if self.current_input_size != (target_w, target_h):
+            self.detector.setInputSize((target_w, target_h))
+            self.current_input_size = (target_w, target_h)
+            
+        # Detect all faces in frame
+        faces_detected = self.detector.detect(proc_frame)
+        
+        # === Spatial Centroid Tracking & Slot Lock ===
+        # Match incoming face detections to persistent person_id slots (1 to 6) based on spatial distance.
+        # This prevents ID swapping / jumping face windows when people move or scale slightly.
+        current_detections = []
+        if faces_detected[1] is not None and len(faces_detected[1]) > 0:
+            for f in faces_detected[1]:
+                fw, fh = int(f[2]), int(f[3])
+                fx, fy = int(f[0]), int(f[1])
+                if fw > 15 and fh > 15:
+                    aspect = float(fw) / float(fh)
+                    if 0.40 <= aspect <= 1.60:
+                        # Verify skin tone presence to reject cymbals, drums & hardware
+                        if self._is_valid_human_skin_roi(proc_frame, fx, fy, fw, fh):
+                            cx = fx + fw / 2.0
+                            cy = fy + fh / 2.0
+                            current_detections.append({'face': f, 'cx': cx, 'cy': cy, 'area': fw * fh})
+
+        # Match new detections to existing tracked slots (1 to 6)
+        matched_slots: Dict[int, np.ndarray] = {}
+        unmatched_detections = list(current_detections)
+        
+        # 1. Match existing active slots to nearest new detection
+        if hasattr(self, '_tracked_slots'):
+            for pid, slot_info in list(self._tracked_slots.items()):
+                if not unmatched_detections:
+                    break
+                tcx, tcy = slot_info['cx'], slot_info['cy']
+                # Find nearest detection within 140px
+                best_match_idx = None
+                min_dist = 999999.0
+                for idx, det in enumerate(unmatched_detections):
+                    dist = math.hypot(det['cx'] - tcx, det['cy'] - tcy)
+                    if dist < 140.0 and dist < min_dist:
+                        min_dist = dist
+                        best_match_idx = idx
+
+                if best_match_idx is not None:
+                    matched_det = unmatched_detections.pop(best_match_idx)
+                    matched_slots[pid] = matched_det['face']
+                    self._tracked_slots[pid] = {
+                        'cx': matched_det['cx'], 'cy': matched_det['cy'],
+                        'face': matched_det['face'], 'missed': 0
+                    }
+                else:
+                    # Increment missed frames grace period
+                    slot_info['missed'] += 1
+                    if slot_info['missed'] <= self._face_persistence_frames:
+                        matched_slots[pid] = slot_info['face']
+                    else:
+                        del self._tracked_slots[pid]
+                        if pid in self._smooth_bboxes:
+                            del self._smooth_bboxes[pid]
+        else:
+            self._tracked_slots = {}
+
+        # 2. Assign remaining unmatched detections to free slots (1 to 6)
+        # Sort remaining unmatched by area descending
+        unmatched_detections.sort(key=lambda d: d['area'], reverse=True)
+        for det in unmatched_detections:
+            # Find lowest available slot ID between 1 and max_people_target
+            free_pid = None
+            for candidate_pid in range(1, self.max_people_target + 1):
+                if candidate_pid not in matched_slots and candidate_pid not in self._tracked_slots:
+                    free_pid = candidate_pid
+                    break
+            
+            if free_pid is not None:
+                matched_slots[free_pid] = det['face']
+                self._tracked_slots[free_pid] = {
+                    'cx': det['cx'], 'cy': det['cy'],
+                    'face': det['face'], 'missed': 0
+                }
+
+        # Filter slots to up to max_people_target
+        active_pids = sorted([p for p in matched_slots.keys() if p <= self.max_people_target])
+
+        if not active_pids:
+            result.face_detected = False
+            result.people_detected_count = 0
+            self._smooth_bboxes.clear()
+            return result
+
+        result.face_detected = True
+        result.people_detected_count = len(active_pids)
+        
+        # Analyze each individual face (up to 6)
+        analyzed_faces: List[SingleFaceAnalysis] = []
+        any_blinking = False
+
+        for pid in active_pids:
+            face_data = matched_slots[pid]
+            face_analysis = self._analyze_single_face(pid, face_data, frame, orig_w, orig_h, scale)
+            face_analysis.is_selected = (pid in self.selected_person_ids)
+            analyzed_faces.append(face_analysis)
+            if face_analysis.is_selected and face_analysis.is_blinking:
+                any_blinking = True
+
+        result.faces = analyzed_faces
+        
+        # MediaPipe Hand and Pose Tracking across the frame
+        result.hand_skeletons = []
+        result.pose_skeletons = []
+        result.hands_covering_face = False
+        result.is_hand_blurry = False
+        result.is_hand_weird = False
+        result.hands_detected_count = 0
+        
+        mp_image = None
+        if self.hand_landmarker is not None or self.pose_landmarker is not None:
+            try:
+                rgb_proc = cv2.cvtColor(proc_frame, cv2.COLOR_BGR2RGB)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_proc)
+            except Exception:
+                pass
+
+        # 1. Hand Tracking
+        if self.hand_landmarker is not None and mp_image is not None:
+            try:
+                hand_result = self.hand_landmarker.detect(mp_image)
+                if hand_result and hand_result.hand_landmarks:
+                    result.hands_detected_count = len(hand_result.hand_landmarks)
+                    for hand_pts in hand_result.hand_landmarks:
+                        pts_full_res = []
+                        xs, ys = [], []
+                        for pt in hand_pts:
+                            px = int(pt.x * target_w / scale)
+                            py = int(pt.y * target_h / scale)
+                            pts_full_res.append((px, py))
+                            xs.append(px)
+                            ys.append(py)
+                            
+                            # Check against all detected face bboxes
+                            for f_item in analyzed_faces:
+                                bx, by, bw, bh = f_item.bbox
+                                if bx <= px <= bx + bw and by <= py <= by + bh:
+                                    result.hands_covering_face = True
+
+                        result.hand_skeletons.append(pts_full_res)
+                        
+                        min_x, max_x = max(0, min(xs)), min(orig_w, max(xs))
+                        min_y, max_y = max(0, min(ys)), min(orig_h, max(ys))
+                        hand_crop = frame[min_y:max_y, min_x:max_x]
+                        
+                        if hand_crop.size > 0:
+                            hand_gray = cv2.cvtColor(hand_crop, cv2.COLOR_BGR2GRAY)
+                            hand_lap_var = float(cv2.Laplacian(hand_gray, cv2.CV_64F).var())
+                            if hand_lap_var < 20.0 or (analyzed_faces[0].laplacian_variance > 50 and hand_lap_var < analyzed_faces[0].laplacian_variance * 0.25):
+                                result.is_hand_blurry = True
+
+                        index_tip = np.array(pts_full_res[8])
+                        pinky_tip = np.array(pts_full_res[20])
+                        hand_span = np.linalg.norm(index_tip - pinky_tip)
+                        
+                        primary_bbox = analyzed_faces[0].bbox
+                        if primary_bbox is not None:
+                            bx, by, bw, bh = primary_bbox
+                            if min_y <= by + bh and hand_span > bw * 0.5:
+                                result.is_hand_weird = True
+            except Exception:
+                pass
+
+        result.hand_pose_score = 1.0
+
+        # 2. Pose & Shoulder Tracking
+        if self.pose_landmarker is not None and mp_image is not None:
+            try:
+                pose_result = self.pose_landmarker.detect(mp_image)
+                if pose_result and pose_result.pose_landmarks:
+                    for pose_lms in pose_result.pose_landmarks:
+                        if len(pose_lms) > 12:
+                            lm_nose = pose_lms[0]
+                            lm_ls = pose_lms[11]  # Left shoulder (anatomical left)
+                            lm_rs = pose_lms[12]  # Right shoulder (anatomical right)
+                            
+                            nose_pt = (int(lm_nose.x * target_w / scale), int(lm_nose.y * target_h / scale))
+                            ls_pt = (int(lm_ls.x * target_w / scale), int(lm_ls.y * target_h / scale))
+                            rs_pt = (int(lm_rs.x * target_w / scale), int(lm_rs.y * target_h / scale))
+                            
+                            ls_vis = getattr(lm_ls, 'visibility', 1.0)
+                            rs_vis = getattr(lm_rs, 'visibility', 1.0)
+                            ls_pres = getattr(lm_ls, 'presence', 1.0)
+                            rs_pres = getattr(lm_rs, 'presence', 1.0)
+                            
+                            shoulders_visible = (
+                                (ls_vis is None or ls_vis > 0.3) and
+                                (rs_vis is None or rs_vis > 0.3) and
+                                (ls_pres is None or ls_pres > 0.3) and
+                                (rs_pres is None or rs_pres > 0.3)
+                            )
+                            
+                            # Match this pose to closest face in analyzed_faces
+                            matched_face = None
+                            min_dist = float('inf')
+                            for f_item in analyzed_faces:
+                                bx, by, bw, bh = f_item.bbox
+                                fcx = bx + bw / 2.0
+                                fcy = by + bh / 2.0
+                                mid_sx = (ls_pt[0] + rs_pt[0]) / 2.0
+                                mid_sy = (ls_pt[1] + rs_pt[1]) / 2.0
+                                dist_nose = math.hypot(nose_pt[0] - fcx, nose_pt[1] - fcy)
+                                dist_mid = math.hypot(mid_sx - fcx, mid_sy - (by + bh))
+                                dist = min(dist_nose, dist_mid)
+                                
+                                if dist < max(bw * 2.5, bh * 2.5) and dist < min_dist:
+                                    min_dist = dist
+                                    matched_face = f_item
+
+                            tilt_deg = 0.0
+                            is_level = True
+                            sh_score = 1.0
+                            if shoulders_visible:
+                                tilt_deg = self.compute_shoulder_tilt_angle(ls_pt, rs_pt)
+                                sh_score, is_level = self.compute_shoulder_score(tilt_deg)
+                                
+                            pose_dict = {
+                                'left_shoulder': ls_pt,
+                                'right_shoulder': rs_pt,
+                                'tilt_deg': tilt_deg,
+                                'is_level': is_level,
+                                'score': sh_score,
+                                'visible': shoulders_visible,
+                                'person_id': matched_face.person_id if matched_face else None
+                            }
+                            if len(pose_lms) > 14:
+                                pose_dict['left_elbow'] = (int(pose_lms[13].x * target_w / scale), int(pose_lms[13].y * target_h / scale))
+                                pose_dict['right_elbow'] = (int(pose_lms[14].x * target_w / scale), int(pose_lms[14].y * target_h / scale))
+                            result.pose_skeletons.append(pose_dict)
+                            
+                            if matched_face is not None:
+                                matched_face.shoulder_detected = shoulders_visible
+                                matched_face.shoulder_points = (ls_pt, rs_pt) if shoulders_visible else None
+                                matched_face.shoulder_tilt_deg = tilt_deg
+                                matched_face.is_shoulders_level = is_level
+                                matched_face.is_shoulder_tilted = not is_level
+                                matched_face.shoulder_score = sh_score
+                                matched_face.shoulder_pose_score = sh_score
+            except Exception:
+                pass
+
+        # Finalize score and qualification across all analyzed faces (incorporating shoulder metrics)
+        for f_item in analyzed_faces:
+            self._finalize_face_score(f_item)
+
+        # Populate root level fields from Primary (First) Face for telemetry & backward compatibility
+        primary = analyzed_faces[0]
+        result.face_bbox = primary.bbox
+        result.head_pose_score = primary.head_pose_score
+        result.eye_openness_score = primary.eye_openness_score
+        result.expression_score = primary.expression_score
+        result.shoulder_pose_score = primary.shoulder_pose_score
+        result.sharpness_score = primary.sharpness_score
+        result.exposure_score = primary.exposure_score
+        result.centering_score = primary.centering_score
+        result.yaw_deg = primary.yaw_deg
+        result.pitch_deg = primary.pitch_deg
+        result.roll_deg = primary.roll_deg
+        result.shoulder_tilt_deg = primary.shoulder_tilt_deg
+        result.is_shoulders_level = primary.is_shoulders_level
+        result.is_shoulder_tilted = primary.is_shoulder_tilted
+        result.shoulder_detected = primary.shoulder_detected
+        result.shoulder_points = primary.shoulder_points
+        result.left_ear = primary.avg_ear
+        result.right_ear = primary.avg_ear
+        result.avg_ear = primary.avg_ear
+        result.is_blinking = primary.is_blinking
+        result.mar = primary.mar
+        result.smile_ratio = primary.smile_ratio
+        result.is_smiling = primary.is_smiling
+        result.is_awkward_expression = primary.is_awkward_expression
+        result.is_looking_down = primary.is_looking_down
+        result.laplacian_variance = primary.laplacian_variance
+        result.face_brightness = primary.face_brightness
+        result.mesh_points = primary.mesh_points
+
+        # Composite Overall Score Calculation strictly for ACTIVE SELECTED faces
+        selected_face_scores = [f.score for f in analyzed_faces if f.is_selected]
+        
+        if not selected_face_scores:
+            # All detected faces are unselected / ignored
+            raw_score = 0.0
+        elif len(selected_face_scores) == 1:
+            raw_score = selected_face_scores[0]
+        else:
+            min_s = min(selected_face_scores)
+            avg_s = sum(selected_face_scores) / len(selected_face_scores)
+            raw_score = 0.60 * min_s + 0.40 * avg_s
+
+        # Apply global environmental/gesture penalties
+        if result.is_hand_weird:
+            raw_score *= 0.55
+        if result.hands_covering_face:
+            raw_score *= 0.10
+        if result.is_hand_blurry:
+            raw_score *= 0.45
+
+        rule_score = max(0.0, min(1.0, raw_score))
+        
+        # Scikit-Learn Machine Learning Preference Prediction
+        try:
+            features = UserPreferenceModel.extract_features(primary if primary else result)
+            ml_pred = self.preference_model.predict(features)
+            result.ml_score = ml_pred
+            result.ml_trained = self.preference_model.is_trained
+            
+            # Blend Rule Score (65%) and ML Model Score (35%) if trained
+            if self.preference_model.is_trained:
+                final_score = 0.65 * rule_score + 0.35 * ml_pred
+            else:
+                final_score = rule_score
+        except Exception:
+            result.ml_score = 0.5
+            result.ml_trained = False
+            final_score = rule_score
+
+        result.overall_score = round(max(0.0, min(1.0, final_score)), 3)
+        
+        # Temporal EMA Smoothing
+        if self._ema_score is None:
+            self._ema_score = result.overall_score
+        else:
+            self._ema_score = self._ema_alpha * result.overall_score + (1.0 - self._ema_alpha) * self._ema_score
+        result.smoothed_score = round(self._ema_score, 3)
+        
+        # Score Stability Check
+        self._recent_scores.append(result.overall_score)
+        if len(self._recent_scores) >= 3:
+            score_std = float(np.std(list(self._recent_scores)))
+            result.is_stable = score_std <= self._stability_threshold
+        else:
+            result.is_stable = False
+        
+        # Qualification check: ALL active selected faces must be individually qualified!
+        selected_faces = [f for f in analyzed_faces if f.is_selected]
+        all_faces_qualified = len(selected_faces) > 0 and all(f.is_qualified for f in selected_faces)
+        
+        basic_qualified = (
+            result.overall_score >= self.thresholds.min_overall_score and
+            all_faces_qualified and
+            not result.hands_covering_face and
+            not self._blink_suppressed
+        )
+        
+        if basic_qualified:
+            self._consecutive_qualified += 1
+        else:
+            self._consecutive_qualified = 0
+
+        result.is_qualified = (
+            basic_qualified and
+            result.is_stable and
+            self._consecutive_qualified >= 2
+        )
+
+        return result
+
+    def _analyze_single_face(self, person_id: int, best_face: np.ndarray, frame: np.ndarray,
+                            orig_w: int, orig_h: int, scale: float) -> SingleFaceAnalysis:
+        """Analyzes quality metrics for one specific face in the frame."""
+        f_res = SingleFaceAnalysis(person_id=person_id)
+        
+        fx_s, fy_s, fw_s, fh_s = int(best_face[0]), int(best_face[1]), int(best_face[2]), int(best_face[3])
+        
+        fx = int(fx_s / scale)
+        fy = int(fy_s / scale)
+        fw = int(fw_s / scale)
+        fh = int(fh_s / scale)
+        
+        fx, fy = max(0, fx), max(0, fy)
+        fw, fh = min(orig_w - fx, fw), min(orig_h - fy, fh)
+        
+        # EMA Bounding Box Smoothing per person slot
+        raw_bbox = (float(fx), float(fy), float(fw), float(fh))
+        if person_id not in self._smooth_bboxes:
+            self._smooth_bboxes[person_id] = raw_bbox
+        else:
+            a = self._bbox_ema_alpha
+            prev = self._smooth_bboxes[person_id]
+            self._smooth_bboxes[person_id] = (
+                a * raw_bbox[0] + (1 - a) * prev[0],
+                a * raw_bbox[1] + (1 - a) * prev[1],
+                a * raw_bbox[2] + (1 - a) * prev[2],
+                a * raw_bbox[3] + (1 - a) * prev[3],
+            )
+        
+        sm = self._smooth_bboxes[person_id]
+        f_res.bbox = (int(sm[0]), int(sm[1]), int(sm[2]), int(sm[3]))
+        
+        right_eye = (int(best_face[4] / scale), int(best_face[5] / scale))
+        left_eye = (int(best_face[6] / scale), int(best_face[7] / scale))
+        nose_tip = (int(best_face[8] / scale), int(best_face[9] / scale))
+        right_mouth = (int(best_face[10] / scale), int(best_face[11] / scale))
+        left_mouth = (int(best_face[12] / scale), int(best_face[13] / scale))
+        
+        mouth_center_x = (right_mouth[0] + left_mouth[0]) / 2.0
+        mouth_center_y = (right_mouth[1] + left_mouth[1]) / 2.0
+        chin = (int(mouth_center_x + (mouth_center_x - nose_tip[0]) * 0.3), int(mouth_center_y + (mouth_center_y - nose_tip[1]) * 1.5))
+        
+        landmarks_2d = np.array([nose_tip, chin, right_eye, left_eye, right_mouth, left_mouth], dtype=np.float64)
+        f_res.mesh_points = landmarks_2d.astype(int)
+
+        # 1. Image Sharpness on Face ROI
+        face_roi = frame[fy:fy+fh, fx:fx+fw]
+        if face_roi.size > 0:
+            gray_roi = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY)
+            lap_var = float(cv2.Laplacian(gray_roi, cv2.CV_64F).var())
+        else:
+            gray_roi = None
+            lap_var = 0.0
+            
+        f_res.laplacian_variance = lap_var
+        f_res.sharpness_score = min(1.0, lap_var / max(1.0, self.thresholds.min_sharpness_laplacian * 2.5))
+
+        # 2. Exposure & Centering
+        f_res.exposure_score, f_res.face_brightness = self._compute_exposure_score(face_roi, gray_roi)
+        f_res.centering_score = self._compute_centering_score(fx, fy, fw, fh, orig_w, orig_h)
+
+        # 3. Head Pose Estimation
+        yaw, pitch, roll, pose_score = self._compute_head_pose(landmarks_2d, orig_w, orig_h)
+        f_res.yaw_deg = yaw
+        f_res.pitch_deg = pitch
+        f_res.roll_deg = roll
+
+        eye_mid_y = (right_eye[1] + left_eye[1]) / 2.0
+        nose_eye_v = nose_tip[1] - eye_mid_y
+        nose_mouth_v = mouth_center_y - nose_tip[1]
+
+        is_looking_down_2d = False
+        if nose_eye_v > 5:
+            vert_ratio = nose_mouth_v / nose_eye_v
+            is_looking_down_2d = vert_ratio < 0.50
+
+        f_res.is_looking_down = is_looking_down_2d or pitch < -15.0
+        f_res.head_pose_score = round(pose_score, 2)
+
+        # 4. Eye Openness & Blink
+        eye_dist = np.linalg.norm(np.array(left_eye) - np.array(right_eye))
+        is_blink, avg_ear = self._detect_blink(
+            right_eye, left_eye, nose_tip, face_roi, gray_roi, fx, fy, fw, fh, eye_dist
+        )
+        f_res.avg_ear = round(avg_ear, 2)
+        f_res.is_blinking = is_blink
+        f_res.eye_openness_score = 0.0 if is_blink else 1.0
+
+        # 5. Expression Analysis
+        mouth_width = np.linalg.norm(np.array(left_mouth) - np.array(right_mouth))
+        smile_ratio = mouth_width / max(1.0, eye_dist)
+        f_res.smile_ratio = round(smile_ratio, 2)
+        is_smiling = (smile_ratio >= 0.72)
+        f_res.is_smiling = is_smiling
+
+        mouth_is_open = False
+        mar = 0.20
+        if face_roi.size > 0 and gray_roi is not None and gray_roi.shape[0] > 10:
+            m_left = max(0, int(min(right_mouth[0], left_mouth[0]) - fx))
+            m_right = min(fw, int(max(right_mouth[0], left_mouth[0]) - fx))
+            pad_x = int((m_right - m_left) * 0.15)
+            m_left = m_left + pad_x
+            m_right = m_right - pad_x
+            m_top = max(0, int(nose_tip[1] - fy + (mouth_center_y - nose_tip[1]) * 0.25))
+            m_bottom = min(fh, int(mouth_center_y - fy + (mouth_center_y - nose_tip[1]) * 0.7))
+
+            if m_right > m_left + 4 and m_bottom > m_top + 4:
+                mouth_roi = gray_roi[m_top:m_bottom, m_left:m_right]
+                if mouth_roi.size > 20:
+                    mh = mouth_roi.shape[0]
+                    if mh >= 6:
+                        upper_band = mouth_roi[:mh // 3, :]
+                        center_band = mouth_roi[mh // 3: 2 * mh // 3, :]
+                        if center_band.size > 0 and upper_band.size > 0:
+                            center_mean = float(np.mean(center_band))
+                            upper_mean = float(np.mean(upper_band))
+                            if upper_mean > 10:
+                                darkness_ratio = center_mean / upper_mean
+                                mouth_is_open = darkness_ratio < 0.70
+                                mar = round(max(0.0, min(1.0, 1.0 - darkness_ratio)), 2)
+
+                    mouth_std = float(np.std(mouth_roi))
+                    if mouth_std > 42.0:
+                        mouth_is_open = True
+                        mar = max(mar, 0.40)
+
+        f_res.mar = mar
+        f_res.is_awkward_expression = mouth_is_open and not is_smiling
+
+        if is_smiling:
+            expr_score = 1.0
+        elif not mouth_is_open:
+            expr_score = 0.95
+        else:
+            expr_score = 0.30
+
+        f_res.expression_score = round(expr_score, 2)
+
+        # Default Shoulder / Posture values (updated when pose landmarker runs on full frame)
+        f_res.shoulder_tilt_deg = 0.0
+        f_res.is_shoulders_level = True
+        f_res.is_shoulder_tilted = False
+        f_res.shoulder_detected = False
+        f_res.shoulder_score = 1.0
+        f_res.shoulder_pose_score = 1.0
+        f_res.shoulder_points = None
+
+        self._finalize_face_score(f_res)
+        return f_res
+
+    def _compute_exposure_score(self, face_roi: np.ndarray, gray_roi: Optional[np.ndarray]) -> Tuple[float, float]:
+        if face_roi is None or face_roi.size == 0 or gray_roi is None:
+            return 0.5, 128.0
+        
+        mean_brightness = float(np.mean(gray_roi))
+        min_b = self.thresholds.min_brightness
+        max_b = self.thresholds.max_brightness
+        ideal_low = 80.0
+        ideal_high = 180.0
+        
+        if ideal_low <= mean_brightness <= ideal_high:
+            exposure_score = 1.0
+        elif mean_brightness < min_b:
+            exposure_score = max(0.0, mean_brightness / min_b * 0.5)
+        elif mean_brightness > max_b:
+            exposure_score = max(0.0, (255.0 - mean_brightness) / (255.0 - max_b) * 0.5)
+        elif mean_brightness < ideal_low:
+            exposure_score = 0.5 + 0.5 * (mean_brightness - min_b) / (ideal_low - min_b)
+        else:
+            exposure_score = 0.5 + 0.5 * (max_b - mean_brightness) / (max_b - ideal_high)
+        
+        return round(max(0.0, min(1.0, exposure_score)), 2), round(mean_brightness, 1)
+
+    def _compute_centering_score(self, fx: int, fy: int, fw: int, fh: int,
+                                  frame_w: int, frame_h: int) -> float:
+        face_cx = fx + fw / 2.0
+        face_cy = fy + fh / 2.0
+        
+        frame_cx = frame_w / 2.0
+        frame_cy = frame_h / 2.0
+        
+        dx = abs(face_cx - frame_cx) / frame_cx
+        dy = abs(face_cy - frame_cy) / frame_cy
+        
+        center_dist = 0.6 * dx + 0.4 * dy
+        centering_score = max(0.0, 1.0 - center_dist * 1.2)
+        
+        face_area_ratio = (fw * fh) / (frame_w * frame_h)
+        if face_area_ratio < 0.02:
+            centering_score *= 0.5
+        elif face_area_ratio > 0.5:
+            centering_score *= 0.7
+        
+        return round(max(0.0, min(1.0, centering_score)), 2)
+
+    def _detect_blink(self, right_eye, left_eye, nose_tip, face_roi, gray_roi,
+                      fx, fy, fw, fh, eye_dist) -> Tuple[bool, float]:
+        if face_roi is None or face_roi.size == 0 or gray_roi is None:
+            return False, 0.30
+        
+        eye_results = []
+        for eye_center in [right_eye, left_eye]:
+            ex = eye_center[0] - fx
+            ey = eye_center[1] - fy
+            
+            eye_half_w = max(8, int(eye_dist * 0.15))
+            eye_half_h = max(5, int(eye_dist * 0.08))
+            
+            ey1 = max(0, ey - eye_half_h)
+            ey2 = min(gray_roi.shape[0], ey + eye_half_h)
+            ex1 = max(0, ex - eye_half_w)
+            ex2 = min(gray_roi.shape[1], ex + eye_half_w)
+            
+            eye_patch = gray_roi[ey1:ey2, ex1:ex2]
+            if eye_patch.size < 10:
+                eye_results.append(0.30)
+                continue
+            
+            patch_h = eye_patch.shape[0]
+            if patch_h >= 3:
+                upper_third = eye_patch[:patch_h // 3, :]
+                center_third = eye_patch[patch_h // 3: 2 * patch_h // 3, :]
+                lower_third = eye_patch[2 * patch_h // 3:, :]
+                
+                upper_mean = float(np.mean(upper_third)) if upper_third.size > 0 else 128.0
+                center_mean = float(np.mean(center_third)) if center_third.size > 0 else 128.0
+                lower_mean = float(np.mean(lower_third)) if lower_third.size > 0 else 128.0
+                
+                surround_mean = (upper_mean + lower_mean) / 2.0
+                if surround_mean > 5:
+                    contrast = (surround_mean - center_mean) / surround_mean
+                else:
+                    contrast = 0.0
+                
+                eye_std = float(np.std(eye_patch))
+                approx_ear = 0.15 + 0.25 * min(1.0, contrast * 3.0) + 0.10 * min(1.0, eye_std / 30.0)
+                eye_results.append(approx_ear)
+            else:
+                eye_results.append(0.30)
+        
+        avg_ear = sum(eye_results) / len(eye_results) if eye_results else 0.30
+        
+        pixel_blink = False
+        if gray_roi is not None and gray_roi.shape[0] > fh * 0.4:
+            eye_roi = gray_roi[int(fh * 0.2):int(fh * 0.4), :]
+            if eye_roi.size > 0:
+                eye_std = float(np.std(eye_roi))
+                pixel_blink = eye_std < 10.0
+        
+        geometric_blink = avg_ear < self.thresholds.min_ear
+        
+        if geometric_blink and pixel_blink:
+            is_blink = True
+        elif geometric_blink:
+            is_blink = avg_ear < (self.thresholds.min_ear - 0.03)
+        else:
+            is_blink = False
+        
+        return is_blink, avg_ear
+
+    def _compute_head_pose(self, landmarks_2d: np.ndarray, frame_w: int, frame_h: int) -> Tuple[float, float, float, float]:
+        focal_length = frame_w
+        center = (frame_w / 2, frame_h / 2)
+        camera_matrix = np.array([[focal_length, 0, center[0]], [0, focal_length, center[1]], [0, 0, 1]], dtype=np.float64)
+        dist_coeffs = np.zeros((4, 1))
+
+        success, rvec, tvec = cv2.solvePnP(
+            self.model_3d_points, landmarks_2d, camera_matrix, dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE
+        )
+
+        if not success:
+            return 0.0, 0.0, 0.0, 0.0
+
+        rmat, _ = cv2.Rodrigues(rvec)
+        sy = math.sqrt(rmat[0, 0] * rmat[0, 0] + rmat[1, 0] * rmat[1, 0])
+        if sy >= 1e-6:
+            pitch = math.degrees(math.atan2(rmat[2, 1], rmat[2, 2]))
+            yaw = math.degrees(math.atan2(-rmat[2, 0], sy))
+            roll = math.degrees(math.atan2(rmat[1, 0], rmat[0, 0]))
+        else:
+            pitch = math.degrees(math.atan2(-rmat[1, 2], rmat[1, 1]))
+            yaw = math.degrees(math.atan2(-rmat[2, 0], sy))
+            roll = 0.0
+
+        yaw_deg = self._normalize_angle(round(yaw, 1))
+        pitch_deg = self._normalize_angle(round(pitch, 1))
+        roll_deg = self._normalize_angle(round(roll, 1))
+
+        yaw_pen = min(1.0, abs(yaw_deg) / self.thresholds.max_yaw_deg)
+        pitch_pen = min(1.0, abs(pitch_deg) / self.thresholds.max_pitch_deg)
+        roll_pen = min(1.0, abs(roll_deg) / self.thresholds.max_roll_deg)
+        
+        pose_score = round(max(0.0, 1.0 - (0.45 * yaw_pen + 0.35 * pitch_pen + 0.20 * roll_pen)), 2)
+
+        return yaw_deg, pitch_deg, roll_deg, pose_score
+
+    @staticmethod
+    def _normalize_angle(angle_deg: float) -> float:
+        while angle_deg > 180.0:
+            angle_deg -= 360.0
+        while angle_deg < -180.0:
+            angle_deg += 360.0
+        
+        if angle_deg > 150.0:
+            angle_deg = angle_deg - 180.0
+        elif angle_deg < -150.0:
+            angle_deg = angle_deg + 180.0
+        
+        return round(angle_deg, 1)
+
+    @staticmethod
+    def _is_valid_human_skin_roi(frame_bgr: np.ndarray, fx: int, fy: int, fw: int, fh: int) -> bool:
+        """Verifies that candidate face ROI contains human skin tone pixels.
+        
+        Uses dual YCrCb + HSV warm-chroma checks.
+        Metallic objects like cymbals, snare drum heads, chrome hardware, and speakers have
+        0.0% skin chroma, whereas human faces easily exceed 15-40% skin pixels.
+        Rejects false detections on stage equipment while passing all real faces.
+        """
+        h, w = frame_bgr.shape[:2]
+        fx, fy = max(0, fx), max(0, fy)
+        fw, fh = min(w - fx, fw), min(h - fy, fh)
+        
+        if fw < 8 or fh < 8:
+            return False
+            
+        crop = frame_bgr[fy:fy+fh, fx:fx+fw]
+        if crop.size == 0:
+            return False
+            
+        # 1. YCrCb Skin Mask (broadened range for all skin tones and lighting)
+        ycrcb = cv2.cvtColor(crop, cv2.COLOR_BGR2YCrCb)
+        cr = ycrcb[:, :, 1]
+        cb = ycrcb[:, :, 2]
+        ycrcb_mask = (cr >= 125) & (cr <= 185) & (cb >= 70) & (cb <= 140)
+        
+        # 2. HSV Warm Chroma Mask (Hue: 0 to 25 or 165 to 180)
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        hue = hsv[:, :, 0]
+        sat = hsv[:, :, 1]
+        val = hsv[:, :, 2]
+        hsv_mask = ((hue <= 25) | (hue >= 165)) & (sat >= 20) & (val >= 30)
+        
+        combined_mask = ycrcb_mask | hsv_mask
+        skin_pixel_ratio = np.count_nonzero(combined_mask) / float(crop.shape[0] * crop.shape[1])
+        
+        # 4% threshold passes all human faces under any lighting while rejecting pure grey/metallic objects
+        return skin_pixel_ratio >= 0.04
