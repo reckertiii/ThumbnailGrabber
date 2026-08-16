@@ -1,0 +1,30 @@
+# Version Control
+.git/
+.gitignore
+
+# Environment & Secrets
+.env
+*.local
+
+# Python cache & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Captured output
+captures/
+test_captures/
+
+# OS artifacts
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# IDEs
+.idea/
+.vscode/
+.gemini/

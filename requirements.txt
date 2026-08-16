@@ -1,7 +1,15 @@
+# Core analysis engine
 opencv-python>=4.8.0
 mediapipe>=0.10.0,<1.0.0
 numpy>=1.24.0
-PyQt6>=6.5.0
 scipy>=1.10.0
 pillow>=9.5.0
 scikit-learn>=1.3.0
+joblib>=1.3.0
+
+# Desktop GUI
+PyQt6>=6.5.0
+
+# Web UI
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0

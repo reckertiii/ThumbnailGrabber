@@ -39,12 +39,14 @@ class StreamProcessor:
         self.on_capture_callback = on_capture_callback
 
         self.running = False
+        self._stop_event = threading.Event()
         self.grabber_thread: Optional[threading.Thread] = None
         self.analysis_thread: Optional[threading.Thread] = None
         self.cap: Optional[cv2.VideoCapture] = None
-        
+
         # Thread-safe atomic frame store
         self.latest_frame: Optional[np.ndarray] = None
+        self.latest_analysis: Optional[AnalysisResult] = None
         self.frame_lock = threading.Lock()
         
         # Buffer for peak detection & Single Winner tracking
@@ -73,6 +75,7 @@ class StreamProcessor:
         """Starts the video grabber and analysis background threads."""
         if self.running:
             return
+        self._stop_event.clear()
         self.running = True
         self.connection_status = self.STATUS_CONNECTING
         
@@ -87,10 +90,13 @@ class StreamProcessor:
     def stop(self):
         """Stops processing loops and releases camera resources."""
         self.running = False
+        self._stop_event.set()  # interrupts an in-progress reconnect backoff
         if self.grabber_thread and self.grabber_thread.is_alive():
-            self.grabber_thread.join(timeout=1.0)
+            self.grabber_thread.join(timeout=5.0)
         if self.analysis_thread and self.analysis_thread.is_alive():
-            self.analysis_thread.join(timeout=1.0)
+            self.analysis_thread.join(timeout=5.0)
+        # Release only after the grabber thread has exited, so it can't read
+        # from a capture we just freed.
         if self.cap:
             self.cap.release()
             self.cap = None
@@ -139,13 +145,14 @@ class StreamProcessor:
         if not self.cap:
             self._set_status(self.STATUS_FAILED)
             self.running = False
+            self._stop_event.set()  # also stops the analysis loop
             return
 
         is_rtsp = self.config.stream_source.startswith("rtsp://")
         self._set_status(self.STATUS_CONNECTED)
         self.reconnect_attempt = 0
 
-        while self.running:
+        while not self._stop_event.is_set():
             ret, frame = self.cap.read()
             if not ret or frame is None:
                 if is_rtsp:
@@ -156,6 +163,7 @@ class StreamProcessor:
                         print(f"[StreamProcessor] RTSP reconnection failed after {self.config.rtsp_max_retries} attempts. Giving up.")
                         self._set_status(self.STATUS_FAILED)
                         self.running = False
+                        self._stop_event.set()  # also stops the analysis loop
                         return
                     
                     # Exponential backoff: 1s, 2s, 4s, 8s, ... capped at rtsp_backoff_max
@@ -167,13 +175,18 @@ class StreamProcessor:
                           f"(attempt {self.reconnect_attempt}/{self.config.rtsp_max_retries}, "
                           f"backoff {backoff:.1f}s)")
                     self._set_status(self.STATUS_RECONNECTING)
-                    
-                    time.sleep(backoff)
-                    
+
+                    # Interruptible sleep — stop() can cut this short.
+                    if self._stop_event.wait(backoff):
+                        return
+
                     if self.cap:
                         self.cap.release()
                     self.cap = self._open_capture()
-                    
+
+                    if self.cap is None:
+                        continue
+
                     if self.cap:
                         self._set_status(self.STATUS_CONNECTED)
                         self.reconnect_attempt = 0
@@ -202,7 +215,7 @@ class StreamProcessor:
         last_time = time.time()
         frame_counter = 0
 
-        while self.running:
+        while not self._stop_event.is_set():
             start_time = time.time()
             
             # Fetch latest frame atomically
@@ -227,7 +240,8 @@ class StreamProcessor:
 
             # Analyze frame quality
             analysis = self.analyzer.analyze_frame(frame)
-            
+            self.latest_analysis = analysis
+
             # Track score history for trend analysis
             if analysis.face_detected:
                 self._score_history.append(analysis.overall_score)

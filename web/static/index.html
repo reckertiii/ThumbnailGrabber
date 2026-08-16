@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Thumbnail Grabber</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <span id="statusDot" class="dot">&#9679;</span>
+  <span id="statusText" class="status-text">Connecting…</span>
+  <h1>AI Thumbnail Selector</h1>
+  <span class="spacer"></span>
+  <label class="src-label" for="src">Source</label>
+  <input id="src" type="text" placeholder="rtsp://… , 0, or file path">
+  <button id="btnSource" class="btn">Connect Stream</button>
+  <button id="btnStartStop" class="btn btn-start">▶ Start Capture</button>
+</header>
+
+<main class="layout">
+
+  <section class="video-col">
+    <div class="video-wrap">
+      <img id="video" src="/video.mjpg" alt="Live analyzed camera feed">
+    </div>
+    <div class="video-bar">
+      <label class="chk"><input type="checkbox" id="chkMesh" checked> Show Face Mesh</label>
+      <label class="chk"><input type="checkbox" id="chkHud" checked> Show Quality HUD</label>
+      <label class="chk"><input type="checkbox" id="chkAuto"> Enable Auto-Capture</label>
+      <label class="chk"><input type="checkbox" id="chkWinner" checked> 🏆 Keep Top 5 Only</label>
+      <span class="spacer"></span>
+      <span id="fps" class="muted">— fps</span>
+      <button id="btnManual" class="btn btn-green">📸 Manual Screenshot</button>
+    </div>
+    <p class="hint">Click a face on the video to include or ignore that person.</p>
+  </section>
+
+  <section class="panel-col">
+
+    <div class="card">
+      <h2>Live Telemetry</h2>
+      <div class="score-row">
+        <div class="score-label">Overall Frame Quality</div>
+        <div class="score-val" id="scoreVal">0%</div>
+      </div>
+      <div class="bar"><div id="scoreBar" class="bar-fill"></div></div>
+
+      <div class="metrics">
+        <div class="metric" id="mHead">Head Pose: —</div>
+        <div class="metric" id="mEyes">Eyes: —</div>
+        <div class="metric" id="mExpr">Expression: —</div>
+        <div class="metric" id="mShoulder">Shoulders: —</div>
+        <div class="metric" id="mSharp">Sharpness: —</div>
+        <div class="metric" id="mExposure">Exposure: —</div>
+        <div class="metric" id="mCentering">Centering: —</div>
+        <div class="metric" id="mHand">Hand: —</div>
+        <div class="metric wide" id="mStability">Stability: —</div>
+        <div class="metric wide accent" id="mModel">AI Model: —</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Capture Thresholds</h2>
+
+      <div class="ctrl">
+        <label for="sldScore">Min Quality Threshold</label>
+        <input type="range" id="sldScore" min="30" max="95" value="55">
+        <output id="outScore">55%</output>
+      </div>
+
+      <div class="ctrl">
+        <label for="sldYaw">Max Head Turn (Yaw)</label>
+        <input type="range" id="sldYaw" min="5" max="45" value="30">
+        <output id="outYaw">30°</output>
+      </div>
+
+      <div class="ctrl">
+        <label for="sldShoulder">Max Shoulder Tilt</label>
+        <input type="range" id="sldShoulder" min="4" max="25" value="12">
+        <output id="outShoulder">12°</output>
+      </div>
+
+      <div class="ctrl">
+        <label for="sldBurst">Burst Peak Window</label>
+        <input type="range" id="sldBurst" min="10" max="60" value="25">
+        <output id="outBurst">2.5s</output>
+      </div>
+
+      <div class="ctrl">
+        <label for="numPeople">Max Tracked People</label>
+        <input type="number" id="numPeople" min="1" max="6" value="1">
+        <output id="outPeople">people</output>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Active People Filter</h2>
+      <div class="people" id="people"></div>
+    </div>
+
+    <div class="card">
+      <h2>Output Folder</h2>
+      <code id="outputDir" class="path">—</code>
+    </div>
+
+  </section>
+</main>
+
+<section class="gallery-wrap">
+  <h2>Captured Best Screenshots</h2>
+  <div id="gallery" class="gallery"><p class="muted">No captures yet — press Start Capture.</p></div>
+</section>
+
+<div id="lightbox" class="lightbox hidden">
+  <div class="lightbox-inner">
+    <img id="lbImg" alt="Full size capture">
+    <div id="lbInfo" class="lb-info"></div>
+    <button id="lbClose" class="btn">Close</button>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

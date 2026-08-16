@@ -38,7 +38,12 @@ def _default_stream_source() -> str:
     return os.environ.get("TG_STREAM_SOURCE", "").strip() or "0"
 
 def _default_output_dir() -> str:
-    """Default to Pictures/ThumbnailGrabber, fallback to ./captures."""
+    """TG_OUTPUT_DIR if set, else Pictures/ThumbnailGrabber, else ./captures."""
+    override = os.environ.get("TG_OUTPUT_DIR", "").strip()
+    if override:
+        Path(override).mkdir(parents=True, exist_ok=True)
+        return override
+
     pictures = Path.home() / "Pictures" / "ThumbnailGrabber"
     if pictures.parent.exists():
         pictures.mkdir(parents=True, exist_ok=True)
