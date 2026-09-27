@@ -2,7 +2,9 @@ import cv2
 import numpy as np
 import math
 import os
+import sys
 import time
+import contextlib
 import urllib.request
 from collections import deque
 from dataclasses import dataclass, field
@@ -18,6 +20,51 @@ from mediapipe.tasks.python import vision as mp_vision
 from config import QualityWeights, QualityThresholds
 from preference_model import UserPreferenceModel
 
+# Where the downloaded ML weights live. Overridable so a container can bake them into
+# an image path that isn't shadowed by a mounted volume — with the weights under a bind
+# mount, a fresh host directory hides them and the container re-downloads on every
+# start, or fails outright when it has no outbound internet.
+MODELS_DIR = os.environ.get("TG_MODELS_DIR", "").strip() or os.path.join(os.getcwd(), "models")
+
+
+@contextlib.contextmanager
+def _quiet_native_startup():
+    """Silences the MediaPipe/TFLite C++ chatter emitted while models are built.
+
+    Those warnings ("Feedback manager requires a model with a single signature",
+    "Sets FaceBlendshapesGraph acceleration to xnnpack") are informational and
+    unavoidable — they are written straight to file descriptor 2 by the native layer,
+    so GLOG_minloglevel and Python's logging module cannot reach them. Seven lines per
+    analyzer are enough to bury the capture log and any genuine error, so fd 2 is
+    redirected for the duration of model construction only. Per-frame analysis is left
+    untouched, and the loaders report their own failures on stdout, so a model that
+    fails to load still says so.
+
+    Set TG_VERBOSE_MEDIAPIPE=1 to see the native output.
+    """
+    if os.environ.get("TG_VERBOSE_MEDIAPIPE", "").strip():
+        yield
+        return
+    try:
+        sys.stderr.flush()
+        saved_fd = os.dup(2)
+    except Exception:
+        # No real fd 2 to juggle (embedded/pythonw); just run without suppression.
+        yield
+        return
+    devnull_fd = None
+    try:
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull_fd, 2)
+        yield
+    finally:
+        try:
+            os.dup2(saved_fd, 2)
+        finally:
+            os.close(saved_fd)
+            if devnull_fd is not None:
+                os.close(devnull_fd)
+
 # Standard 21 Hand Landmark skeleton connections
 HAND_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4),           # Thumb
@@ -31,6 +78,9 @@ HAND_CONNECTIONS = [
 class SingleFaceAnalysis:
     person_id: int = 1
     bbox: Tuple[int, int, int, int] = (0, 0, 0, 0)
+    # Unsmoothed detection box. bbox is EMA-smoothed for a steady HUD, which lags
+    # during movement — crops for landmarking must use the raw box or they drift.
+    raw_bbox: Tuple[int, int, int, int] = (0, 0, 0, 0)
     score: float = 0.0
     is_qualified: bool = False
     is_selected: bool = True       # Whether this person is actively selected for scoring
@@ -56,6 +106,28 @@ class SingleFaceAnalysis:
     is_awkward_expression: bool = False
     is_looking_down: bool = False
     mar: float = 0.20
+    
+    # Precise Mouth & Expression Blendshape Metrics
+    is_licking_lips: bool = False
+    is_weird_mouth: bool = False
+    is_talking_or_open: bool = False
+    jaw_open_score: float = 0.0
+    smile_blendshape_score: float = 0.0
+    tongue_out_score: float = 0.0
+    eye_squint_score: float = 0.0
+    eye_look_down_score: float = 0.0      # Gaze dropped, distinct from the head being down
+    mesh_from_blendshapes: bool = False   # True when the 478-pt mesh actually resolved
+    disqualified_reasons: List[str] = field(default_factory=list)
+
+    # Cutout suitability — how well this frame survives having its background removed
+    # and being dropped onto a slide, which is the end use for these captures.
+    cutout_score: float = 0.5
+    subject_bbox: Optional[Tuple[int, int, int, int]] = None
+    subject_height_ratio: float = 0.0   # Subject height as a fraction of frame height
+    is_subject_clipped: bool = False    # Subject runs off an edge of the frame
+    hands_on_torso: bool = False        # Hands overlap the body, which muddies the matte
+    background_score: float = 1.0       # 1.0 = clean/plain behind the subject
+    pose_points: Optional[Dict[str, Any]] = None
     
     # Score Breakdown
     head_pose_score: float = 0.0
@@ -114,9 +186,18 @@ class AnalysisResult:
     smile_ratio: float = 0.50
     is_smiling: bool = False
     is_awkward_expression: bool = False
+    is_licking_lips: bool = False
+    is_weird_mouth: bool = False
+    is_talking_or_open: bool = False
     
     laplacian_variance: float = 0.0
     face_brightness: float = 128.0
+    cutout_score: float = 0.5
+    subject_height_ratio: float = 0.0
+    is_subject_clipped: bool = False
+    hands_on_torso: bool = False
+    background_score: float = 1.0
+    disqualified_reasons: List[str] = field(default_factory=list)
     hands_covering_face: bool = False
     is_hand_blurry: bool = False
     is_hand_weird: bool = False
@@ -134,21 +215,39 @@ class AnalysisResult:
 
 class PersonQualityAnalyzer:
     YUNET_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
-    YUNET_PATH = os.path.join(os.getcwd(), "models", "yunet.onnx")
+    YUNET_PATH = os.path.join(MODELS_DIR, "yunet.onnx")
     
+    FACE_LANDMARKER_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task"
+    FACE_LANDMARKER_MODEL_PATH = os.path.join(MODELS_DIR, "face_landmarker.task")
+
     HAND_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
-    HAND_MODEL_PATH = os.path.join(os.getcwd(), "models", "hand_landmarker.task")
+    HAND_MODEL_PATH = os.path.join(MODELS_DIR, "hand_landmarker.task")
 
     POSE_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
-    POSE_MODEL_PATH = os.path.join(os.getcwd(), "models", "pose_landmarker_lite.task")
+    POSE_MODEL_PATH = os.path.join(MODELS_DIR, "pose_landmarker_lite.task")
 
     def __init__(self, weights: Optional[QualityWeights] = None, thresholds: Optional[QualityThresholds] = None,
                  ema_alpha: float = 0.3, stability_window: int = 10, stability_threshold: float = 0.08,
                  blink_suppression_ms: int = 300, max_people_target: int = 1,
-                 selected_person_ids: Optional[List[int]] = None):
+                 selected_person_ids: Optional[List[int]] = None,
+                 require_temporal_stability: bool = True,
+                 pose_hand_interval: int = 1):
         self.weights = weights or QualityWeights()
         self.thresholds = thresholds or QualityThresholds()
         self.max_people_target = max(1, min(6, max_people_target))  # Clamp between 1 and 6
+        # Live capture waits for the score to settle before firing, so it doesn't save
+        # the frame either side of a good moment. Scanning a file has the whole timeline
+        # available and should judge each frame on its own merits — with these gates on,
+        # a single excellent frame surrounded by bad ones is thrown away.
+        self.require_temporal_stability = require_temporal_stability
+
+        # Hand/pose re-detection cadence, and the cached results reused in between.
+        # The cached landmarks are re-matched against the current faces every frame, so
+        # only their positions go stale — by at most one analysis interval.
+        self.pose_hand_interval = max(1, int(pose_hand_interval))
+        self._detail_tick: int = 0
+        self._cached_hand_result = None
+        self._cached_pose_result = None
         self.selected_person_ids: set = set(selected_person_ids if selected_person_ids is not None else [1, 2, 3, 4, 5, 6])
         
         # User Preference ML Model (Scikit-Learn)
@@ -179,13 +278,61 @@ class PersonQualityAnalyzer:
         self._bbox_ema_alpha: float = 0.20
         
         self._ensure_models_exist()
-        
+
+        # The face detector is not optional — without it nothing else runs. Say so
+        # clearly rather than letting OpenCV raise about an unreadable file path.
+        if not os.path.exists(self.YUNET_PATH):
+            raise RuntimeError(
+                f"Face detector model missing at '{self.YUNET_PATH}' and it could not be "
+                f"downloaded. If this machine has no internet access, fetch the models on "
+                f"another machine and place them in that directory (or point TG_MODELS_DIR "
+                f"at one that has them)."
+            )
+
         # Calibrated YuNet score threshold (0.45) + robust skin chroma check for 100% human face recognition
         self.detector = cv2.FaceDetectorYN.create(
             self.YUNET_PATH, "", (320, 320), score_threshold=0.45, nms_threshold=0.3
         )
         self.current_input_size = (320, 320)
         
+        # Model construction is the only place the native layer is chatty.
+        with _quiet_native_startup():
+            self._init_landmarkers()
+
+        # 3D Canonical Head Model for solvePnP
+        self.model_3d_points = np.array([
+            (0.0, 0.0, 0.0),             # Nose tip
+            (0.0, -330.0, -65.0),        # Chin
+            (-225.0, 170.0, -135.0),     # Right eye center
+            (225.0, 170.0, -135.0),      # Left eye center
+            (-150.0, -150.0, -125.0),    # Right mouth corner
+            (150.0, -150.0, -125.0)      # Left mouth corner
+        ], dtype=np.float64)
+
+    def _init_landmarkers(self):
+        """Builds the MediaPipe face / hand / pose landmarkers.
+
+        Each loader degrades to None on failure so the analyzer still runs with
+        whatever did load, rather than refusing to start.
+        """
+        # Initialize MediaPipe FaceLandmarker with 52 Blendshapes
+        self.face_landmarker = None
+        try:
+            face_base_options = mp_python.BaseOptions(model_asset_path=self.FACE_LANDMARKER_MODEL_PATH)
+            face_options = mp_vision.FaceLandmarkerOptions(
+                base_options=face_base_options,
+                output_face_blendshapes=True,
+                # One face per call: the landmarker is run on a crop of each detected
+                # face rather than on the whole frame (see _landmark_face).
+                num_faces=1,
+                min_face_detection_confidence=0.30,
+                min_face_presence_confidence=0.30,
+                min_tracking_confidence=0.30
+            )
+            self.face_landmarker = mp_vision.FaceLandmarker.create_from_options(face_options)
+        except Exception as e:
+            print(f"[PersonQualityAnalyzer] Warning initializing FaceLandmarker: {e}")
+
         # Initialize MediaPipe HandLandmarker
         self.hand_landmarker = None
         try:
@@ -215,25 +362,22 @@ class PersonQualityAnalyzer:
             self.pose_landmarker = mp_vision.PoseLandmarker.create_from_options(pose_options)
         except Exception as e:
             print(f"[PersonQualityAnalyzer] Warning initializing PoseLandmarker: {e}")
-        
-        # 3D Canonical Head Model for solvePnP
-        self.model_3d_points = np.array([
-            (0.0, 0.0, 0.0),             # Nose tip
-            (0.0, -330.0, -65.0),        # Chin
-            (-225.0, 170.0, -135.0),     # Right eye center
-            (225.0, 170.0, -135.0),      # Left eye center
-            (-150.0, -150.0, -125.0),    # Right mouth corner
-            (150.0, -150.0, -125.0)      # Left mouth corner
-        ], dtype=np.float64)
 
     def _ensure_models_exist(self):
-        os.makedirs(os.path.join(os.getcwd(), "models"), exist_ok=True)
+        os.makedirs(MODELS_DIR, exist_ok=True)
         if not os.path.exists(self.YUNET_PATH):
             print(f"[PersonQualityAnalyzer] Downloading YuNet Face Detector to '{self.YUNET_PATH}'...")
             try:
                 urllib.request.urlretrieve(self.YUNET_URL, self.YUNET_PATH)
             except Exception as e:
                 print(f"Error downloading YuNet: {e}")
+
+        if not os.path.exists(self.FACE_LANDMARKER_MODEL_PATH):
+            print(f"[PersonQualityAnalyzer] Downloading MediaPipe FaceLandmarker to '{self.FACE_LANDMARKER_MODEL_PATH}'...")
+            try:
+                urllib.request.urlretrieve(self.FACE_LANDMARKER_URL, self.FACE_LANDMARKER_MODEL_PATH)
+            except Exception as e:
+                print(f"Error downloading FaceLandmarker: {e}")
 
         if not os.path.exists(self.HAND_MODEL_PATH):
             print(f"[PersonQualityAnalyzer] Downloading MediaPipe HandLandmarker to '{self.HAND_MODEL_PATH}'...")
@@ -275,39 +419,87 @@ class PersonQualityAnalyzer:
         return round(max(0.0, min(1.0, score)), 2), is_level
 
     def _finalize_face_score(self, f_res: SingleFaceAnalysis):
-        """Calculates single face composite score and qualification after all metrics (including shoulders) are set."""
+        """Computes the composite score, then decides whether the frame is usable at all.
+
+        The distinction matters. Anything merely imperfect — mid-word, shoulders tilted,
+        gaze dropped — is scored down and left in the running, because ranking picks the
+        best of what actually happened and retention replaces it when something better
+        comes along. Only frames that cannot be used no matter what else is available are
+        disqualified outright. Gating on imperfections instead produced no captures at
+        all from a speaker who talks continuously.
+        """
+        min_sharp = self.thresholds.min_sharpness_laplacian
+        if f_res.laplacian_variance == 0.0 and f_res.sharpness_score > 0.0:
+            f_res.laplacian_variance = self._score_to_sharpness(f_res.sharpness_score)
+
         w = self.weights
+        # hand_pose used to be multiplied by a hardcoded 1.0, so its weight was simply
+        # dead score. It now reflects whether the hands are clear of the body.
+        hand_pose_score = 0.45 if f_res.hands_on_torso else 1.0
         raw_score = (
             w.head_pose * f_res.head_pose_score +
             w.eye_openness * f_res.eye_openness_score +
             w.expression * f_res.expression_score +
             w.shoulder_pose * f_res.shoulder_pose_score +
             w.sharpness * f_res.sharpness_score +
-            w.hand_pose * 1.0 +
+            w.hand_pose * hand_pose_score +
             w.exposure * f_res.exposure_score +
-            w.centering * f_res.centering_score
+            w.cutout * f_res.cutout_score
         )
 
+        # --- Graded penalties -------------------------------------------------
+        # Mouth openness tapers rather than falling off a cliff. A slightly parted mouth
+        # is normal in a good shot; a jaw dropped mid-word is not, but is still worth
+        # keeping if the alternative is nothing.
+        jaw = f_res.jaw_open_score
+        if jaw <= 0.30:
+            mouth_mult = 1.0
+        elif jaw >= 0.65:
+            mouth_mult = 0.45
+        else:
+            mouth_mult = 1.0 - 0.55 * ((jaw - 0.30) / 0.35)
+        raw_score *= mouth_mult
+
+        if f_res.is_licking_lips:
+            raw_score *= 0.15
+        elif f_res.is_weird_mouth:
+            raw_score *= 0.55
+
+        # Gaze dropped: mild. Head dropped: severe.
+        if f_res.eye_look_down_score > 0.45:
+            raw_score *= 1.0 - 0.25 * min(1.0, (f_res.eye_look_down_score - 0.45) / 0.40)
         if f_res.is_looking_down:
             raw_score *= 0.50
         if f_res.is_blinking:
-            raw_score *= 0.25
-        if f_res.is_awkward_expression:
-            raw_score *= 0.35
+            raw_score *= 0.20
         if f_res.is_shoulder_tilted:
-            raw_score *= 0.65
-        if f_res.laplacian_variance < self.thresholds.min_sharpness_laplacian:
-            raw_score *= 0.75
+            raw_score *= 0.80
+
+        # Heavy penalty for motion blur / low sharpness
+        is_blurry = f_res.laplacian_variance < min_sharp
+        if is_blurry:
+            sharp_ratio = max(0.05, f_res.laplacian_variance / max(1.0, min_sharp))
+            raw_score *= (sharp_ratio ** 1.5)
 
         f_res.score = round(max(0.0, min(1.0, raw_score)), 3)
-        f_res.is_qualified = (
-            f_res.score >= self.thresholds.min_overall_score and
-            abs(f_res.yaw_deg) <= self.thresholds.max_yaw_deg and
-            not f_res.is_blinking and
-            not f_res.is_looking_down and
-            not f_res.is_awkward_expression and
-            f_res.is_shoulders_level
-        )
+
+        # --- Hard disqualifiers: unusable, not merely imperfect ---------------
+        reasons: List[str] = []
+        if f_res.score < self.thresholds.min_overall_score:
+            reasons.append(f"score {f_res.score:.0%} below {self.thresholds.min_overall_score:.0%}")
+        if abs(f_res.yaw_deg) > self.thresholds.max_yaw_deg:
+            reasons.append(f"head turned {abs(f_res.yaw_deg):.0f}deg")
+        if f_res.is_blinking:
+            reasons.append("eyes closed")
+        if f_res.is_looking_down:
+            reasons.append("head down")
+        if f_res.is_licking_lips:
+            reasons.append("tongue/lip")
+        if is_blurry:
+            reasons.append(f"blurry ({f_res.laplacian_variance:.0f} < {min_sharp:.0f})")
+
+        f_res.disqualified_reasons = reasons
+        f_res.is_qualified = not reasons
 
     def analyze_frame(self, frame: np.ndarray) -> AnalysisResult:
         result = AnalysisResult()
@@ -434,7 +626,7 @@ class PersonQualityAnalyzer:
 
         result.faces = analyzed_faces
         
-        # MediaPipe Hand and Pose Tracking across the frame
+        # MediaPipe Hand, Pose, and Face Tracking across the frame
         result.hand_skeletons = []
         result.pose_skeletons = []
         result.hands_covering_face = False
@@ -443,17 +635,27 @@ class PersonQualityAnalyzer:
         result.hands_detected_count = 0
         
         mp_image = None
-        if self.hand_landmarker is not None or self.pose_landmarker is not None:
+        if self.face_landmarker is not None or self.hand_landmarker is not None or self.pose_landmarker is not None:
             try:
                 rgb_proc = cv2.cvtColor(proc_frame, cv2.COLOR_BGR2RGB)
                 mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_proc)
             except Exception:
                 pass
 
-        # 1. Hand Tracking
+        # 1. MediaPipe FaceLandmarker with 52 Blendshapes (Mouth, Lip Licking, Talking & Blink Analysis)
+        # Run per detected face on an upscaled crop. Run on the whole frame it finds
+        # nothing whenever the subject is more than a few feet from the camera, which
+        # silently drops every blendshape metric back to the crude 2D fallbacks.
+        if self.face_landmarker is not None:
+            for f_item in analyzed_faces:
+                self._landmark_face(frame, f_item)
+
+        # 2. Hand Tracking
         if self.hand_landmarker is not None and mp_image is not None:
             try:
-                hand_result = self.hand_landmarker.detect(mp_image)
+                if self._detail_tick % self.pose_hand_interval == 0:
+                    self._cached_hand_result = self.hand_landmarker.detect(mp_image)
+                hand_result = self._cached_hand_result
                 if hand_result and hand_result.hand_landmarks:
                     result.hands_detected_count = len(hand_result.hand_landmarks)
                     for hand_pts in hand_result.hand_landmarks:
@@ -498,10 +700,12 @@ class PersonQualityAnalyzer:
 
         result.hand_pose_score = 1.0
 
-        # 2. Pose & Shoulder Tracking
+        # 3. Pose & Shoulder Tracking
         if self.pose_landmarker is not None and mp_image is not None:
             try:
-                pose_result = self.pose_landmarker.detect(mp_image)
+                if self._detail_tick % self.pose_hand_interval == 0:
+                    self._cached_pose_result = self.pose_landmarker.detect(mp_image)
+                pose_result = self._cached_pose_result
                 if pose_result and pose_result.pose_landmarks:
                     for pose_lms in pose_result.pose_landmarks:
                         if len(pose_lms) > 12:
@@ -561,9 +765,27 @@ class PersonQualityAnalyzer:
                             if len(pose_lms) > 14:
                                 pose_dict['left_elbow'] = (int(pose_lms[13].x * target_w / scale), int(pose_lms[13].y * target_h / scale))
                                 pose_dict['right_elbow'] = (int(pose_lms[14].x * target_w / scale), int(pose_lms[14].y * target_h / scale))
+
+                            # Wrists and hips drive the cutout checks (hands over torso,
+                            # subject extent), so pull them out when they are visible.
+                            for name, idx in (('left_wrist', 15), ('right_wrist', 16),
+                                              ('left_hip', 23), ('right_hip', 24)):
+                                if len(pose_lms) > idx:
+                                    lm = pose_lms[idx]
+                                    if getattr(lm, 'visibility', 1.0) > 0.5:
+                                        pose_dict[name] = (int(lm.x * target_w / scale),
+                                                           int(lm.y * target_h / scale))
+
+                            # Full visible-landmark cloud, used to bound the subject.
+                            visible_pts = [
+                                (int(lm.x * target_w / scale), int(lm.y * target_h / scale))
+                                for lm in pose_lms if getattr(lm, 'visibility', 1.0) > 0.5
+                            ]
+                            pose_dict['visible_points'] = visible_pts
                             result.pose_skeletons.append(pose_dict)
                             
                             if matched_face is not None:
+                                matched_face.pose_points = pose_dict
                                 matched_face.shoulder_detected = shoulders_visible
                                 matched_face.shoulder_points = (ls_pt, rs_pt) if shoulders_visible else None
                                 matched_face.shoulder_tilt_deg = tilt_deg
@@ -574,8 +796,12 @@ class PersonQualityAnalyzer:
             except Exception:
                 pass
 
+        self._detail_tick += 1
+
         # Finalize score and qualification across all analyzed faces (incorporating shoulder metrics)
+        # Cutout scoring needs the pose landmarks matched above, so it runs here.
         for f_item in analyzed_faces:
+            self._compute_cutout_score(frame, f_item, result.hand_skeletons)
             self._finalize_face_score(f_item)
 
         # Populate root level fields from Primary (First) Face for telemetry & backward compatibility
@@ -604,9 +830,18 @@ class PersonQualityAnalyzer:
         result.smile_ratio = primary.smile_ratio
         result.is_smiling = primary.is_smiling
         result.is_awkward_expression = primary.is_awkward_expression
+        result.is_licking_lips = primary.is_licking_lips
+        result.is_weird_mouth = primary.is_weird_mouth
+        result.is_talking_or_open = primary.is_talking_or_open
         result.is_looking_down = primary.is_looking_down
         result.laplacian_variance = primary.laplacian_variance
         result.face_brightness = primary.face_brightness
+        result.cutout_score = primary.cutout_score
+        result.subject_height_ratio = primary.subject_height_ratio
+        result.is_subject_clipped = primary.is_subject_clipped
+        result.hands_on_torso = primary.hands_on_torso
+        result.background_score = primary.background_score
+        result.hand_pose_score = 0.45 if primary.hands_on_torso else 1.0
         result.mesh_points = primary.mesh_points
 
         # Composite Overall Score Calculation strictly for ACTIVE SELECTED faces
@@ -670,6 +905,27 @@ class PersonQualityAnalyzer:
         selected_faces = [f for f in analyzed_faces if f.is_selected]
         all_faces_qualified = len(selected_faces) > 0 and all(f.is_qualified for f in selected_faces)
         
+        # Collect why this frame can't be captured, so "score is high but nothing saves"
+        # is answerable from the HUD instead of by reading the scoring code.
+        frame_reasons: List[str] = []
+        for f_item in selected_faces:
+            for reason in f_item.disqualified_reasons:
+                tag = reason if len(selected_faces) == 1 else f"P{f_item.person_id}: {reason}"
+                if tag not in frame_reasons:
+                    frame_reasons.append(tag)
+        if not selected_faces:
+            frame_reasons.append("no person selected")
+        # Only mention the frame score when no individual face already explained it,
+        # otherwise a single-person shot reports the same problem twice.
+        if (result.overall_score < self.thresholds.min_overall_score
+                and not any("score" in r for r in frame_reasons)):
+            frame_reasons.append(
+                f"frame score {result.overall_score:.0%} below {self.thresholds.min_overall_score:.0%}")
+        if result.hands_covering_face:
+            frame_reasons.append("hand over face")
+        if self._blink_suppressed:
+            frame_reasons.append("blink cooldown")
+
         basic_qualified = (
             result.overall_score >= self.thresholds.min_overall_score and
             all_faces_qualified and
@@ -682,11 +938,20 @@ class PersonQualityAnalyzer:
         else:
             self._consecutive_qualified = 0
 
-        result.is_qualified = (
-            basic_qualified and
-            result.is_stable and
-            self._consecutive_qualified >= 2
-        )
+        if self.require_temporal_stability:
+            if basic_qualified and not result.is_stable:
+                frame_reasons.append("score still settling")
+            if basic_qualified and self._consecutive_qualified < 2:
+                frame_reasons.append("waiting for a 2nd good frame")
+            result.is_qualified = (
+                basic_qualified and
+                result.is_stable and
+                self._consecutive_qualified >= 2
+            )
+        else:
+            result.is_qualified = basic_qualified
+
+        result.disqualified_reasons = frame_reasons
 
         return result
 
@@ -705,6 +970,8 @@ class PersonQualityAnalyzer:
         fx, fy = max(0, fx), max(0, fy)
         fw, fh = min(orig_w - fx, fw), min(orig_h - fy, fh)
         
+        f_res.raw_bbox = (fx, fy, fw, fh)
+
         # EMA Bounding Box Smoothing per person slot
         raw_bbox = (float(fx), float(fy), float(fw), float(fh))
         if person_id not in self._smooth_bboxes:
@@ -735,17 +1002,33 @@ class PersonQualityAnalyzer:
         landmarks_2d = np.array([nose_tip, chin, right_eye, left_eye, right_mouth, left_mouth], dtype=np.float64)
         f_res.mesh_points = landmarks_2d.astype(int)
 
-        # 1. Image Sharpness on Face ROI
+        # 1. Image Sharpness on Face ROI & Eyes Region
+        # Measured on a fixed-height copy of the face so the number means the same thing
+        # whether the subject is 3ft or 30ft from the camera. Measured raw, a big near
+        # face always beat a small far one no matter which was actually in focus.
         face_roi = frame[fy:fy+fh, fx:fx+fw]
         if face_roi.size > 0:
             gray_roi = cv2.cvtColor(face_roi, cv2.COLOR_BGR2GRAY)
-            lap_var = float(cv2.Laplacian(gray_roi, cv2.CV_64F).var())
+            gray_norm = self._resize_to_height(gray_roi, self.thresholds.sharpness_face_height)
+            lap_var_face = float(cv2.Laplacian(gray_norm, cv2.CV_64F).var())
+
+            # Eye region sharpness (upper 15% to 55% of face ROI)
+            roi_h, roi_w = gray_norm.shape
+            eye_top = int(roi_h * 0.15)
+            eye_bottom = int(roi_h * 0.55)
+            eye_roi = gray_norm[eye_top:eye_bottom, :]
+            if eye_roi.size > 40:
+                lap_var_eyes = float(cv2.Laplacian(eye_roi, cv2.CV_64F).var())
+                # Sharpness is weighted between eyes and full face ROI
+                lap_var = 0.60 * lap_var_eyes + 0.40 * lap_var_face
+            else:
+                lap_var = lap_var_face
         else:
             gray_roi = None
             lap_var = 0.0
-            
+
         f_res.laplacian_variance = lap_var
-        f_res.sharpness_score = min(1.0, lap_var / max(1.0, self.thresholds.min_sharpness_laplacian * 2.5))
+        f_res.sharpness_score = self._sharpness_to_score(lap_var)
 
         # 2. Exposure & Centering
         f_res.exposure_score, f_res.face_brightness = self._compute_exposure_score(face_roi, gray_roi)
@@ -839,6 +1122,327 @@ class PersonQualityAnalyzer:
 
         self._finalize_face_score(f_res)
         return f_res
+
+    def _compute_cutout_score(self, frame: np.ndarray, f_res: SingleFaceAnalysis,
+                              hand_skeletons: Optional[List[List[Tuple[int, int]]]] = None) -> None:
+        """Scores how usable this frame is once the background is removed.
+
+        A shot can be a flawless headshot and still be useless for a slide: the subject
+        runs off the edge of frame, they are too small to enlarge, their hands are
+        crossed over their chest, or they are standing against clutter that no matting
+        tool will cut cleanly. Those are the failures this scores.
+        """
+        h, w = frame.shape[:2]
+        pose = f_res.pose_points or {}
+        pts = pose.get('visible_points') or []
+
+        fx, fy, fw, fh = f_res.raw_bbox
+
+        # --- Subject extent -------------------------------------------------
+        # Prefer the pose landmark cloud; fall back to a rough body estimate from the
+        # face box when the pose model found nothing.
+        if len(pts) >= 4:
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            sx0, sy0, sx1, sy1 = min(xs), min(ys), max(xs), max(ys)
+            # Landmarks sit on the skeleton, not the silhouette; pad out to the body.
+            pad_x = int((sx1 - sx0) * 0.18)
+            sx0, sx1 = sx0 - pad_x, sx1 + pad_x
+            sy0 = min(sy0, fy)          # include the top of the head
+        elif fw > 0 and fh > 0:
+            # ~7.5 head-heights for a standing adult, ~3 face-widths across the shoulders
+            sx0, sx1 = fx - int(fw * 1.0), fx + fw + int(fw * 1.0)
+            sy0, sy1 = fy, fy + int(fh * 7.5)
+        else:
+            f_res.cutout_score = 0.0
+            return
+
+        sx0, sy0 = max(0, sx0), max(0, sy0)
+        sx1, sy1 = min(w, sx1), min(h, sy1)
+        f_res.subject_bbox = (sx0, sy0, sx1 - sx0, sy1 - sy0)
+
+        subj_h = max(1, sy1 - sy0)
+        f_res.subject_height_ratio = round(subj_h / float(h), 3)
+
+        # --- 1. Completeness: does the subject fit inside the frame? ---------
+        # A silhouette sliced by the frame edge cuts off flat in the cutout.
+        margin = max(4, int(w * 0.01))
+        clipped_sides = 0
+        if sx0 <= margin:
+            clipped_sides += 1
+        if sx1 >= w - margin:
+            clipped_sides += 1
+        if sy0 <= margin:                       # head cropped — the worst case
+            clipped_sides += 2
+        f_res.is_subject_clipped = clipped_sides > 0
+        # The bottom edge is expected (subjects are cut at the waist), so it is ignored.
+        completeness = max(0.0, 1.0 - 0.32 * clipped_sides)
+
+        # --- 2. Size: enough pixels to enlarge on a slide? -------------------
+        # Below ~35% of frame height the cutout has to be upscaled hard and goes soft.
+        r = f_res.subject_height_ratio
+        if r >= 0.75:
+            size_score = 1.0
+        elif r <= 0.20:
+            size_score = 0.0
+        else:
+            size_score = (r - 0.20) / 0.55
+
+        # --- 3. Hands clear of the torso ------------------------------------
+        # Hands crossed over the chest merge into the body and read as a blob.
+        hands_on_torso = False
+        ls, rs = pose.get('left_shoulder'), pose.get('right_shoulder')
+        lh, rh = pose.get('left_hip'), pose.get('right_hip')
+        if ls and rs:
+            torso_x0, torso_x1 = min(ls[0], rs[0]), max(ls[0], rs[0])
+            torso_y0 = min(ls[1], rs[1])
+            if lh and rh:
+                torso_y1 = max(lh[1], rh[1])
+            else:
+                torso_y1 = torso_y0 + int(abs(torso_x1 - torso_x0) * 1.4)
+            # A hand anywhere across the body merges with it in the cutout, so this
+            # trims only a sliver off each side rather than a wide margin.
+            inset = int((torso_x1 - torso_x0) * 0.05)
+            # Arms hanging naturally rest against the hips, which is normal and cuts out
+            # fine. Only the chest and midriff count, or every relaxed pose gets flagged.
+            torso_y1 = torso_y0 + int((torso_y1 - torso_y0) * 0.70)
+            torso_x0, torso_x1 = torso_x0 + inset, torso_x1 - inset
+
+            def _in_torso(pt):
+                return torso_x0 <= pt[0] <= torso_x1 and torso_y0 <= pt[1] <= torso_y1
+
+            # Prefer the hand landmarks: the pose model marks the wrist joint, which can
+            # sit outboard of the body while the fingers are spread across the chest.
+            for hand in (hand_skeletons or []):
+                if not hand:
+                    continue
+                cx = sum(pt[0] for pt in hand) / float(len(hand))
+                cy = sum(pt[1] for pt in hand) / float(len(hand))
+                if _in_torso((cx, cy)):
+                    hands_on_torso = True
+                    break
+            if not hands_on_torso:
+                for wrist in (pose.get('left_wrist'), pose.get('right_wrist')):
+                    if wrist and _in_torso(wrist):
+                        hands_on_torso = True
+                        break
+        f_res.hands_on_torso = hands_on_torso
+        hands_score = 0.45 if hands_on_torso else 1.0
+
+        # --- 4. Background cleanliness --------------------------------------
+        f_res.background_score = self._background_cleanliness(frame, (sx0, sy0, sx1, sy1))
+
+        cutout = (
+            0.35 * completeness +
+            0.25 * size_score +
+            0.15 * hands_score +
+            0.25 * f_res.background_score
+        )
+        f_res.cutout_score = round(max(0.0, min(1.0, cutout)), 3)
+
+    @staticmethod
+    def _background_cleanliness(frame: np.ndarray, subject_rect: Tuple[int, int, int, int]) -> float:
+        """Rates how easy the area around the subject is to key out.
+
+        Samples a ring just outside the subject and measures edge density there. A plain
+        dark curtain scores near 1.0; a drum kit, furniture or lit signage scores low,
+        because that is where automatic background removal leaves fringes and holes.
+
+        This is a proxy, not a matte: clutter falling within the subject's own bounding
+        box is masked out along with the subject, so something directly behind their
+        head is not counted. It is weighted accordingly.
+        """
+        h, w = frame.shape[:2]
+        sx0, sy0, sx1, sy1 = subject_rect
+        band = max(12, int((sx1 - sx0) * 0.35))
+
+        rx0, ry0 = max(0, sx0 - band), max(0, sy0 - band)
+        rx1, ry1 = min(w, sx1 + band), min(h, sy1 + band)
+        if rx1 - rx0 < 8 or ry1 - ry0 < 8:
+            return 1.0
+
+        outer = frame[ry0:ry1, rx0:rx1]
+        gray = cv2.cvtColor(outer, cv2.COLOR_BGR2GRAY)
+        # Mask out the subject so we measure only what is behind and beside them.
+        mask = np.ones(gray.shape, dtype=np.uint8)
+        mask[max(0, sy0 - ry0):max(0, sy1 - ry0), max(0, sx0 - rx0):max(0, sx1 - rx0)] = 0
+        if int(mask.sum()) < 64:
+            return 1.0
+
+        edges = cv2.Canny(gray, 60, 160)
+        edge_ratio = float(np.count_nonzero(edges & (mask * 255))) / float(mask.sum())
+
+        # ~2% edge pixels is a clean backdrop; ~12% is heavy clutter.
+        score = 1.0 - (edge_ratio - 0.02) / 0.10
+        return round(max(0.0, min(1.0, score)), 3)
+
+    @staticmethod
+    def _resize_to_height(gray: np.ndarray, target_h: int) -> np.ndarray:
+        """Resamples a grayscale ROI to a fixed height, preserving aspect ratio."""
+        h, w = gray.shape[:2]
+        if h < 2 or w < 2 or h == target_h:
+            return gray
+        scale = target_h / float(h)
+        new_w = max(2, int(round(w * scale)))
+        interp = cv2.INTER_CUBIC if scale > 1.0 else cv2.INTER_AREA
+        return cv2.resize(gray, (new_w, target_h), interpolation=interp)
+
+    def _sharpness_to_score(self, lap_var: float) -> float:
+        """Maps normalised Laplacian variance onto 0..1 across the range real footage
+        actually occupies, so soft and crisp frames get different scores.
+        """
+        floor = self.thresholds.sharpness_floor
+        good = max(floor + 1.0, self.thresholds.sharpness_good)
+        return round(max(0.0, min(1.0, (lap_var - floor) / (good - floor))), 3)
+
+    def _score_to_sharpness(self, score: float) -> float:
+        """Inverse of _sharpness_to_score, used to back-fill a plausible variance when
+        only a score was supplied (synthetic results in tests and the ML feature path).
+        """
+        floor = self.thresholds.sharpness_floor
+        good = max(floor + 1.0, self.thresholds.sharpness_good)
+        return floor + score * (good - floor)
+
+    # Width the face crop is resampled to before landmarking. The mesh model wants a
+    # face filling a decent share of its input; 384 is enough for stable blendshapes
+    # on a ~100px source face without paying for a larger inference.
+    LANDMARK_CROP_WIDTH = 384
+    LANDMARK_CROP_PAD = 0.85   # padding around the detection box, as a fraction of its longer side
+
+    def _landmark_face(self, frame: np.ndarray, f_item: SingleFaceAnalysis) -> bool:
+        """Runs the FaceLandmarker on a padded crop around one face and applies the
+        blendshape-derived expression / eye metrics to `f_item`.
+
+        Returns True if a mesh was found. On a miss the crude 2D metrics already set by
+        _analyze_single_face are left untouched.
+        """
+        h, w = frame.shape[:2]
+        bx, by, bw, bh = f_item.raw_bbox
+        if bw <= 0 or bh <= 0:
+            return False
+
+        pad = int(max(bw, bh) * self.LANDMARK_CROP_PAD)
+        x0, y0 = max(0, bx - pad), max(0, by - pad)
+        x1, y1 = min(w, bx + bw + pad), min(h, by + bh + pad)
+        if x1 - x0 < 16 or y1 - y0 < 16:
+            return False
+
+        crop = frame[y0:y1, x0:x1]
+        crop_w, crop_h = x1 - x0, y1 - y0
+
+        # Normalise crop size so the mesh model sees a consistently scaled face.
+        target_w = self.LANDMARK_CROP_WIDTH
+        interp = cv2.INTER_CUBIC if crop_w < target_w else cv2.INTER_AREA
+        target_h = max(1, int(crop_h * target_w / float(crop_w)))
+        try:
+            crop_rs = cv2.resize(crop, (target_w, target_h), interpolation=interp)
+            mp_crop = mp.Image(image_format=mp.ImageFormat.SRGB,
+                               data=cv2.cvtColor(crop_rs, cv2.COLOR_BGR2RGB))
+            res = self.face_landmarker.detect(mp_crop)
+        except Exception:
+            return False
+
+        if not res or not res.face_landmarks:
+            return False
+
+        lms = res.face_landmarks[0]
+        # Landmarks are normalised to the crop, so they map back to the source frame
+        # through the crop rect alone — the resize factor cancels out.
+        f_item.mesh_points = np.array(
+            [[int(x0 + lm.x * crop_w), int(y0 + lm.y * crop_h)] for lm in lms], dtype=np.int32
+        )
+
+        bl = {}
+        if getattr(res, 'face_blendshapes', None):
+            bl = {b.category_name: b.score for b in res.face_blendshapes[0]}
+        if not bl:
+            return True
+
+        g = bl.get
+        jaw_open = g('jawOpen', 0.0)
+        mouth_close = g('mouthClose', 0.0)
+        tongue_out = g('tongueOut', 0.0)
+        smile_score = (g('mouthSmileLeft', 0.0) + g('mouthSmileRight', 0.0)) / 2.0
+        pucker = g('mouthPucker', 0.0)
+        funnel = g('mouthFunnel', 0.0)
+        roll_lower = g('mouthRollLower', 0.0)
+        roll_upper = g('mouthRollUpper', 0.0)
+        shrug_lower = g('mouthShrugLower', 0.0)
+        shrug_upper = g('mouthShrugUpper', 0.0)
+        press_l = g('mouthPressLeft', 0.0)
+        press_r = g('mouthPressRight', 0.0)
+        blink_l = g('eyeBlinkLeft', 0.0)
+        blink_r = g('eyeBlinkRight', 0.0)
+        squint = (g('eyeSquintLeft', 0.0) + g('eyeSquintRight', 0.0)) / 2.0
+        look_down = (g('eyeLookDownLeft', 0.0) + g('eyeLookDownRight', 0.0)) / 2.0
+
+        # Exact lip licking detection (tongue actually protruding or lower lip sucked)
+        is_licking = (tongue_out > 0.16) or (roll_lower > 0.55 and jaw_open > 0.15)
+
+        # Weird mouth shape / pursing / grimacing / speaking
+        is_weird = (
+            is_licking or
+            pucker > 0.45 or
+            funnel > 0.45 or
+            (roll_lower > 0.55) or
+            (roll_upper > 0.55) or
+            ((shrug_lower > 0.50 or shrug_upper > 0.50) and smile_score < 0.20) or
+            (press_l > 0.60 or press_r > 0.60)
+        )
+
+        # Open mouth mid-speech vs genuine smile
+        is_talking = (jaw_open > 0.28 and smile_score < 0.25 and mouth_close < 0.30) or (jaw_open > 0.55)
+
+        # Genuine smile check
+        is_smile = (smile_score >= 0.25) and not is_weird and not is_licking and (jaw_open <= 0.50)
+
+        # A half-closed eye reads as badly as a full blink in a still, and it is common
+        # under stage lighting, so openness is graded rather than treated as a boolean.
+        blink_max = max(blink_l, blink_r)
+        is_blink = (blink_l > 0.50 and blink_r > 0.50) or blink_max > 0.70
+        if blink_max <= 0.25:
+            eye_open = 1.0
+        elif blink_max >= 0.60:
+            eye_open = 0.0
+        else:
+            eye_open = 1.0 - (blink_max - 0.25) / 0.35
+        # Hard squinting still leaves the eyes readable, so it only trims the score.
+        if squint > 0.55:
+            eye_open *= max(0.55, 1.0 - (squint - 0.55))
+
+        f_item.is_licking_lips = is_licking
+        f_item.is_weird_mouth = is_weird
+        f_item.is_talking_or_open = is_talking
+        f_item.is_smiling = is_smile
+        f_item.is_blinking = is_blink
+        f_item.is_awkward_expression = is_weird or is_licking or is_talking
+        # Eye gaze dropping is not the same as the head being down: a speaker glancing at
+        # notes with a level head still photographs fine, so it is tracked separately and
+        # only nudges the score. is_looking_down stays reserved for the head itself.
+        f_item.eye_look_down_score = round(look_down, 2)
+        f_item.smile_ratio = round(smile_score, 2)
+        f_item.mar = round(jaw_open, 2)
+        f_item.jaw_open_score = jaw_open
+        f_item.smile_blendshape_score = smile_score
+        f_item.tongue_out_score = tongue_out
+        f_item.eye_squint_score = round(squint, 2)
+        f_item.avg_ear = round(0.40 * eye_open, 2)
+
+        if is_licking:
+            expr_score = 0.05
+        elif is_weird:
+            expr_score = 0.15
+        elif is_talking:
+            expr_score = max(0.10, 0.35 - jaw_open * 0.4)
+        elif is_smile:
+            expr_score = min(1.0, 0.88 + smile_score * 0.12)
+        else:
+            expr_score = 0.88  # Natural resting closed mouth
+
+        f_item.expression_score = round(expr_score, 2)
+        f_item.eye_openness_score = round(max(0.0, min(1.0, eye_open)), 2)
+        f_item.mesh_from_blendshapes = True
+        return True
 
     def _compute_exposure_score(self, face_roi: np.ndarray, gray_roi: Optional[np.ndarray]) -> Tuple[float, float]:
         if face_roi is None or face_roi.size == 0 or gray_roi is None:

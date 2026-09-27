@@ -89,16 +89,24 @@ def draw_overlay(frame_bgr: np.ndarray, analysis: Optional[AnalysisResult],
             if is_sel:
                 color = PERSON_COLORS[idx % len(PERSON_COLORS)] if f_item.is_qualified else (0, 165, 255)
                 label = f"P{f_item.person_id}: {int(f_item.score * 100)}%"
-                if f_item.is_smiling:
-                    label += " [SMILE]"
+                if getattr(f_item, 'is_licking_lips', False):
+                    label += " [LICKING]"
+                elif getattr(f_item, 'is_talking_or_open', False):
+                    label += " [OPEN MOUTH]"
+                elif getattr(f_item, 'is_weird_mouth', False):
+                    label += " [WEIRD MOUTH]"
                 elif f_item.is_blinking:
                     label += " [BLINK]"
+                elif f_item.is_smiling:
+                    label += " [SMILE]"
                 elif f_item.is_looking_down:
                     label += " [LOOK DOWN]"
                 elif f_item.is_awkward_expression:
                     label += " [SPEECH]"
                 elif f_item.is_shoulder_tilted:
                     label += " [SHOULDER TILT]"
+                elif f_item.is_qualified:
+                    label += " [CLEAN]"
 
                 cv2.rectangle(display_frame, (bx, by), (bx + bw_, by + bh_), color, 2)
                 cv2.rectangle(display_frame, (bx, max(0, by - 26)),
@@ -114,8 +122,20 @@ def draw_overlay(frame_bgr: np.ndarray, analysis: Optional[AnalysisResult],
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
 
             if show_mesh and is_sel and f_item.mesh_points is not None:
+                # The full mesh is 478 points over a face often only ~120px tall, so
+                # fat dots would paint it solid. Scale the dot to the point count.
+                radius = 1 if len(f_item.mesh_points) > 64 else 4
                 for pt in f_item.mesh_points:
-                    cv2.circle(display_frame, (int(pt[0]), int(pt[1])), 4, (0, 255, 255), -1)
+                    cv2.circle(display_frame, (int(pt[0]), int(pt[1])), radius, (0, 255, 255), -1)
+
+        # Why nothing is being captured, under the score meter. Without this, a high
+        # score with no saved shots looks like a broken capture button.
+        if not analysis.is_qualified:
+            reasons = list(getattr(analysis, "disqualified_reasons", []) or [])
+            for i, reason in enumerate(reasons[:3]):
+                y = 150 + i * 20
+                cv2.putText(display_frame, f"- {reason}", (20, y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (120, 190, 255), 1)
 
         # Composite score meter, top-left
         cv2.rectangle(display_frame, (15, 15), (380, 135), (0, 0, 0), -1)

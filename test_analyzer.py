@@ -1,4 +1,5 @@
 import unittest
+import os
 import numpy as np
 import cv2
 
@@ -213,7 +214,13 @@ class TestPersonQualityAnalyzer(unittest.TestCase):
             is_shoulder_tilted=True
         )
         self.analyzer._finalize_face_score(face_tilted)
-        self.assertFalse(face_tilted.is_qualified, "Speaker with tilted shoulders should not be qualified")
+        # Tilted shoulders are a blemish, not a reason to throw the frame away. They cost
+        # score so a level-shouldered frame outranks this one, but if the whole service
+        # is shot at a slight angle we still want captures.
+        self.assertLess(face_tilted.score, face_good.score,
+                        "Tilted shoulders should score below level shoulders")
+        self.assertNotIn("shoulders", " ".join(face_tilted.disqualified_reasons),
+                         "Shoulder tilt should not be a hard disqualifier")
 
         # 3. Headshot / Close-up fallback (shoulders out of frame) -> Qualified
         face_closeup = SingleFaceAnalysis(
@@ -246,31 +253,161 @@ class TestPersonQualityAnalyzer(unittest.TestCase):
         self.assertEqual(res.people_detected_count, 0)
 
     def test_scikit_preference_model(self):
-        """Test Scikit-Learn LogisticRegression preference model training and predictions with shoulder feature."""
+        """Preference model: refuses to train on too little feedback, then learns."""
+        import tempfile
         from preference_model import UserPreferenceModel
-        model = UserPreferenceModel()
-        
+
         sample_res_good = AnalysisResult(
             yaw_deg=2.0, avg_ear=0.38, smile_ratio=0.85, exposure_score=1.0,
-            shoulder_tilt_deg=1.5, is_shoulders_level=True
+            shoulder_tilt_deg=1.5, is_shoulders_level=True, cutout_score=0.95
         )
         sample_res_bad = AnalysisResult(
             yaw_deg=28.0, avg_ear=0.15, smile_ratio=0.20, exposure_score=0.3,
-            shoulder_tilt_deg=18.0, is_shoulders_level=False
+            shoulder_tilt_deg=18.0, is_shoulders_level=False, cutout_score=0.25
         )
+
+        # Point persistence at a scratch file so the test can't clobber the user's
+        # real ratings in models/.
+        with tempfile.TemporaryDirectory() as tmp:
+            original_path = UserPreferenceModel.JSON_DATA_PATH
+            UserPreferenceModel.JSON_DATA_PATH = os.path.join(tmp, "prefs.json")
+            try:
+                model = UserPreferenceModel()
+
+                feat_good = model.extract_features(sample_res_good)
+                self.assertEqual(len(feat_good), 9, "Feature vector should be 9-dimensional")
+                self.assertAlmostEqual(feat_good[5], 1.5 / 15.0, places=2,
+                                       msg="Feature index 5 should be normalized shoulder tilt")
+
+                # Two ratings is not a model. Fitting them (previously padded with a
+                # synthetic row) produced a "trained" classifier with a meaningless
+                # 100% self-scored accuracy.
+                model.add_sample(sample_res_good, is_favorite=True)
+                model.add_sample(sample_res_bad, is_favorite=False)
+                self.assertFalse(model.is_trained,
+                                 "Model should not report trained on 2 samples")
+                self.assertEqual(model.predict(feat_good), 0.5,
+                                 "Untrained model must return a neutral score")
+
+                # Enough separable feedback and it should train and prefer the good one.
+                for _ in range(UserPreferenceModel.MIN_SAMPLES_TO_TRAIN):
+                    model.add_sample(sample_res_good, is_favorite=True)
+                    model.add_sample(sample_res_bad, is_favorite=False)
+
+                self.assertTrue(model.is_trained)
+                self.assertGreaterEqual(model.confidence, 0.5)
+                self.assertLessEqual(model.confidence, 1.0)
+                self.assertGreater(model.predict(feat_good),
+                                   model.predict(model.extract_features(sample_res_bad)),
+                                   "Favorited sample should outscore the rejected one")
+            finally:
+                UserPreferenceModel.JSON_DATA_PATH = original_path
+
+    def test_mouth_tracking_and_lip_licking_disqualification(self):
+        """Lip licking is disqualifying; an open mouth is graded, not disqualifying."""
+        from analyzer import SingleFaceAnalysis
         
-        model.add_sample(sample_res_good, is_favorite=True)
-        model.add_sample(sample_res_bad, is_favorite=False)
-        
-        self.assertTrue(model.is_trained)
-        self.assertGreaterEqual(model.confidence, 0.5)
-        
-        feat_good = model.extract_features(sample_res_good)
-        self.assertEqual(len(feat_good), 9, "Feature vector should be 9-dimensional")
-        self.assertAlmostEqual(feat_good[5], 1.5 / 15.0, places=2, msg="Feature index 5 should be normalized shoulder tilt")
-        
-        pred_good = model.predict(feat_good)
-        self.assertGreaterEqual(pred_good, 0.5, "Good sample should get high preference score")
+        # 1. Lip Licking -> Disqualified and penalized
+        face_licking = SingleFaceAnalysis(
+            person_id=1,
+            head_pose_score=0.95,
+            eye_openness_score=1.0,
+            expression_score=0.02,
+            shoulder_pose_score=1.0,
+            sharpness_score=0.9,
+            is_licking_lips=True,
+            is_awkward_expression=True
+        )
+        self.analyzer._finalize_face_score(face_licking)
+        self.assertFalse(face_licking.is_qualified, "Face licking lips must be disqualified")
+        self.assertLess(face_licking.score, 0.15, "Licking lips score must be heavily penalized")
+
+        # 2. Open Mouth Mid-Speech / Talking -> Disqualified
+        face_talking = SingleFaceAnalysis(
+            person_id=1,
+            head_pose_score=0.95,
+            eye_openness_score=1.0,
+            expression_score=0.15,
+            shoulder_pose_score=1.0,
+            sharpness_score=0.9,
+            is_talking_or_open=True,
+            is_awkward_expression=True
+        )
+        # An open mouth is graded by how far the jaw actually drops, not treated as a
+        # cliff. Disqualifying it outright meant a speaker who talks continuously
+        # produced no captures at all for a whole service.
+        face_talking.jaw_open_score = 0.45
+        self.analyzer._finalize_face_score(face_talking)
+        self.assertNotIn("talking", " ".join(face_talking.disqualified_reasons),
+                         "Mid-speech should not be a hard disqualifier")
+
+        face_mouth_shut = SingleFaceAnalysis(
+            person_id=1,
+            head_pose_score=0.95,
+            eye_openness_score=1.0,
+            expression_score=0.88,
+            shoulder_pose_score=1.0,
+            sharpness_score=0.9,
+            jaw_open_score=0.05,
+        )
+        self.analyzer._finalize_face_score(face_mouth_shut)
+        self.assertLess(face_talking.score, face_mouth_shut.score,
+                        "A closed mouth should outrank a mouth caught mid-word")
+
+        face_gaping = SingleFaceAnalysis(
+            person_id=1,
+            head_pose_score=0.95,
+            eye_openness_score=1.0,
+            expression_score=0.15,
+            shoulder_pose_score=1.0,
+            sharpness_score=0.9,
+            is_talking_or_open=True,
+            jaw_open_score=0.80,
+        )
+        self.analyzer._finalize_face_score(face_gaping)
+        self.assertLess(face_gaping.score, face_talking.score,
+                        "A wide-open jaw should be penalized more than a slightly open one")
+
+        # 3. Weird Mouth Shape / Grimacing -> penalised below the capture threshold
+        face_weird = SingleFaceAnalysis(
+            person_id=1,
+            head_pose_score=0.95,
+            eye_openness_score=1.0,
+            expression_score=0.05,
+            shoulder_pose_score=1.0,
+            sharpness_score=0.9,
+            is_weird_mouth=True,
+            is_awkward_expression=True
+        )
+        self.analyzer._finalize_face_score(face_weird)
+        # A grimace excludes itself by scoring under the capture threshold rather than by
+        # a dedicated gate, so it can still be picked if a recording contains nothing
+        # better — but it never outranks a clean frame.
+        self.assertFalse(face_weird.is_qualified, "Weird mouth shape must not qualify")
+        self.assertLess(face_weird.score, self.config.thresholds.min_overall_score,
+                        "Weird mouth shape must score below the capture threshold")
+
+        # 4. Clean Natural Smile -> Qualified
+        face_smile = SingleFaceAnalysis(
+            person_id=1,
+            head_pose_score=0.95,
+            eye_openness_score=1.0,
+            expression_score=1.0,
+            shoulder_pose_score=1.0,
+            sharpness_score=0.9,
+            is_smiling=True,
+            is_licking_lips=False,
+            is_talking_or_open=False,
+            is_weird_mouth=False,
+            is_awkward_expression=False
+        )
+        self.analyzer._finalize_face_score(face_smile)
+        self.assertTrue(face_smile.is_qualified, "Clean natural smile must be qualified")
+        self.assertGreaterEqual(face_smile.score, self.config.thresholds.min_overall_score)
+
+    def test_face_landmarker_initialization(self):
+        """Test that MediaPipe FaceLandmarker with 52 blendshapes initializes properly."""
+        self.assertIsNotNone(self.analyzer.face_landmarker, "FaceLandmarker should be initialized")
 
 if __name__ == "__main__":
     unittest.main()

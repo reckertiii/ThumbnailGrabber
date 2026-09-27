@@ -33,7 +33,7 @@ def _default_stream_source() -> str:
     """Stream source from TG_STREAM_SOURCE, else webcam 0.
 
     Set TG_STREAM_SOURCE in .env, e.g.
-        TG_STREAM_SOURCE=rtsp://user:pass@192.168.50.93:554/media/video1
+        TG_STREAM_SOURCE=rtsp://user:pass@192.168.1.100:554/media/video1
     """
     return os.environ.get("TG_STREAM_SOURCE", "").strip() or "0"
 
@@ -52,14 +52,19 @@ def _default_output_dir() -> str:
 
 @dataclass
 class QualityWeights:
-    head_pose: float = 0.20      # Weight for head orientation (looking straight at camera)
-    eye_openness: float = 0.20   # Weight for eyes open (not blinking)
-    expression: float = 0.16     # Weight for smile / pleasant expression
-    shoulder_pose: float = 0.10  # Weight for level speaker shoulders / posture
-    sharpness: float = 0.14      # Weight for image clarity / sharpness
-    hand_pose: float = 0.10      # Weight for clean hand posture / not blurry or awkward
-    exposure: float = 0.05       # Weight for proper lighting / exposure
-    centering: float = 0.05      # Weight for face centered in frame
+    # Tuned for cutouts: these frames get their background removed and dropped onto a
+    # slide, so how cleanly the subject separates matters as much as the face itself.
+    sharpness: float = 0.20      # Weight for image clarity / sharpness (critical for crisp thumbnails)
+    head_pose: float = 0.16      # Weight for head orientation (looking straight at camera)
+    eye_openness: float = 0.16   # Weight for eyes open (not blinking or half-shut)
+    expression: float = 0.14     # Weight for smile / pleasant expression
+    cutout: float = 0.18         # Weight for cutout suitability (framing, size, clean background)
+    shoulder_pose: float = 0.08  # Weight for level speaker shoulders / posture
+    hand_pose: float = 0.04      # Weight for hands clear of the torso
+    exposure: float = 0.04       # Weight for proper lighting / exposure
+    centering: float = 0.0       # Face-centred framing: reported only, not scored.
+                                 # The subject is normally off-centre by design, and it
+                                 # is irrelevant once they are cut out and repositioned.
 
 @dataclass
 class QualityThresholds:
@@ -71,7 +76,14 @@ class QualityThresholds:
     min_ear: float = 0.20            # Minimum Eye Aspect Ratio (below this is closed/blinking)
     min_mar_smile: float = 0.15      # Mouth Aspect Ratio indicator for natural smile
     max_mar_awkward: float = 0.60    # Excessively wide/open mouth threshold (yawning / mid-speech)
-    min_sharpness_laplacian: float = 40.0 # Min Laplacian variance for motion blur check
+    # Sharpness is measured on the face ROI after it is resampled to a fixed height, so
+    # the numbers below are comparable across camera distances and source resolutions.
+    # A raw (unnormalised) Laplacian grows with face size, which made a distant subject
+    # look "blurry" and a close one always look perfect.
+    sharpness_face_height: int = 160  # Face ROI is resized to this height before measuring
+    min_sharpness_laplacian: float = 18.0 # Below this the frame is treated as motion-blurred
+    sharpness_floor: float = 8.0     # Normalised variance scoring 0.0 (heavy blur)
+    sharpness_good: float = 70.0     # Normalised variance scoring 1.0 (crisp)
     min_brightness: float = 40.0     # Min mean brightness of face ROI (underexposure threshold)
     max_brightness: float = 220.0    # Max mean brightness of face ROI (overexposure threshold)
 
@@ -85,17 +97,68 @@ class AppConfig:
 
 
     # Analysis & Capture settings
-    analysis_fps: int = 15                 # Sub-sample frames per second for CV analysis
+    # A full analysis pass costs roughly 90-120ms per 1080p frame on a desktop CPU and
+    # more on a NAS, so anything above ~8 is unreachable: the loop simply never sleeps
+    # and pins a core. 6 leaves headroom for the MJPEG encode and the web server.
+    analysis_fps: int = 8                  # Sub-sample frames per second for CV analysis
+    # The preview deliberately runs faster than analysis. Scoring a frame is expensive,
+    # but the video feed should still look live — so the newest grabbed frame is shown
+    # with the most recent overlay drawn on it, rather than only showing scored frames.
+    preview_fps: int = 15                  # Frames per second for the web MJPEG preview
+    # Hand and pose inference together cost ~80ms of a ~120ms analysis pass. Hands and
+    # shoulders move far more slowly than eyes and mouths, so they are re-detected every
+    # Nth analysed frame and the previous landmarks are re-matched in between. Set to 1
+    # to detect them on every frame.
+    pose_hand_interval: int = 2
     burst_window_seconds: float = 2.5      # Time window to find peak score candidate frame
     cooldown_seconds: float = 2.0          # Minimum cooldown between auto-saved screenshots
     single_winner_mode: bool = True        # Automatically delete inferior shots beyond Top 5
     max_retained_captures: int = 5         # Keep Top 5 best final screenshots
     output_dir: str = field(default_factory=_default_output_dir)
+
+    # Output format. These frames get their background removed and dropped onto a slide,
+    # and JPEG ringing lands exactly on the hair and shoulder edges the matting tool has
+    # to cut — so PNG is the default despite the larger files.
+    capture_format: str = "png"            # "png" (lossless) or "jpg"
+    jpeg_quality: int = 95                 # Only used when capture_format is "jpg"
+    save_subject_crop: bool = True         # Also write a tight crop around the subject
+    subject_crop_padding: float = 0.08     # Crop margin, as a fraction of subject size
     
     # Multi-Person Settings
     max_people_target: int = 1             # Number of people to track and score (1 to 6)
     require_exact_people_count: bool = False # If True, requires finding exactly max_people_target people
     
+    # AI judge — a vision model reviews each candidate that would enter the kept set.
+    # Only runs when Anthropic credentials resolve (ANTHROPIC_API_KEY, or an `ant auth
+    # login` profile); otherwise it stays off and says so once at startup. Cost is a
+    # few dozen calls per service, not one per frame: a candidate reaches the judge
+    # only after clearing the heuristics and beating the weakest kept capture.
+    ai_judge_enabled: bool = True
+    # "auto" uses the Claude API when credentials resolve, otherwise a local Ollama if
+    # one is reachable with the model pulled, otherwise off. Force one with
+    # "anthropic" or "ollama"; "off" disables the judge entirely.
+    ai_judge_backend: str = field(default_factory=lambda: os.environ.get("TG_AI_JUDGE_BACKEND", "auto"))
+    ai_judge_model: str = "claude-opus-5"      # claude-sonnet-5 is the cheaper option
+    # Local backend. qwen3-vl:4b (3.3 GB) is the sensible default on a CPU-only box;
+    # qwen3-vl:8b (6.1 GB) judges noticeably better if there is RAM for it.
+    ai_judge_ollama_url: str = field(default_factory=lambda: os.environ.get("OLLAMA_HOST", "http://localhost:11434"))
+    ai_judge_ollama_model: str = field(default_factory=lambda: os.environ.get("TG_AI_JUDGE_OLLAMA_MODEL", "qwen3-vl:4b"))
+    # How long Ollama keeps the weights loaded after a review. "-1" pins them in memory
+    # permanently — the right setting when RAM is dedicated to it, since the first
+    # review of a service otherwise pays a cold load of the whole model from disk.
+    ai_judge_ollama_keep_alive: str = field(default_factory=lambda: os.environ.get("TG_AI_JUDGE_OLLAMA_KEEP_ALIVE", "30m"))
+    # Threads Ollama should use for a review. Inside a container with a CPU limit this
+    # MUST match the limit: Ollama otherwise defaults to the host's physical core count,
+    # overruns the quota, and gets throttled — measured at ~3x slower. 0 leaves it to
+    # Ollama (fine when it runs on bare metal with no limit).
+    ai_judge_ollama_num_thread: int = int(os.environ.get("TG_AI_JUDGE_OLLAMA_NUM_THREAD", "0") or 0)
+    ai_judge_timeout_sec: float = 300.0        # CPU inference plus a possible 20 GB cold load
+    ai_judge_effort: str = "medium"            # low | medium | high
+    ai_judge_weight: float = 0.5               # Share of the final score from the judge
+    ai_judge_image_max_px: int = 768           # Longest side sent to the model
+    ai_judge_min_interval_sec: float = 3.0     # Never review more often than this
+    ai_judge_max_calls_per_session: int = 300  # Hard cost guard per process
+
     # Machine Learning User Preference
     use_ml_preference: bool = True          # Enable user preference machine learning
     ml_weight: float = 0.35                 # Weight for ML preference score vs rule-based score
@@ -107,13 +170,27 @@ class AppConfig:
     blink_suppression_ms: int = 300        # Milliseconds to suppress capture after blink detected
     min_consecutive_qualified: int = 2     # Require N consecutive qualified frames before capture
 
+    # Web server path safety
+    # Directories the web UI is allowed to read videos from, as an OS-path-separator
+    # separated list in TG_VIDEO_ROOTS. Empty means "anywhere the process can read",
+    # which is the historical behaviour — set it when the port is reachable by anyone
+    # you don't trust, since these endpoints have no authentication.
+    video_scan_roots: str = field(default_factory=lambda: os.environ.get("TG_VIDEO_ROOTS", "").strip())
+    max_upload_mb: int = int(os.environ.get("TG_MAX_UPLOAD_MB", "4096"))
+    # Directories the web UI's folder picker may browse, OS-path-separator separated.
+    # Empty means anywhere the process can read, which is the historical behaviour for
+    # these endpoints. Set it alongside TG_VIDEO_ROOTS when the port is exposed.
+    output_browse_roots: str = field(default_factory=lambda: os.environ.get("TG_OUTPUT_ROOTS", "").strip())
+
     # RTSP Reconnection
     rtsp_max_retries: int = 10             # Max reconnection attempts before giving up
     rtsp_backoff_base: float = 1.0         # Initial retry delay in seconds
     rtsp_backoff_max: float = 30.0         # Maximum retry delay in seconds
     
-    # Duplicate Frame Detection
-    duplicate_mse_threshold: float = 50.0  # Max MSE between frames to consider them duplicates
+    # Capture spacing. Two keepers from the same few seconds are one shot with
+    # variations, so retention prefers spread-out captures and a new one only displaces
+    # a nearby one if it scores higher. 0 disables spacing.
+    min_capture_spacing_sec: float = 20.0
 
     # Weights & Thresholds
     weights: QualityWeights = field(default_factory=QualityWeights)

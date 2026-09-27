@@ -3,12 +3,13 @@ import time
 import os
 import threading
 from collections import deque
-from dataclasses import dataclass
-from typing import Optional, Callable, Dict, Any, List
+from dataclasses import dataclass, field
+from typing import Optional, Callable, Dict, Any, List, Tuple
 import numpy as np
 
 from config import AppConfig
 from analyzer import PersonQualityAnalyzer, AnalysisResult
+from ai_judge import AIJudge, JudgeResult
 
 @dataclass
 class CapturedScreenshot:
@@ -16,6 +17,73 @@ class CapturedScreenshot:
     timestamp_str: str
     overall_score: float
     analysis: AnalysisResult
+    crop_filepath: Optional[str] = None   # Subject-tight crop written alongside, if enabled
+    captured_at: float = 0.0              # time.time() at capture, for spacing decisions
+    heuristic_score: float = 0.0          # Analyzer score before the judge weighed in
+    judge_score: Optional[float] = None   # Vision-model score, if the judge ran
+    judge_summary: str = ""
+    judge_issues: List[str] = field(default_factory=list)
+
+
+def subject_crop_rect(analysis: AnalysisResult, frame_w: int, frame_h: int,
+                      padding: float = 0.08) -> Optional[Tuple[int, int, int, int]]:
+    """Rectangle tightly framing the subject, for the companion crop.
+
+    Uses the pose-derived subject box when available, falling back to an estimate from
+    the face box. Returns None if neither is usable.
+    """
+    faces = analysis.faces or []
+    primary = faces[0] if faces else None
+    rect = getattr(primary, "subject_bbox", None) if primary else None
+
+    if not rect or rect[2] <= 0 or rect[3] <= 0:
+        bbox = analysis.face_bbox
+        if not bbox or bbox[2] <= 0 or bbox[3] <= 0:
+            return None
+        fx, fy, fw, fh = bbox
+        # Roughly head-to-thigh from the face box alone.
+        rect = (fx - fw, fy - int(fh * 0.4), fw * 3, int(fh * 8.0))
+
+    x, y, w, h = rect
+    pad_x, pad_y = int(w * padding), int(h * padding)
+    x0 = max(0, x - pad_x)
+    y0 = max(0, y - pad_y)
+    x1 = min(frame_w, x + w + pad_x)
+    y1 = min(frame_h, y + h + pad_y)
+    if x1 - x0 < 16 or y1 - y0 < 16:
+        return None
+    return (x0, y0, x1 - x0, y1 - y0)
+
+
+def write_capture(frame: np.ndarray, analysis: AnalysisResult, out_dir: str,
+                  base_name: str, config: AppConfig) -> Tuple[str, Optional[str]]:
+    """Writes a capture (and optionally its subject crop) and returns both paths.
+
+    Shared by live capture and the offline video scanner so both produce identical
+    output, in the same format, with the same naming.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    fmt = (config.capture_format or "png").lower().lstrip(".")
+    if fmt not in ("png", "jpg", "jpeg"):
+        fmt = "png"
+    ext = ".png" if fmt == "png" else ".jpg"
+    params = [] if fmt == "png" else [int(cv2.IMWRITE_JPEG_QUALITY), int(config.jpeg_quality)]
+
+    filepath = os.path.join(out_dir, base_name + ext)
+    cv2.imwrite(filepath, frame, params)
+
+    crop_path = None
+    if config.save_subject_crop:
+        h, w = frame.shape[:2]
+        rect = subject_crop_rect(analysis, w, h, config.subject_crop_padding)
+        if rect:
+            cx, cy, cw, ch = rect
+            crop = frame[cy:cy + ch, cx:cx + cw]
+            if crop.size > 0:
+                crop_path = os.path.join(out_dir, base_name + "_subject" + ext)
+                cv2.imwrite(crop_path, crop, params)
+
+    return filepath, crop_path
 
 class StreamProcessor:
     # Connection status constants
@@ -33,7 +101,8 @@ class StreamProcessor:
             stability_window=config.score_stability_window,
             stability_threshold=config.score_stability_threshold,
             blink_suppression_ms=config.blink_suppression_ms,
-            max_people_target=config.max_people_target
+            max_people_target=config.max_people_target,
+            pose_hand_interval=getattr(config, "pose_hand_interval", 1)
         )
         self.on_frame_callback = on_frame_callback
         self.on_capture_callback = on_capture_callback
@@ -57,9 +126,13 @@ class StreamProcessor:
         
         # Score trend tracking for local peak detection
         self._score_history: deque = deque(maxlen=20)
+
+        # Second-opinion review. The analysis thread must never wait on the network,
+        # so candidates are handed to a single worker that reviews and then saves.
+        self.judge = AIJudge(config)
+        self._review_lock = threading.Lock()
+        self._review_in_flight: bool = False
         
-        # Duplicate frame detection: store last captured frame's fingerprint
-        self._last_captured_frame: Optional[np.ndarray] = None
         
         # Connection status tracking
         self.connection_status: str = self.STATUS_DISCONNECTED
@@ -67,7 +140,8 @@ class StreamProcessor:
         self.on_status_callback: Optional[Callable[[str, int], None]] = None
         
         # Stats
-        self.frames_processed = 0
+        self.frames_grabbed = 0        # Frames read off the stream (drives the preview)
+        self.frames_processed = 0      # Frames actually scored
         self.captures_count = 0
         self.current_fps = 0.0
 
@@ -203,6 +277,7 @@ class StreamProcessor:
             # Store latest frame
             with self.frame_lock:
                 self.latest_frame = frame
+                self.frames_grabbed += 1
 
             # Yield slightly to prevent 100% CPU lock in grabber thread
             time.sleep(0.001)
@@ -268,6 +343,10 @@ class StreamProcessor:
             sleep_needed = frame_delay - process_duration
             if sleep_needed > 0:
                 time.sleep(sleep_needed)
+            else:
+                # Analysis is already slower than the requested rate. Yield anyway so
+                # this thread can't starve the grabber and the web server on a NAS.
+                time.sleep(0.002)
 
     def _is_at_local_peak(self) -> bool:
         """Check if the score trend is at or near a local peak or high plateau."""
@@ -289,24 +368,33 @@ class StreamProcessor:
         # Allow peak at position 1, 2, 3, or 4
         return peak_idx >= 1
 
-    def _is_duplicate_frame(self, frame: np.ndarray) -> bool:
-        """Check if the new frame is nearly identical to the last captured frame.
-        
-        Uses Mean Squared Error (MSE) on downsampled frames for speed.
+    def _would_improve_retained(self, score: float, now: float) -> bool:
+        """Is this capture worth writing, given what is already kept?
+
+        This replaced a check that compared each candidate against the *last saved*
+        score and demanded a 2% improvement over it unless the frame looked visually
+        different. That was a ratchet: one strong capture pinned the bar high, a seated
+        speaker rarely looks "different" enough at 160x120, and capturing quietly
+        stopped for the rest of the service — even for frames that would have replaced
+        the weakest of the five kept. The question that matters is whether this frame
+        improves the kept set, so that is what is asked.
         """
-        if self._last_captured_frame is None:
-            return False
-        
-        try:
-            # Downsample both frames for fast comparison
-            target_size = (160, 120)
-            new_small = cv2.resize(frame, target_size, interpolation=cv2.INTER_NEAREST)
-            old_small = cv2.resize(self._last_captured_frame, target_size, interpolation=cv2.INTER_NEAREST)
-            
-            mse = float(np.mean((new_small.astype(float) - old_small.astype(float)) ** 2))
-            return mse < self.config.duplicate_mse_threshold
-        except Exception:
-            return False
+        if not self.config.single_winner_mode:
+            return True
+        n = max(1, self.config.max_retained_captures)
+        kept = self.saved_captures
+        if len(kept) < n:
+            return True
+
+        spacing = max(0.0, float(getattr(self.config, "min_capture_spacing_sec", 0.0)))
+        if spacing > 0:
+            # A better version of a moment already represented replaces it; a weaker
+            # one is not worth a second copy of the same few seconds.
+            nearby = [c for c in kept if abs(now - c.captured_at) < spacing]
+            if nearby:
+                return score > max(c.overall_score for c in nearby)
+
+        return score > min(c.overall_score for c in kept)
 
     def _evaluate_and_trigger_capture(self, now: float):
         if not self.candidate_buffer:
@@ -324,47 +412,119 @@ class StreamProcessor:
         if not self._is_at_local_peak():
             return
         
-        # === Duplicate Frame Detection ===
-        if self._is_duplicate_frame(best_frame):
-            print(f"[StreamProcessor] Skipped duplicate frame (too similar to last capture)")
+        # === Would this actually improve what we're keeping? ===
+        if not self._would_improve_retained(best_analysis.overall_score, now):
             return
-        
-        # All checks passed — save the screenshot
-        self._last_captured_frame = best_frame.copy()
-        self.save_screenshot(best_frame, best_analysis)
+
+        # All checks passed — either save now, or send it for review first.
+        if self.judge.available:
+            if not self._start_review(best_frame, best_analysis, now):
+                return   # a review is already running; the next candidate will come along
+        else:
+            self.save_screenshot(best_frame, best_analysis)
+        # Reports the terms that actually drive the pick. Plain "deg" rather than the
+        # degree sign, which mojibakes on a default Windows console codepage.
+        flags = []
+        if best_analysis.is_smiling:
+            flags.append("smile")
+        if best_analysis.hands_on_torso:
+            flags.append("hands-on-body")
+        if best_analysis.is_subject_clipped:
+            flags.append("clipped")
         print(f"[Capture] Score={best_analysis.overall_score:.0%} "
-              f"Smoothed={best_analysis.smoothed_score:.0%} "
-              f"Stable={best_analysis.is_stable} "
-              f"Pitch={best_analysis.pitch_deg:.1f}° "
-              f"Roll={best_analysis.roll_deg:.1f}° "
-              f"LookDown={best_analysis.is_looking_down} "
-              f"MouthOpen={best_analysis.is_awkward_expression} "
-              f"HandWeird={best_analysis.is_hand_weird} "
-              f"HandBlur={best_analysis.is_hand_blurry} "
-              f"MAR={best_analysis.mar:.2f} "
-              f"Exposure={best_analysis.exposure_score:.2f} "
-              f"Centering={best_analysis.centering_score:.2f}")
+              f"Sharp={best_analysis.sharpness_score:.2f}({int(best_analysis.laplacian_variance)}) "
+              f"Cutout={best_analysis.cutout_score:.2f} "
+              f"Subject={best_analysis.subject_height_ratio:.0%}h "
+              f"Bg={best_analysis.background_score:.2f} "
+              f"Yaw={best_analysis.yaw_deg:.0f}deg "
+              f"Pitch={best_analysis.pitch_deg:.0f}deg "
+              f"Exposure={best_analysis.exposure_score:.2f}"
+              + (f" [{', '.join(flags)}]" if flags else ""))
         self.last_capture_time = now
         self.candidate_buffer.clear()
 
-    def save_screenshot(self, frame: np.ndarray, analysis: AnalysisResult) -> CapturedScreenshot:
+    def _start_review(self, frame: np.ndarray, analysis: AnalysisResult, now: float) -> bool:
+        """Kicks off an asynchronous judge review. Returns False if one is already running."""
+        with self._review_lock:
+            if self._review_in_flight:
+                return False
+            self._review_in_flight = True
+        # Cooldown starts at hand-off, not at save, so the analysis loop doesn't queue
+        # up a second candidate while the first is still being reviewed.
+        self.last_capture_time = now
+        self.candidate_buffer.clear()
+        threading.Thread(target=self._review_and_save, args=(frame.copy(), analysis),
+                         daemon=True).start()
+        return True
+
+    def _review_and_save(self, frame: np.ndarray, analysis: AnalysisResult) -> None:
+        try:
+            h, w = frame.shape[:2]
+            rect = subject_crop_rect(analysis, w, h, self.config.subject_crop_padding)
+            crop = frame if rect is None else frame[rect[1]:rect[1] + rect[3], rect[0]:rect[0] + rect[2]]
+            notes = list(getattr(analysis, "disqualified_reasons", []) or [])
+            if analysis.hands_on_torso:
+                notes.append("hands over the torso")
+            if analysis.is_subject_clipped:
+                notes.append("subject runs off the frame edge")
+
+            result = self.judge.judge(crop, analysis.overall_score, notes)
+
+            # "Unusable" is a hard no only once there is something better to keep. Early
+            # in a service it is a heavy penalty instead, so a strict judge can never
+            # leave the gallery empty - the same reason the heuristics don't hard-gate.
+            if result.verdict is not None and not result.verdict.usable:
+                n = max(1, self.config.max_retained_captures)
+                if not self.config.single_winner_mode or len(self.saved_captures) >= n:
+                    print(f"[AIJudge] Rejected ({analysis.overall_score:.0%} -> judge "
+                          f"{result.verdict.score:.0%}): {result.verdict.summary}")
+                    return
+                result.blended_score = round(min(result.blended_score, analysis.overall_score * 0.5), 3)
+
+            # Re-check against the kept set with the blended score: the review took a
+            # few seconds, and a better capture may have landed meanwhile.
+            if not self._would_improve_retained(result.blended_score, time.time()):
+                return
+
+            self.save_screenshot(frame, analysis, review=result)
+        except Exception as e:  # noqa: BLE001 - a review failure must not kill the worker
+            print(f"[AIJudge] Review worker error: {e}")
+        finally:
+            with self._review_lock:
+                self._review_in_flight = False
+
+    def save_screenshot(self, frame: np.ndarray, analysis: AnalysisResult,
+                        review: Optional[JudgeResult] = None) -> CapturedScreenshot:
         """Saves screenshot frame to disk and prunes inferior shots if Single Winner Mode is enabled."""
-        os.makedirs(self.config.output_dir, exist_ok=True)
-        
+        heuristic = analysis.overall_score
+        final_score = heuristic
+        verdict = review.verdict if review else None
+        if verdict is not None:
+            final_score = review.blended_score
+
         timestamp_str = time.strftime("%Y%m%d_%H%M%S")
         ms_str = f"{int((time.time() % 1) * 1000):03d}"
-        filename = f"best_shot_{timestamp_str}_{ms_str}_score_{int(analysis.overall_score * 100)}.jpg"
-        filepath = os.path.join(self.config.output_dir, filename)
+        base_name = f"best_shot_{timestamp_str}_{ms_str}_score_{int(final_score * 100)}"
 
-        # Save JPEG at maximum quality (95)
-        cv2.imwrite(filepath, frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-        
+        filepath, crop_path = write_capture(
+            frame, analysis, self.config.output_dir, base_name, self.config
+        )
+
         capture_item = CapturedScreenshot(
             filepath=filepath,
             timestamp_str=timestamp_str,
-            overall_score=analysis.overall_score,
-            analysis=analysis
+            overall_score=final_score,
+            analysis=analysis,
+            crop_filepath=crop_path,
+            captured_at=time.time(),
+            heuristic_score=heuristic,
+            judge_score=(float(verdict.score) if verdict is not None else None),
+            judge_summary=(verdict.summary if verdict is not None else ""),
+            judge_issues=(list(verdict.issues) if verdict is not None else []),
         )
+        if verdict is not None:
+            print(f"[AIJudge] Kept ({heuristic:.0%} -> judge {verdict.score:.0%} = {final_score:.0%}, "
+                  f"{review.latency_sec:.1f}s): {verdict.summary}")
         
         self.saved_captures.append(capture_item)
         
@@ -383,21 +543,37 @@ class StreamProcessor:
         if not self.saved_captures:
             return
 
-        # Sort captures by overall_score descending
-        self.saved_captures.sort(key=lambda item: item.overall_score, reverse=True)
-        
-        # Keep top N
-        winners = self.saved_captures[:n]
-        losers = self.saved_captures[n:]
+        # Best first, but five shots from the same ten seconds are one shot with
+        # variations. Spread the keepers out, then relax the spacing only if there
+        # aren't enough well-separated shots to fill the slots.
+        ordered = sorted(self.saved_captures, key=lambda item: item.overall_score, reverse=True)
+        spacing = max(0.0, float(getattr(self.config, "min_capture_spacing_sec", 0.0)))
+        winners: List[CapturedScreenshot] = []
+        for enforce in (True, False):
+            for c in ordered:
+                if len(winners) >= n:
+                    break
+                if c in winners:
+                    continue
+                if enforce and spacing > 0 and any(
+                    abs(c.captured_at - w.captured_at) < spacing for w in winners
+                ):
+                    continue
+                winners.append(c)
+        losers = [c for c in ordered if c not in winners]
+        winners.sort(key=lambda item: item.overall_score, reverse=True)
         
         # Delete inferior screenshot files from disk
         for loser in losers:
-            if os.path.exists(loser.filepath):
-                try:
-                    os.remove(loser.filepath)
-                    print(f"[StreamProcessor] Pruned inferior shot: {loser.filepath} (Score: {loser.overall_score})")
-                except Exception as e:
-                    print(f"[StreamProcessor] Error deleting file {loser.filepath}: {e}")
+            # Remove the companion subject crop alongside the full frame, otherwise
+            # pruning leaves orphaned crops of shots that were deleted.
+            for path in (loser.filepath, loser.crop_filepath):
+                if path and os.path.exists(path):
+                    try:
+                        os.remove(path)
+                        print(f"[StreamProcessor] Pruned inferior shot: {path} (Score: {loser.overall_score})")
+                    except Exception as e:
+                        print(f"[StreamProcessor] Error deleting file {path}: {e}")
 
         self.saved_captures = winners
         self.captures_count = len(winners)

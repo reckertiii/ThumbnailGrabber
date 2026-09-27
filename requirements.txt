@@ -2,14 +2,23 @@
 opencv-python>=4.8.0
 mediapipe>=0.10.0,<1.0.0
 numpy>=1.24.0
-scipy>=1.10.0
 pillow>=9.5.0
 scikit-learn>=1.3.0
-joblib>=1.3.0
 
-# Desktop GUI
+# Desktop GUI. The Dockerfile filters this line out, so the container image doesn't
+# carry Qt; the web UI and the headless CLI scanner don't need it.
 PyQt6>=6.5.0
 
 # Web UI
 fastapi>=0.110.0
 uvicorn[standard]>=0.27.0
+# Required by the /api/video/upload endpoint. Without it FastAPI raises at import
+# time and the whole web server fails to start, not just that one route.
+python-multipart>=0.0.9
+
+# AI judge. Declared explicitly because ai_judge.py imports it directly rather than
+# relying on it arriving as a FastAPI dependency.
+pydantic>=2.0
+# Only needed for the Claude API backend; the local Ollama backend talks plain HTTP.
+# Harmless to install either way - the judge stays off without credentials.
+anthropic>=1.7.0

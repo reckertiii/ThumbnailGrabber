@@ -3,6 +3,7 @@ import os
 import cv2
 import time
 import numpy as np
+import threading
 from typing import Optional, List, Callable, Dict, Tuple
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
@@ -11,16 +12,17 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QLineEdit,
     QSlider, QCheckBox, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox,
     QScrollArea, QFrame, QSplitter, QFileDialog, QMessageBox, QProgressBar,
-    QStyleOption, QStyle, QSpinBox, QComboBox
+    QStyleOption, QStyle, QSpinBox, QComboBox, QDialog
 )
 
 from config import AppConfig, QualityWeights, QualityThresholds
 from analyzer import AnalysisResult
 from stream_processor import StreamProcessor, CapturedScreenshot
 from overlay import draw_overlay
+from video_scanner import VideoRecordingScanner, ScanProgress, VideoInfo
 
 DARK_STYLESHEET = """
-QMainWindow {
+QMainWindow, QDialog {
     background-color: #0f172a;
 }
 QWidget {
@@ -63,6 +65,14 @@ QPushButton#btn_preset {
 QPushButton#btn_preset:hover {
     background-color: #0f766e;
 }
+QPushButton#btn_scan_video {
+    background-color: #7c3aed;
+    color: #ffffff;
+    font-weight: bold;
+}
+QPushButton#btn_scan_video:hover {
+    background-color: #6d28d9;
+}
 QPushButton#btn_capture {
     background-color: #16a34a;
     font-size: 14px;
@@ -78,6 +88,16 @@ QLineEdit {
     color: #f8fafc;
 }
 QLineEdit:focus {
+    border: 1px solid #38bdf8;
+}
+QComboBox, QSpinBox {
+    background-color: #0f172a;
+    border: 1px solid #475569;
+    border-radius: 6px;
+    padding: 6px 10px;
+    color: #f8fafc;
+}
+QComboBox:focus, QSpinBox:focus {
     border: 1px solid #38bdf8;
 }
 QProgressBar {
@@ -254,6 +274,367 @@ class ThumbnailCard(QFrame):
     def mousePressEvent(self, event):
         self.on_click_callback(self.capture)
 
+class VideoScanWorker(QThread):
+    progress_signal = pyqtSignal(object)
+    finished_signal = pyqtSignal(list)
+    error_signal = pyqtSignal(str)
+
+    def __init__(self, video_path: str, top_n: int, min_score: float, sample_fps: float,
+                 min_interval_sec: float, output_dir: str, config: AppConfig):
+        super().__init__()
+        self.video_path = video_path
+        self.top_n = top_n
+        self.min_score = min_score
+        self.sample_fps = sample_fps
+        self.min_interval_sec = min_interval_sec
+        self.output_dir = output_dir
+        self.config = config
+        self.cancel_event = threading.Event()
+
+    def run(self):
+        try:
+            scanner = VideoRecordingScanner(self.config)
+            results = scanner.scan_video(
+                video_path=self.video_path,
+                top_n=self.top_n,
+                min_score=self.min_score,
+                sample_fps=self.sample_fps,
+                min_interval_sec=self.min_interval_sec,
+                output_dir=self.output_dir,
+                progress_callback=lambda p: self.progress_signal.emit(p),
+                cancel_event=self.cancel_event
+            )
+            self.finished_signal.emit(results)
+        except Exception as e:
+            self.error_signal.emit(str(e))
+
+    def cancel(self):
+        self.cancel_event.set()
+
+class VideoScanDialog(QDialog):
+    scan_completed_signal = pyqtSignal(list)
+
+    def __init__(self, parent=None, config: Optional[AppConfig] = None):
+        super().__init__(parent)
+        self.config = config or AppConfig()
+        self.worker: Optional[VideoScanWorker] = None
+        self.video_info: Optional[VideoInfo] = None
+        self.scanned_results: List[CapturedScreenshot] = []
+
+        self.setWindowTitle("Scan Video Recording — Best Thumbnail Picker")
+        self.resize(800, 680)
+        self.setStyleSheet(DARK_STYLESHEET)
+
+        self._init_ui()
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        # Header
+        lbl_header = QLabel("📼 Scan Video Recording for Best Thumbnails")
+        lbl_header.setFont(QFont("Segoe UI", 15, QFont.Weight.Bold))
+        lbl_header.setStyleSheet("color: #a78bfa;")
+        layout.addWidget(lbl_header)
+
+        lbl_sub = QLabel("Select any pre-recorded video (MP4, MOV, MKV, AVI) to analyze head pose, eye openness, expressions, and posture to extract the highest-quality shots.")
+        lbl_sub.setStyleSheet("color: #94a3b8; font-size: 12px;")
+        lbl_sub.setWordWrap(True)
+        layout.addWidget(lbl_sub)
+
+        # 1. Video File Selection Group
+        grp_file = QGroupBox("Video File")
+        grp_file_layout = QVBoxLayout(grp_file)
+
+        file_row = QHBoxLayout()
+        self.txt_video_path = QLineEdit()
+        self.txt_video_path.setPlaceholderText("Select a video file to scan...")
+        self.txt_video_path.textChanged.connect(self._on_video_path_changed)
+        btn_browse = QPushButton("📂 Browse Video...")
+        btn_browse.clicked.connect(self._on_browse_video)
+        file_row.addWidget(self.txt_video_path)
+        file_row.addWidget(btn_browse)
+        grp_file_layout.addLayout(file_row)
+
+        self.lbl_video_info = QLabel("No video selected. Select a file above.")
+        self.lbl_video_info.setStyleSheet("color: #38bdf8; font-size: 12px; font-weight: 500;")
+        grp_file_layout.addWidget(self.lbl_video_info)
+        layout.addWidget(grp_file)
+
+        # 2. Settings Grid Group
+        grp_settings = QGroupBox("Scan Configuration")
+        grid_settings = QGridLayout(grp_settings)
+        grid_settings.setVerticalSpacing(8)
+        grid_settings.setHorizontalSpacing(12)
+
+        # Number of Top Thumbnails
+        grid_settings.addWidget(QLabel("Top Best Thumbnails to Pick:"), 0, 0)
+        self.spn_top_n = QSpinBox()
+        self.spn_top_n.setRange(1, 50)
+        self.spn_top_n.setValue(5)
+        self.spn_top_n.setSuffix(" Thumbnails")
+        grid_settings.addWidget(self.spn_top_n, 0, 1)
+
+        # Sampling Speed
+        grid_settings.addWidget(QLabel("Scanning Speed / Rate:"), 0, 2)
+        self.cmb_speed = QComboBox()
+        self.cmb_speed.addItem("Fast (5 FPS sampling — Recommended)", 5.0)
+        self.cmb_speed.addItem("Ultra-Fast (2 FPS sampling)", 2.0)
+        self.cmb_speed.addItem("High Precision (10 FPS sampling)", 10.0)
+        self.cmb_speed.addItem("Exhaustive (Every Frame)", 0.0)
+        grid_settings.addWidget(self.cmb_speed, 0, 3)
+
+        # Quality Threshold Slider
+        grid_settings.addWidget(QLabel("Min Quality Threshold:"), 1, 0)
+        self.lbl_min_score = QLabel("55%")
+        self.sld_min_score = QSlider(Qt.Orientation.Horizontal)
+        self.sld_min_score.setRange(30, 95)
+        self.sld_min_score.setValue(55)
+        self.sld_min_score.valueChanged.connect(lambda v: self.lbl_min_score.setText(f"{v}%"))
+        score_layout = QHBoxLayout()
+        score_layout.addWidget(self.sld_min_score)
+        score_layout.addWidget(self.lbl_min_score)
+        grid_settings.addLayout(score_layout, 1, 1)
+
+        # Time Interval / Diversity Separation
+        grid_settings.addWidget(QLabel("Min Time Gap (Diversity):"), 1, 2)
+        self.lbl_interval = QLabel("2.0s")
+        self.sld_interval = QSlider(Qt.Orientation.Horizontal)
+        self.sld_interval.setRange(5, 100) # 0.5s to 10.0s
+        self.sld_interval.setValue(20)
+        self.sld_interval.valueChanged.connect(lambda v: self.lbl_interval.setText(f"{v/10.0:.1f}s"))
+        interval_layout = QHBoxLayout()
+        interval_layout.addWidget(self.sld_interval)
+        interval_layout.addWidget(self.lbl_interval)
+        grid_settings.addLayout(interval_layout, 1, 3)
+
+        # Output folder
+        grid_settings.addWidget(QLabel("Output Folder:"), 2, 0)
+        self.txt_output_dir = QLineEdit(self.config.output_dir)
+        btn_browse_out = QPushButton("Browse...")
+        btn_browse_out.clicked.connect(self._on_browse_output)
+        out_row = QHBoxLayout()
+        out_row.addWidget(self.txt_output_dir)
+        out_row.addWidget(btn_browse_out)
+        grid_settings.addLayout(out_row, 2, 1, 1, 3)
+
+        layout.addWidget(grp_settings)
+
+        # 3. Live Progress & Preview Group
+        grp_progress = QGroupBox("Scan Progress & Live Preview")
+        v_prog_layout = QVBoxLayout(grp_progress)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        v_prog_layout.addWidget(self.progress_bar)
+
+        self.lbl_status = QLabel("Ready to scan.")
+        self.lbl_status.setStyleSheet("color: #cbd5e1; font-weight: 500; font-size: 12px;")
+        v_prog_layout.addWidget(self.lbl_status)
+
+        # Preview frames side-by-side
+        h_previews = QHBoxLayout()
+        
+        # Left preview: Current Frame
+        v_curr = QVBoxLayout()
+        lbl_curr_title = QLabel("Current Frame Scanning")
+        lbl_curr_title.setStyleSheet("color: #94a3b8; font-size: 11px; font-weight: bold;")
+        lbl_curr_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_preview_curr = QLabel("Video Preview")
+        self.lbl_preview_curr.setFixedSize(360, 202)
+        self.lbl_preview_curr.setStyleSheet("background-color: #020617; border: 1px solid #334155; border-radius: 6px;")
+        self.lbl_preview_curr.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v_curr.addWidget(lbl_curr_title)
+        v_curr.addWidget(self.lbl_preview_curr)
+        h_previews.addLayout(v_curr)
+
+        # Right preview: Champion Best Thumbnail
+        v_champ = QVBoxLayout()
+        lbl_champ_title = QLabel("⭐ Champion Best Shot Found")
+        lbl_champ_title.setStyleSheet("color: #f59e0b; font-size: 11px; font-weight: bold;")
+        lbl_champ_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_preview_champ = QLabel("Best Shot Preview")
+        self.lbl_preview_champ.setFixedSize(360, 202)
+        self.lbl_preview_champ.setStyleSheet("background-color: #020617; border: 2px solid #f59e0b; border-radius: 6px;")
+        self.lbl_preview_champ.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v_champ.addWidget(lbl_champ_title)
+        v_champ.addWidget(self.lbl_preview_champ)
+        h_previews.addLayout(v_champ)
+
+        v_prog_layout.addLayout(h_previews)
+        layout.addWidget(grp_progress)
+
+        # 4. Action Buttons Bar
+        btn_bar = QHBoxLayout()
+        self.btn_start = QPushButton("▶  Start Scan")
+        self.btn_start.setStyleSheet("background-color: #7c3aed; font-size: 14px; font-weight: bold; padding: 10px 24px;")
+        self.btn_start.clicked.connect(self._on_toggle_scan)
+        btn_bar.addWidget(self.btn_start)
+
+        self.btn_open_out = QPushButton("📁 Open Output Folder")
+        self.btn_open_out.clicked.connect(self._on_open_output)
+        btn_bar.addWidget(self.btn_open_out)
+
+        btn_bar.addStretch()
+
+        self.btn_close = QPushButton("Close")
+        self.btn_close.clicked.connect(self.close)
+        btn_bar.addWidget(self.btn_close)
+
+        layout.addLayout(btn_bar)
+
+    def _on_browse_video(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Select Video File to Scan", "",
+            "Video Files (*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.ts *.wmv *.flv);;All Files (*.*)"
+        )
+        if file_path:
+            self.txt_video_path.setText(file_path)
+
+    def _on_browse_output(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Output Folder", self.txt_output_dir.text())
+        if folder:
+            self.txt_output_dir.setText(folder)
+
+    def _on_open_output(self):
+        folder = os.path.abspath(self.txt_output_dir.text().strip())
+        os.makedirs(folder, exist_ok=True)
+        os.startfile(folder)
+
+    def _on_video_path_changed(self, text: str):
+        path = text.strip()
+        if os.path.exists(path) and os.path.isfile(path):
+            info = VideoRecordingScanner.get_video_info(path)
+            if info:
+                self.video_info = info
+                dur_str = VideoRecordingScanner.format_time_display(info.duration_sec)
+                self.lbl_video_info.setText(
+                    f"✓ <b>{info.filename}</b> — Duration: <b>{dur_str}</b> ({info.duration_sec:.1f}s) | "
+                    f"Resolution: <b>{info.width}x{info.height}</b> | FPS: <b>{info.fps:.1f}</b> | Total Frames: <b>{info.total_frames:,}</b>"
+                )
+                self.lbl_video_info.setStyleSheet("color: #4ade80; font-size: 12px;")
+                return
+        self.video_info = None
+        self.lbl_video_info.setText("No valid video selected.")
+        self.lbl_video_info.setStyleSheet("color: #94a3b8; font-size: 12px;")
+
+    def _on_toggle_scan(self):
+        if self.worker and self.worker.isRunning():
+            # Stop scan
+            self.btn_start.setEnabled(False)
+            self.lbl_status.setText("Cancelling scan...")
+            self.worker.cancel()
+        else:
+            # Start scan
+            v_path = self.txt_video_path.text().strip()
+            if not v_path or not os.path.exists(v_path):
+                QMessageBox.warning(self, "Select Video", "Please select a valid video file first.")
+                return
+
+            out_dir = self.txt_output_dir.text().strip()
+            if not out_dir:
+                out_dir = self.config.output_dir
+
+            top_n = self.spn_top_n.value()
+            min_score = self.sld_min_score.value() / 100.0
+            sample_fps = float(self.cmb_speed.currentData())
+            min_interval_sec = self.sld_interval.value() / 10.0
+
+            self.btn_start.setText("⏹  Stop Scan")
+            self.btn_start.setStyleSheet("background-color: #dc2626; font-size: 14px; font-weight: bold; padding: 10px 24px;")
+            self.progress_bar.setValue(0)
+            self.lbl_status.setText("Initializing scanner...")
+            self.lbl_preview_curr.setText("Scanning...")
+            self.lbl_preview_champ.setText("Finding Best Shot...")
+
+            self.worker = VideoScanWorker(
+                video_path=v_path,
+                top_n=top_n,
+                min_score=min_score,
+                sample_fps=sample_fps,
+                min_interval_sec=min_interval_sec,
+                output_dir=out_dir,
+                config=self.config
+            )
+            self.worker.progress_signal.connect(self._on_scan_progress)
+            self.worker.finished_signal.connect(self._on_scan_finished)
+            self.worker.error_signal.connect(self._on_scan_error)
+            self.worker.start()
+
+    def _on_scan_progress(self, p: ScanProgress):
+        self.progress_bar.setValue(int(p.progress_pct))
+
+        curr_time = VideoRecordingScanner.format_time_display(p.current_time_sec)
+        tot_time = VideoRecordingScanner.format_time_display(p.total_duration_sec)
+        eta_str = f"{int(p.estimated_time_remaining_sec)}s" if p.estimated_time_remaining_sec > 0 else "0s"
+        speed_str = f"{p.fps_speed:.1f} FPS"
+        
+        best_str = f"Best Score: {int(p.best_score_found * 100)}%" if p.best_score_found > 0 else "No qualified face yet"
+        status_text = (
+            f"Scanning: <b>{curr_time} / {tot_time}</b> ({p.progress_pct:.0f}%) • "
+            f"Speed: <b>{speed_str}</b> • ETA: <b>{eta_str}</b> • {best_str}"
+        )
+        self.lbl_status.setText(status_text)
+
+        # Update preview frames
+        if p.current_frame is not None:
+            self._set_label_pixmap(self.lbl_preview_curr, p.current_frame)
+            
+        if p.champion_frame is not None:
+            self._set_label_pixmap(self.lbl_preview_champ, p.champion_frame)
+
+    def _set_label_pixmap(self, label: QLabel, frame_bgr: np.ndarray):
+        h, w, c = frame_bgr.shape
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        qimg = QImage(rgb.data, w, h, w * c, QImage.Format.Format_RGB888)
+        pix = QPixmap.fromImage(qimg)
+        label.setPixmap(pix.scaled(label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation))
+
+    def _on_scan_finished(self, results: List[CapturedScreenshot]):
+        self.scanned_results = results
+        self.btn_start.setText("▶  Start Scan")
+        self.btn_start.setStyleSheet("background-color: #7c3aed; font-size: 14px; font-weight: bold; padding: 10px 24px;")
+        self.btn_start.setEnabled(True)
+        self.progress_bar.setValue(100)
+
+        count = len(results)
+        self.lbl_status.setText(f"✓ <b>Scan Complete!</b> Successfully extracted <b>{count}</b> best thumbnail{'s' if count != 1 else ''}.")
+        self.lbl_status.setStyleSheet("color: #4ade80; font-weight: bold; font-size: 13px;")
+
+        self.scan_completed_signal.emit(results)
+
+        if count > 0:
+            best = results[0]
+            QMessageBox.information(
+                self, "Video Scan Finished",
+                f"Successfully extracted {count} best thumbnails from the video recording!\n\n"
+                f"• Top Champion Score: {int(best.overall_score * 100)}%\n"
+                f"• Saved To: {self.txt_output_dir.text()}\n\n"
+                f"The thumbnails have been imported into the main gallery."
+            )
+        else:
+            QMessageBox.warning(
+                self, "Scan Complete",
+                "Scan completed, but no frames met the minimum quality threshold.\n"
+                "Try lowering the Min Quality Threshold or checking the video."
+            )
+
+    def _on_scan_error(self, err_msg: str):
+        self.btn_start.setText("▶  Start Scan")
+        self.btn_start.setStyleSheet("background-color: #7c3aed; font-size: 14px; font-weight: bold; padding: 10px 24px;")
+        self.btn_start.setEnabled(True)
+        self.lbl_status.setText(f"Scan failed: {err_msg}")
+        self.lbl_status.setStyleSheet("color: #ef4444; font-weight: bold;")
+        QMessageBox.critical(self, "Scan Error", f"Error scanning video:\n{err_msg}")
+
+    def closeEvent(self, event):
+        if self.worker and self.worker.isRunning():
+            self.worker.cancel()
+            self.worker.wait(1000)
+        event.accept()
+
 class MainWindow(QMainWindow):
     frame_signal = pyqtSignal(np.ndarray, AnalysisResult)
     capture_signal = pyqtSignal(CapturedScreenshot)
@@ -321,6 +702,10 @@ class MainWindow(QMainWindow):
         btn_preset_sony = QPushButton("Sony SRG-A40 Preset")
         btn_preset_sony.setObjectName("btn_preset")
         btn_preset_sony.clicked.connect(self._on_preset_sony)
+
+        btn_scan_video = QPushButton("📼 Scan Video File...")
+        btn_scan_video.setObjectName("btn_scan_video")
+        btn_scan_video.clicked.connect(self._on_open_video_scanner)
         
         # Start/Stop Capture Button
         self.btn_start_stop = QPushButton("▶  Start Capture")
@@ -343,6 +728,7 @@ class MainWindow(QMainWindow):
         top_bar.addWidget(self.txt_source)
         top_bar.addWidget(btn_apply_source)
         top_bar.addWidget(btn_preset_sony)
+        top_bar.addWidget(btn_scan_video)
         top_bar.addWidget(self.btn_start_stop)
         
         main_layout.addLayout(top_bar)
@@ -418,7 +804,7 @@ class MainWindow(QMainWindow):
         self.lbl_sharpness = QLabel("Sharpness: --")
         self.lbl_hand = QLabel("Hand Position: --")
         self.lbl_exposure = QLabel("Exposure: --")
-        self.lbl_centering = QLabel("Centering: --")
+        self.lbl_centering = QLabel("Cutout: --")
         self.lbl_stability = QLabel("Stability: --")
         self.lbl_ai_model = QLabel("AI Preference Model: Untrained (Default Rule Mode)")
         self.lbl_ai_model.setStyleSheet("color: #38bdf8; font-weight: bold;")
@@ -602,8 +988,16 @@ class MainWindow(QMainWindow):
             exp_icon = "☀️" if analysis.face_brightness > 180 else ("🌑" if analysis.face_brightness < 60 else "✅")
             self.lbl_exposure.setText(f"Exposure: {exp_pct}% {exp_icon} ({analysis.face_brightness:.0f})")
             
-            ctr_pct = int(analysis.centering_score * 100)
-            self.lbl_centering.setText(f"Centering: {ctr_pct}%")
+            cut_pct = int(analysis.cutout_score * 100)
+            cut_flags = []
+            if analysis.is_subject_clipped:
+                cut_flags.append("CLIPPED ⚠️")
+            if analysis.hands_on_torso:
+                cut_flags.append("hands on body")
+            suffix = (" · " + " · ".join(cut_flags)) if cut_flags else ""
+            self.lbl_centering.setText(
+                f"Cutout: {cut_pct}% · subject {int(analysis.subject_height_ratio * 100)}% of frame"
+                f" · bg {int(analysis.background_score * 100)}%{suffix}")
             
             stab_icon = "🟢 Stable" if analysis.is_stable else "🟡 Unstable"
             self.lbl_stability.setText(f"Score: {stab_icon}")
@@ -611,7 +1005,7 @@ class MainWindow(QMainWindow):
             # Live AI Model Telemetry Readout
             if self.processor and self.processor.analyzer.preference_model.is_trained:
                 pm = self.processor.analyzer.preference_model
-                self.lbl_ai_model.setText(f"AI Model: Trained ({pm.confidence*100:.0f}% fit | {len(pm.samples)} samples | ML Score: {int(analysis.ml_score*100)}%)")
+                self.lbl_ai_model.setText(f"AI Model: Trained ({pm.confidence*100:.0f}% held-out accuracy | {len(pm.samples)} ratings | ML Score: {int(analysis.ml_score*100)}%)")
                 self.lbl_ai_model.setStyleSheet("color: #4ade80; font-weight: bold;")
             else:
                 self.lbl_ai_model.setText("AI Model: Untrained (Click ⭐ Best in gallery to train AI)")
@@ -625,7 +1019,7 @@ class MainWindow(QMainWindow):
             self.lbl_sharpness.setText("Sharpness: --")
             self.lbl_hand.setText("Hand Position: --")
             self.lbl_exposure.setText("Exposure: --")
-            self.lbl_centering.setText("Centering: --")
+            self.lbl_centering.setText("Cutout: --")
             self.lbl_stability.setText("Stability: --")
 
     def _on_status_changed(self, status: str, attempt: int):
@@ -689,6 +1083,10 @@ class MainWindow(QMainWindow):
             f"<b>Eye Aspect Ratio:</b> {capture.analysis.avg_ear:.2f}<br>"
             f"<b>Smile Ratio:</b> {capture.analysis.smile_ratio:.2f}<br>"
             f"<b>Sharpness Var:</b> {int(capture.analysis.laplacian_variance)}<br>"
+            + (f"<b>AI judge:</b> {int(capture.judge_score * 100)}% "
+               f"(analyzer {int(capture.heuristic_score * 100)}%)<br><i>{capture.judge_summary}</i><br>"
+               + (f"<b>Flagged:</b> {'; '.join(capture.judge_issues)}<br>" if capture.judge_issues else "")
+               if getattr(capture, "judge_score", None) is not None else "")
         )
         dlg.setInformativeText(info)
         dlg.setIconPixmap(QPixmap(capture.filepath).scaled(320, 180, Qt.AspectRatioMode.KeepAspectRatio))
@@ -798,6 +1196,23 @@ class MainWindow(QMainWindow):
             self.txt_output_path.setText(folder)
             if self.processor:
                 self.processor.config.output_dir = folder
+
+    def _on_open_video_scanner(self):
+        """Open the dedicated Video Recording Scanner dialog."""
+        dlg = VideoScanDialog(self, config=self.config)
+        dlg.scan_completed_signal.connect(self._on_video_scan_completed)
+        dlg.exec()
+
+    def _on_video_scan_completed(self, results: List[CapturedScreenshot]):
+        """Called when video scan finishes and extracts screenshots."""
+        if not results:
+            return
+        if self.processor:
+            for item in results:
+                # Avoid duplicate filepath entries
+                if not any(c.filepath == item.filepath for c in self.processor.saved_captures):
+                    self.processor.saved_captures.append(item)
+            self._refresh_gallery_display()
 
     def _on_start_stop(self):
         """Toggle auto-capture on/off. The video feed stays connected."""

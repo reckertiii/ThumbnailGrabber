@@ -2,22 +2,38 @@ import os
 import json
 import numpy as np
 from typing import List, Tuple, Dict, Any, Optional
-import joblib
 
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
+from sklearn.model_selection import cross_val_score, StratifiedKFold
 
 class UserPreferenceModel:
     """Scikit-Learn ML Model (Logistic Regression with StandardScaler)
     that learns user visual preference for thumbnail selection.
     
-    Extracts normalized 8-D feature vectors from AnalysisResult objects and
+    Extracts normalized 9-D feature vectors from AnalysisResult objects and
     trains on user feedback (⭐ Favorite = 1, 👎 Rejected = 0).
-    Persists model state and samples to models/scikit_preference_model.joblib.
+    Labelled samples persist to models/user_preference_model.json; the estimator is
+    refit from them on load.
     """
     
-    MODEL_PATH = os.path.join(os.getcwd(), "models", "scikit_preference_model.joblib")
-    JSON_DATA_PATH = os.path.join(os.getcwd(), "models", "user_preference_model.json")
+    # User ratings, unlike the downloaded weights, must persist across container
+    # restarts — so this stays on the mounted data directory.
+    JSON_DATA_PATH = os.path.join(
+        os.environ.get("TG_DATA_DIR", "").strip() or os.path.join(os.getcwd(), "models"),
+        "user_preference_model.json"
+    )
+
+    # Bump whenever the meaning or scale of any feature changes. Samples recorded under
+    # an older version describe different quantities, so mixing them in would train the
+    # model on nonsense; they are dropped on load instead.
+    #   v2: sharpness renormalised to a fixed face size, blendshape-derived eye/mouth
+    #       metrics, and cutout suitability replacing face centering.
+    FEATURE_VERSION = 2
+
+    # Below this many labelled samples the model isn't worth blending into the score.
+    MIN_SAMPLES_TO_TRAIN = 12
     
     FEATURE_NAMES = [
         "head_yaw_norm",        # 0: Head Turn (0=facing camera)
@@ -28,7 +44,7 @@ class UserPreferenceModel:
         "shoulder_tilt_norm",   # 5: Shoulder Tilt (0=level)
         "sharpness_norm",       # 6: Laplacian Sharpness
         "exposure_score",       # 7: Exposure/Lighting
-        "centering_score"       # 8: Centering/Framing
+        "cutout_score"          # 8: Cutout suitability (framing, size, clean background)
     ]
 
     def __init__(self):
@@ -52,18 +68,18 @@ class UserPreferenceModel:
         smile = min(1.0, max(0.0, getattr(analysis, 'smile_ratio', 0.5) / 1.0))
         mar = min(1.0, max(0.0, getattr(analysis, 'mar', 0.2)))
         shoulder_tilt_norm = min(1.0, max(0.0, getattr(analysis, 'shoulder_tilt_deg', 0.0) / 15.0))
-        sharp = min(1.0, max(0.0, getattr(analysis, 'laplacian_variance', 50.0) / 150.0))
+        sharp = min(1.0, max(0.0, (getattr(analysis, 'laplacian_variance', 40.0) - 8.0) / 62.0))
         exposure = min(1.0, max(0.0, getattr(analysis, 'exposure_score', 1.0)))
-        centering = min(1.0, max(0.0, getattr(analysis, 'centering_score', 0.5)))
+        cutout = min(1.0, max(0.0, getattr(analysis, 'cutout_score', 0.5)))
         
         return np.array([
             yaw_norm, pitch_norm, eye_open, smile,
-            mar, shoulder_tilt_norm, sharp, exposure, centering
+            mar, shoulder_tilt_norm, sharp, exposure, cutout
         ], dtype=np.float64)
 
     def predict(self, features: np.ndarray) -> float:
         """Predicts preference probability score (0.0 to 1.0) for a feature vector."""
-        if not self.is_trained or len(self.samples) < 2:
+        if not self.is_trained:
             return 0.5  # Neutral default prior to training
             
         try:
@@ -85,79 +101,101 @@ class UserPreferenceModel:
         self.save()
 
     def fit(self):
-        """Fits Scikit-Learn StandardScaler and LogisticRegression classifier."""
-        if len(self.samples) < 2:
-            self.is_trained = False
+        """Fits the scaler + classifier and estimates how well it actually generalises."""
+        self.is_trained = False
+        self.confidence = 0.0
+
+        if len(self.samples) < self.MIN_SAMPLES_TO_TRAIN:
             return
 
         X = np.array([s[0] for s in self.samples], dtype=np.float64)
         y = np.array([s[1] for s in self.samples], dtype=np.int32)
-        
-        # Check if we have at least 2 distinct classes
-        unique_classes = np.unique(y)
-        if len(unique_classes) < 2:
-            # Synthetic balancing sample to allow fitting before 2 distinct classes
-            dummy_label = 1 if unique_classes[0] == 0 else 0
-            dummy_x = np.ones((1, self.feature_count), dtype=np.float64) * 0.5
-            X = np.vstack([X, dummy_x])
-            y = np.append(y, dummy_label)
-        
+
+        # Both a liked and a disliked example are needed; one class alone says nothing
+        # about what distinguishes them. Waiting is better than fitting a synthetic
+        # placeholder row and calling the result a trained model.
+        classes, counts = np.unique(y, return_counts=True)
+        if len(classes) < 2 or counts.min() < 2:
+            return
+
         try:
+            self.scaler = StandardScaler()
+            self.clf = LogisticRegression(C=1.0, solver='liblinear')
             X_scaled = self.scaler.fit_transform(X)
             self.clf.fit(X_scaled, y)
             self.is_trained = True
-            
-            # Confidence metric: mean accuracy score
-            self.confidence = float(self.clf.score(X_scaled, y))
+            self.confidence = self._cross_val_accuracy(X, y)
         except Exception as e:
             print(f"[UserPreferenceModel] Scikit-Learn fit error: {e}")
 
-    def save(self):
-        """Saves scikit-learn model using joblib and metadata using JSON."""
-        os.makedirs(os.path.dirname(self.MODEL_PATH), exist_ok=True)
+    def _cross_val_accuracy(self, X: np.ndarray, y: np.ndarray) -> float:
+        """Held-out accuracy via stratified k-fold.
+
+        Scoring the model on the same rows it was fitted to reports how well it memorised
+        them, not how well it predicts — on a few dozen samples across nine features that
+        reads high no matter what. Cross-validation gives a number worth showing.
+        """
         try:
-            joblib.dump({"scaler": self.scaler, "clf": self.clf}, self.MODEL_PATH)
-            
+            n_splits = int(min(5, np.bincount(y).min()))
+            if n_splits < 2:
+                return 0.0
+            pipe = make_pipeline(StandardScaler(), LogisticRegression(C=1.0, solver='liblinear'))
+            cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=0)
+            return float(round(cross_val_score(pipe, X, y, cv=cv, scoring="accuracy").mean(), 4))
+        except Exception:
+            return 0.0
+
+    def save(self):
+        """Persists the labelled samples. The estimator itself is refit from these on
+        load, so there is no pickled model to fall out of step with the ratings."""
+        os.makedirs(os.path.dirname(self.JSON_DATA_PATH), exist_ok=True)
+        try:
             data = {
+                "feature_version": self.FEATURE_VERSION,
                 "is_trained": self.is_trained,
                 "confidence": self.confidence,
+                "confidence_metric": "cross_val_accuracy",
                 "sample_count": len(self.samples),
                 "samples": self.samples[-100:]
             }
             with open(self.JSON_DATA_PATH, "w") as f:
                 json.dump(data, f, indent=2)
         except Exception as e:
-            print(f"[UserPreferenceModel] Error saving scikit-learn model: {e}")
+            print(f"[UserPreferenceModel] Error saving preference data: {e}")
 
     def load(self):
-        """Loads scikit-learn model from joblib and JSON data with dimension migration support."""
-        if os.path.exists(self.MODEL_PATH):
-            try:
-                saved_state = joblib.load(self.MODEL_PATH)
-                # Verify scaler feature dimension
-                if hasattr(saved_state.get("scaler"), "n_features_in_") and saved_state["scaler"].n_features_in_ == self.feature_count:
-                    self.scaler = saved_state["scaler"]
-                    self.clf = saved_state["clf"]
-            except Exception as e:
-                print(f"[UserPreferenceModel] Joblib load error: {e}")
+        """Loads stored feedback, discarding it if it predates the current feature set."""
+        if not os.path.exists(self.JSON_DATA_PATH):
+            return
 
-        if os.path.exists(self.JSON_DATA_PATH):
-            try:
-                with open(self.JSON_DATA_PATH, "r") as f:
-                    data = json.load(f)
-                self.is_trained = bool(data.get("is_trained", False))
-                self.confidence = float(data.get("confidence", 0.0))
-                raw_samples = data.get("samples", [])
-                migrated = []
-                for s in raw_samples:
-                    feat, label = s[0], s[1]
-                    if len(feat) == 8:
-                        # Insert default 0.0 for shoulder_tilt_norm
-                        feat = feat[:5] + [0.0] + feat[5:]
-                    if len(feat) == self.feature_count:
-                        migrated.append((feat, label))
-                self.samples = migrated
-                if self.samples and (not hasattr(self.scaler, "n_features_in_") or self.scaler.n_features_in_ != self.feature_count):
-                    self.fit()
-            except Exception as e:
-                print(f"[UserPreferenceModel] JSON data load error: {e}")
+        try:
+            with open(self.JSON_DATA_PATH, "r") as f:
+                data = json.load(f)
+        except Exception as e:
+            print(f"[UserPreferenceModel] JSON data load error: {e}")
+            return
+
+        stored_version = int(data.get("feature_version", 1))
+        raw_samples = data.get("samples", [])
+
+        if stored_version != self.FEATURE_VERSION:
+            # The features these samples describe no longer mean the same thing, so the
+            # labels can't be reused. Keeping them would quietly bias every score.
+            if raw_samples:
+                print(f"[UserPreferenceModel] Discarding {len(raw_samples)} rating(s) recorded "
+                      f"under feature set v{stored_version}; the scoring metrics have changed "
+                      f"(now v{self.FEATURE_VERSION}). Re-rate a few captures to retrain.")
+            self.samples = []
+            self.is_trained = False
+            self.confidence = 0.0
+            return
+
+        self.samples = [
+            (feat, label) for feat, label in
+            ((s[0], s[1]) for s in raw_samples)
+            if len(feat) == self.feature_count
+        ]
+
+        # Refit from the samples rather than trusting a pickled estimator: it is cheap at
+        # this size and keeps the fitted model and the stored ratings from drifting apart.
+        self.fit()

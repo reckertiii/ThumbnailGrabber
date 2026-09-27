@@ -13,6 +13,7 @@
   <span id="statusText" class="status-text">Connecting…</span>
   <h1>AI Thumbnail Selector</h1>
   <span class="spacer"></span>
+  <button id="btnOpenScanModal" class="btn btn-purple">📼 Scan Video File</button>
   <label class="src-label" for="src">Source</label>
   <input id="src" type="text" placeholder="rtsp://… , 0, or file path">
   <button id="btnSource" class="btn">Connect Stream</button>
@@ -54,7 +55,7 @@
         <div class="metric" id="mShoulder">Shoulders: —</div>
         <div class="metric" id="mSharp">Sharpness: —</div>
         <div class="metric" id="mExposure">Exposure: —</div>
-        <div class="metric" id="mCentering">Centering: —</div>
+        <div class="metric" id="mCentering">Cutout: —</div>
         <div class="metric" id="mHand">Hand: —</div>
         <div class="metric wide" id="mStability">Stability: —</div>
         <div class="metric wide accent" id="mModel">AI Model: —</div>
@@ -103,6 +104,7 @@
     <div class="card">
       <h2>Output Folder</h2>
       <code id="outputDir" class="path">—</code>
+      <button id="btnPickFolder" class="btn" style="margin-top:8px">Change Folder…</button>
     </div>
 
   </section>
@@ -112,6 +114,120 @@
   <h2>Captured Best Screenshots</h2>
   <div id="gallery" class="gallery"><p class="muted">No captures yet — press Start Capture.</p></div>
 </section>
+
+<div id="folderModal" class="modal hidden">
+  <div class="modal-inner" style="max-width:640px">
+    <div class="modal-header">
+      <h2>Choose Output Folder</h2>
+      <button id="btnFolderCloseX" class="btn-close">✕</button>
+    </div>
+
+    <div class="modal-section">
+      <div class="row">
+        <input type="text" id="folderPath" placeholder="Type or paste a path, then press Enter">
+        <button id="btnFolderGo" class="btn">Go</button>
+      </div>
+      <div id="folderShortcuts" class="folder-shortcuts"></div>
+      <div id="folderList" class="folder-list"></div>
+      <div id="folderNote" class="scan-status">—</div>
+    </div>
+
+    <div class="modal-footer">
+      <label class="chk"><input type="checkbox" id="folderCreate"> Create it if it doesn't exist</label>
+      <button id="btnFolderUse" class="btn btn-green">Use This Folder</button>
+      <button id="btnFolderClose" class="btn">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<div id="videoScanModal" class="modal hidden">
+  <div class="modal-inner">
+    <div class="modal-header">
+      <h2>📼 Scan Video Recording — Best Thumbnail Picker</h2>
+      <button id="btnModalCloseX" class="btn-close">✕</button>
+    </div>
+    
+    <p class="hint">Analyze an entire video recording offline with AI head pose, eye openness, expressions, and posture scoring to pick out the best thumbnails.</p>
+
+    <div class="modal-section">
+      <h3>1. Select Video File</h3>
+      <div class="file-pick-row">
+        <input type="text" id="scanVideoPath" placeholder="Server file path, e.g. /app/captures/recording.mp4 or C:\Videos\recording.mp4">
+        <button id="btnCheckPath" class="btn">Inspect Path</button>
+      </div>
+      <div class="upload-row">
+        <span class="muted">Or upload from device:</span>
+        <input type="file" id="videoFileInput" accept="video/*">
+        <button id="btnUploadVideo" class="btn btn-purple">⬆ Upload & Scan</button>
+      </div>
+      <div id="scanVideoMeta" class="meta-banner hidden"></div>
+    </div>
+
+    <div class="modal-section">
+      <h3>2. Scan Configuration</h3>
+      <div class="scan-grid">
+        <div class="scan-field">
+          <label for="scanTopN">Top Thumbnails to Pick</label>
+          <input type="number" id="scanTopN" min="1" max="50" value="5">
+        </div>
+        <div class="scan-field">
+          <label for="scanSpeed">Scan Speed / Rate</label>
+          <select id="scanSpeed">
+            <option value="5.0" selected>Fast (5 FPS sampling — Recommended)</option>
+            <option value="2.0">Ultra-Fast (2 FPS sampling)</option>
+            <option value="10.0">High Precision (10 FPS sampling)</option>
+            <option value="0.0">Exhaustive (Every Frame)</option>
+          </select>
+        </div>
+        <div class="scan-field">
+          <label for="scanMinScore">Min Quality Threshold: <span id="outScanScore">55%</span></label>
+          <input type="range" id="scanMinScore" min="30" max="95" value="55">
+        </div>
+        <div class="scan-field">
+          <label for="scanInterval">Min Time Gap (Diversity): <span id="outScanInterval">2.0s</span></label>
+          <input type="range" id="scanInterval" min="5" max="100" value="20">
+        </div>
+      </div>
+    </div>
+
+    <div class="modal-section">
+      <h3>3. Output Folder</h3>
+      <div class="row">
+        <code id="scanOutputDir" class="path">—</code>
+        <button id="btnScanPickFolder" class="btn">Change…</button>
+      </div>
+    </div>
+
+    <div class="modal-section">
+      <h3>4. Scanning Progress & Live Preview</h3>
+      <div class="bar"><div id="scanProgBar" class="bar-fill"></div></div>
+      <div id="scanStatusText" class="scan-status">Ready to scan.</div>
+      
+      <div class="preview-duo">
+        <div class="preview-box">
+          <div class="preview-label">Current Frame</div>
+          <div class="preview-img-wrap">
+            <img id="scanCurrentFrame" src="" alt="Current frame preview" class="hidden">
+            <div id="scanCurrentPlaceholder" class="preview-placeholder">Waiting for scan…</div>
+          </div>
+        </div>
+        <div class="preview-box champion">
+          <div class="preview-label">⭐ Champion Best Thumbnail Found</div>
+          <div class="preview-img-wrap">
+            <img id="scanChampFrame" src="" alt="Champion best shot preview" class="hidden">
+            <div id="scanChampPlaceholder" class="preview-placeholder">Finding top shot…</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="modal-footer">
+      <button id="btnStartWebScan" class="btn btn-purple btn-large">▶ Start Scan</button>
+      <span class="spacer"></span>
+      <button id="btnScanClose" class="btn">Close</button>
+    </div>
+  </div>
+</div>
 
 <div id="lightbox" class="lightbox hidden">
   <div class="lightbox-inner">

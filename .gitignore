@@ -19,3 +19,10 @@ venv/
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# Ollama model weights when using the bundled local-ai compose profile
+ollama/
+
+# Editors
+.vscode/
+.idea/

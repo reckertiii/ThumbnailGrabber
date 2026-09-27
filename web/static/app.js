@@ -55,6 +55,7 @@ function render(d) {
 
   $("fps").textContent = `${d.fps ?? 0} fps`;
   $("outputDir").textContent = d.output_dir || "—";
+  $("scanOutputDir").textContent = d.output_dir || "—";
   if (!sourceFocused && $("src").value !== d.source) $("src").value = d.source || "";
 
   // Start / stop button
@@ -103,11 +104,20 @@ function render(d) {
     $("mSharp").textContent = `Sharpness: ${d.sharpness} · EMA ${Math.round(d.smoothed_score * 100)}%`;
     const expIcon = d.brightness > 180 ? "☀️" : d.brightness < 60 ? "🌑" : "✅";
     $("mExposure").textContent = `Exposure: ${Math.round(d.exposure_score * 100)}% ${expIcon} (${d.brightness})`;
-    $("mCentering").textContent = `Centering: ${Math.round(d.centering_score * 100)}%`;
+    const cutFlags = [d.is_subject_clipped ? "CLIPPED ⚠️" : null,
+                      d.hands_on_torso ? "hands on body" : null].filter(Boolean).join(" · ");
+    $("mCentering").textContent = `Cutout: ${Math.round(d.cutout_score * 100)}% · subject ${Math.round(d.subject_height_ratio * 100)}% of frame`
+      + ` · bg ${Math.round(d.background_score * 100)}%` + (cutFlags ? ` · ${cutFlags}` : "");
     $("mHand").textContent = `Hand: ${d.hands_covering_face ? "OBSTRUCTING ⚠️" : d.is_hand_blurry ? "BLURRY 🔄" : "CLEAR ✅"}`;
-    $("mStability").textContent = `Score: ${d.is_stable ? "🟢 Stable" : "🟡 Unstable"} · People detected: ${d.people_detected}`;
+    // Why nothing is saving. A high score with no captures otherwise looks like a
+    // broken button rather than the scorer holding out for a better frame.
+    const blockers = d.disqualified_reasons || [];
+    const holdText = d.is_qualified
+      ? "✅ capturing"
+      : (blockers.length ? `⏸ holding: ${blockers.slice(0, 2).join(" · ")}` : "⏸ holding");
+    $("mStability").textContent = `Score: ${d.is_stable ? "🟢 Stable" : "🟡 Unstable"} · People detected: ${d.people_detected} · ${holdText}`;
     $("mModel").textContent = d.ml_trained
-      ? `AI Model: Trained (${Math.round(d.ml_confidence * 100)}% fit · ${d.ml_samples} samples · ML score ${Math.round(d.ml_score * 100)}%)`
+      ? `AI Model: Trained (${Math.round(d.ml_confidence * 100)}% held-out accuracy · ${d.ml_samples} ratings · ML score ${Math.round(d.ml_score * 100)}%)`
       : "AI Model: Untrained — click ⭐ Best on a shot to train it";
   } else {
     ["mHead", "mEyes", "mExpr", "mShoulder", "mSharp", "mExposure", "mCentering", "mHand", "mStability"]
@@ -180,7 +190,7 @@ function renderGallery(caps) {
 async function feedback(filename, favorite) {
   try {
     const r = await post(`/api/captures/${encodeURIComponent(filename)}/feedback`, { favorite });
-    toast(`${favorite ? "⭐ Learned as a winner" : "👎 Learned to penalize"} — ${r.samples} samples, ${Math.round(r.confidence * 100)}% fit`);
+    toast(`${favorite ? "⭐ Learned as a winner" : "👎 Learned to penalize"} — ${r.samples} ratings` + (r.confidence ? `, ${Math.round(r.confidence * 100)}% held-out accuracy` : ", not enough ratings to train yet"));
   } catch (e) {
     toast("Training failed: " + e.message);
   }
@@ -196,7 +206,14 @@ function openLightbox(c) {
     <b>Eye aspect ratio:</b> ${c.avg_ear}<br>
     <b>Smile ratio:</b> ${c.smile_ratio}<br>
     <b>Sharpness:</b> ${c.sharpness}<br>
-    <b>File:</b> ${c.filename}`;
+    <b>Cutout suitability:</b> ${Math.round((c.cutout_score || 0) * 100)}%<br>` +
+    (c.judge_score != null
+      ? `<b>AI judge:</b> ${Math.round(c.judge_score * 100)}% (analyzer ${Math.round((c.heuristic_score || 0) * 100)}%)<br>`
+        + `<i>${c.judge_summary || ""}</i><br>`
+        + ((c.judge_issues || []).length ? `<b>Flagged:</b> ${c.judge_issues.join("; ")}<br>` : "")
+      : "") + `
+    <b>File:</b> ${c.filename}` +
+    (c.crop_url ? `<br><a href="${c.crop_url}" target="_blank" rel="noopener">Open subject crop ↗</a>` : "");
   $("lightbox").classList.remove("hidden");
 }
 
@@ -277,10 +294,266 @@ $("video").onclick = (ev) => {
   }).catch(() => {});
 };
 
+// ---------------------------------------------------------------- video scanning modal
+
+let scanPollTimer = null;
+let isScanningVideo = false;
+
+function openScanModal() {
+  $("videoScanModal").classList.remove("hidden");
+}
+
+function closeScanModal() {
+  $("videoScanModal").classList.add("hidden");
+}
+
+$("btnOpenScanModal").onclick = openScanModal;
+$("btnModalCloseX").onclick = closeScanModal;
+$("btnScanClose").onclick = closeScanModal;
+
+$("scanMinScore").oninput = (e) => { $("outScanScore").textContent = e.target.value + "%"; };
+$("scanInterval").oninput = (e) => { $("outScanInterval").textContent = (e.target.value / 10).toFixed(1) + "s"; };
+
+$("btnCheckPath").onclick = async () => {
+  const path = $("scanVideoPath").value.trim();
+  if (!path) return toast("Enter a video file path first");
+  try {
+    const r = await post("/api/video/info", { path });
+    const meta = $("scanVideoMeta");
+    meta.innerHTML = `✓ <b>${r.filename}</b> — Duration: <b>${r.duration_str}</b> (${r.duration_sec}s) | Resolution: <b>${r.width}x${r.height}</b> | FPS: <b>${r.fps}</b> | Total Frames: <b>${r.total_frames.toLocaleString()}</b>`;
+    meta.classList.remove("hidden");
+  } catch (e) {
+    toast("Inspect failed: " + e.message);
+  }
+};
+
+$("btnUploadVideo").onclick = async () => {
+  const fileInput = $("videoFileInput");
+  if (!fileInput.files || !fileInput.files[0]) {
+    return toast("Please select a video file first");
+  }
+  const file = fileInput.files[0];
+  const formData = new FormData();
+  formData.append("file", file);
+
+  $("btnUploadVideo").disabled = true;
+  $("btnUploadVideo").textContent = "Uploading…";
+  try {
+    const res = await fetch("/api/video/upload", {
+      method: "POST",
+      body: formData,
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || res.statusText);
+    }
+    const data = await res.json();
+    $("scanVideoPath").value = data.path;
+    const meta = $("scanVideoMeta");
+    meta.innerHTML = `✓ <b>${data.filename}</b> (Uploaded) — Duration: <b>${data.duration_str}</b> | Resolution: <b>${data.width}x${data.height}</b> | FPS: <b>${data.fps}</b>`;
+    meta.classList.remove("hidden");
+    toast("Video uploaded successfully!");
+  } catch (e) {
+    toast("Upload failed: " + e.message);
+  } finally {
+    $("btnUploadVideo").disabled = false;
+    $("btnUploadVideo").textContent = "⬆ Upload & Scan";
+  }
+};
+
+async function toggleWebScan() {
+  if (isScanningVideo) {
+    // Cancel
+    try {
+      await post("/api/video/scan/cancel", {});
+      toast("Cancelling video scan…");
+    } catch (e) {
+      toast("Cancel failed: " + e.message);
+    }
+  } else {
+    // Start scan
+    const path = $("scanVideoPath").value.trim();
+    if (!path) return toast("Specify or upload a video file first");
+
+    const top_n = +$("scanTopN").value || 5;
+    const sample_fps = +$("scanSpeed").value;
+    const min_score = (+$("scanMinScore").value || 55) / 100;
+    const min_interval_sec = (+$("scanInterval").value || 20) / 10;
+
+    try {
+      await post("/api/video/scan", {
+        path,
+        top_n,
+        sample_fps,
+        min_score,
+        min_interval_sec,
+      });
+
+      isScanningVideo = true;
+      $("btnStartWebScan").textContent = "⏹ Stop Scan";
+      $("btnStartWebScan").classList.remove("btn-purple");
+      $("btnStartWebScan").classList.add("btn-stop");
+      $("scanProgBar").style.width = "0%";
+      $("scanStatusText").textContent = "Initializing scanner…";
+      startScanPolling();
+    } catch (e) {
+      toast("Start scan failed: " + e.message);
+    }
+  }
+}
+
+$("btnStartWebScan").onclick = toggleWebScan;
+
+function startScanPolling() {
+  clearInterval(scanPollTimer);
+  scanPollTimer = setInterval(async () => {
+    try {
+      const res = await fetch("/api/video/scan/status");
+      if (!res.ok) return;
+      const data = await res.json();
+
+      $("scanProgBar").style.width = Math.min(100, data.progress_pct) + "%";
+
+      const bestText = data.best_score > 0 ? `Best Score: ${Math.round(data.best_score * 100)}%` : "No qualified face yet";
+      $("scanStatusText").innerHTML = `Status: <b>${data.status}</b> | Progress: <b>${data.current_time_str} / ${data.total_duration_str}</b> (${data.progress_pct}%) | Speed: <b>${data.fps_speed} FPS</b> | ETA: <b>${data.eta_sec}s</b> | ${bestText}`;
+
+      // Update current frame preview
+      if (data.current_frame_preview) {
+        $("scanCurrentFrame").src = data.current_frame_preview;
+        $("scanCurrentFrame").classList.remove("hidden");
+        $("scanCurrentPlaceholder").classList.add("hidden");
+      }
+
+      // Update champion preview
+      if (data.champion_frame_preview) {
+        $("scanChampFrame").src = data.champion_frame_preview;
+        $("scanChampFrame").classList.remove("hidden");
+        $("scanChampPlaceholder").classList.add("hidden");
+      }
+
+      if (!data.is_scanning) {
+        clearInterval(scanPollTimer);
+        isScanningVideo = false;
+        $("btnStartWebScan").textContent = "▶ Start Scan";
+        $("btnStartWebScan").classList.remove("btn-stop");
+        $("btnStartWebScan").classList.add("btn-purple");
+
+        if (data.status === "completed") {
+          $("scanProgBar").style.width = "100%";
+          const count = data.results_count || 0;
+          toast(`✓ Scan Complete! Picked ${count} best thumbnails.`);
+          $("scanStatusText").innerHTML = `✓ <b>Completed!</b> Extracted <b>${count}</b> best thumbnails into output folder.`;
+          
+          // Refresh main gallery
+          fetch("/api/captures").then(r => r.json()).then(d => {
+            if (d.captures) renderGallery(d.captures);
+          }).catch(() => {});
+        } else if (data.status === "cancelled") {
+          toast("Video scan was cancelled.");
+        } else if (data.error) {
+          toast("Scan error: " + data.error);
+        }
+      }
+    } catch (e) {
+      // ignore network glitch
+    }
+  }, 350);
+}
+
+
+// ---------------------------------------------------------------- folder picker
+// Captures are written by the server, so a native file dialog in the browser would
+// pick a path on the wrong machine. The server lists its own directories instead and
+// this walks them.
+
+let folderCurrent = "";
+
+async function loadFolder(path) {
+  try {
+    const res = await fetch("/api/browse?path=" + encodeURIComponent(path || ""));
+    if (!res.ok) {
+      const d = await res.json().catch(() => ({}));
+      throw new Error(d.detail || res.statusText);
+    }
+    const d = await res.json();
+    folderCurrent = d.path;
+    $("folderPath").value = d.path;
+
+    const sc = $("folderShortcuts");
+    sc.innerHTML = "";
+    [...(d.drives || []), ...(d.shortcuts || [])].forEach((q) => {
+      const b = document.createElement("button");
+      b.textContent = q.name;
+      b.title = q.path;
+      b.onclick = () => loadFolder(q.path);
+      sc.appendChild(b);
+    });
+
+    const list = $("folderList");
+    list.innerHTML = "";
+    if (d.parent) {
+      const up = document.createElement("button");
+      up.className = "up";
+      up.textContent = "\u2191 ..";
+      up.onclick = () => loadFolder(d.parent);
+      list.appendChild(up);
+    }
+    if (!d.entries.length) {
+      const e = document.createElement("div");
+      e.className = "empty";
+      e.textContent = "No subfolders here \u2014 you can still use this folder.";
+      list.appendChild(e);
+    }
+    d.entries.forEach((en) => {
+      const b = document.createElement("button");
+      b.textContent = "\u{1F4C1} " + en.name;
+      b.onclick = () => loadFolder(en.path);
+      list.appendChild(b);
+    });
+
+    $("folderNote").textContent = d.is_current
+      ? "This is the current output folder."
+      : (d.writable ? "Writable." : "\u26a0 Not writable by the server.");
+  } catch (e) {
+    $("folderNote").textContent = "\u26a0 " + e.message;
+  }
+}
+
+function openFolderModal() {
+  $("folderModal").classList.remove("hidden");
+  $("folderCreate").checked = false;
+  loadFolder("");
+}
+function closeFolderModal() { $("folderModal").classList.add("hidden"); }
+
+$("btnPickFolder").onclick = openFolderModal;
+$("btnScanPickFolder").onclick = openFolderModal;
+$("btnFolderCloseX").onclick = closeFolderModal;
+$("btnFolderClose").onclick = closeFolderModal;
+$("btnFolderGo").onclick = () => loadFolder($("folderPath").value.trim());
+$("folderPath").onkeydown = (e) => { if (e.key === "Enter") loadFolder($("folderPath").value.trim()); };
+
+$("btnFolderUse").onclick = async () => {
+  const path = $("folderPath").value.trim() || folderCurrent;
+  try {
+    const d = await post("/api/output", { path, create: $("folderCreate").checked });
+    $("outputDir").textContent = d.output_dir;
+    $("scanOutputDir").textContent = d.output_dir;
+    toast("Saving captures to " + d.output_dir);
+    closeFolderModal();
+  } catch (e) {
+    $("folderNote").textContent = "\u26a0 " + e.message;
+  }
+};
+
 $("lbClose").onclick = () => $("lightbox").classList.add("hidden");
 $("lightbox").onclick = (e) => { if (e.target.id === "lightbox") $("lightbox").classList.add("hidden"); };
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape") $("lightbox").classList.add("hidden");
+  if (e.key === "Escape") {
+    $("lightbox").classList.add("hidden");
+    $("videoScanModal").classList.add("hidden");
+    $("folderModal").classList.add("hidden");
+  }
 });
 
 connect();

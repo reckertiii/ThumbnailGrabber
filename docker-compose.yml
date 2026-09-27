@@ -11,7 +11,34 @@ services:
       - TG_STREAM_SOURCE=${TG_STREAM_SOURCE:-0}
       - TG_OUTPUT_DIR=/app/captures
       - TZ=${TZ:-America/New_York}
+      # Restrict which host directories the web UI may scan videos from. The web
+      # endpoints are unauthenticated, so set this if the port is exposed.
+      - TG_VIDEO_ROOTS=${TG_VIDEO_ROOTS:-}
+      - TG_MAX_UPLOAD_MB=${TG_MAX_UPLOAD_MB:-4096}
+      # Optional. Turns on the AI judge (see README).
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      # Local judge instead. Point at any Ollama — the bundled one below, or the
+      # TrueNAS Ollama app. "auto" prefers Claude when a key is set.
+      - OLLAMA_HOST=${OLLAMA_HOST:-http://ollama:11434}
+      - TG_AI_JUDGE_BACKEND=${TG_AI_JUDGE_BACKEND:-auto}
+      - TG_AI_JUDGE_OLLAMA_MODEL=${TG_AI_JUDGE_OLLAMA_MODEL:-qwen3-vl:4b}
+      - TG_AI_JUDGE_OLLAMA_KEEP_ALIVE=${TG_AI_JUDGE_OLLAMA_KEEP_ALIVE:-30m}
+      - TG_AI_JUDGE_OLLAMA_NUM_THREAD=${TG_AI_JUDGE_OLLAMA_NUM_THREAD:-0}
+    # Note: ./models holds user ratings only. The ML weights are baked into the
+    # image at /opt/tg-models so this mount cannot hide them.
     volumes:
       - ./captures:/app/captures
       - ./models:/app/models
+    restart: unless-stopped
+
+  # Optional self-hosted vision model for the AI judge. Only starts with:
+  #   docker compose --profile local-ai up -d
+  #   docker compose exec ollama ollama pull qwen3-vl:4b
+  # Skip this and set OLLAMA_HOST instead if you already run the TrueNAS Ollama app.
+  ollama:
+    image: ollama/ollama:latest
+    container_name: thumbnail-grabber-ollama
+    profiles: ["local-ai"]
+    volumes:
+      - ./ollama:/root/.ollama
     restart: unless-stopped
