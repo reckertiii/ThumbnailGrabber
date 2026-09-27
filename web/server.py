@@ -908,10 +908,27 @@ def get_state():
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return FileResponse(str(STATIC_DIR / "index.html"))
+    return FileResponse(str(STATIC_DIR / "index.html"),
+                        headers={"Cache-Control": "no-cache"})
 
 
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+class _RevalidatingStatics(StaticFiles):
+    """Serves the UI with `Cache-Control: no-cache`.
+
+    Without it a browser can hold app.js in its memory cache for the life of the tab
+    and never revalidate, so after an upgrade it renders the new index.html against
+    the old script: the new buttons appear but nothing is wired to them. `no-cache`
+    means "revalidate", not "don't cache" - the ETag still turns an unchanged file
+    into a 304, so this costs a round trip rather than a download.
+    """
+
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
+app.mount("/static", _RevalidatingStatics(directory=str(STATIC_DIR)), name="static")
 
 
 def main():
