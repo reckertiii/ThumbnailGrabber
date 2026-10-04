@@ -162,6 +162,9 @@ class AIJudge:
         self.max_px = int(getattr(config, "ai_judge_image_max_px", 768))
         self.min_interval = float(getattr(config, "ai_judge_min_interval_sec", 3.0))
         self.max_calls = int(getattr(config, "ai_judge_max_calls_per_session", 300))
+        self.active_seconds = max(0.0, float(getattr(config, "ai_judge_active_hours", 2.0)) * 3600.0)
+        self.started_at: float = time.time()
+        self._expiry_handled: bool = False
 
         self._client: Any = None            # Anthropic client, when that backend is active
         self._client_error: Optional[str] = None
@@ -243,9 +246,74 @@ class AIJudge:
                     f"(run: ollama pull {self.ollama_model})")
         return None
 
+    # ------------------------------------------------------------------
+    # Active window
+    #
+    # The judge is only wanted while a service is actually being recorded. Left to its
+    # own devices with keep_alive=-1 it would hold 20 GB of weights on the Ollama host
+    # from Sunday to Sunday. So reviewing stops after a fixed window from startup and
+    # the model is unloaded, releasing that memory until someone re-arms it.
+    # ------------------------------------------------------------------
+
+    @property
+    def seconds_remaining(self) -> float:
+        """Seconds left in the active window; inf when the window is disabled."""
+        if self.active_seconds <= 0:
+            return float("inf")
+        return max(0.0, self.active_seconds - (time.time() - self.started_at))
+
+    @property
+    def expired(self) -> bool:
+        return self.seconds_remaining <= 0
+
+    def reset_window(self) -> None:
+        """Re-arms the judge for another full window without restarting the app."""
+        self.started_at = time.time()
+        self._expiry_handled = False
+        if self.enabled:
+            print(f"[AIJudge] Woken for another {self.active_seconds / 3600:.1f}h.")
+
+    def sleep_now(self) -> None:
+        """Ends the window early and releases the model."""
+        self.started_at = time.time() - max(self.active_seconds, 1.0)
+        self._handle_expiry()
+
+    def _handle_expiry(self) -> None:
+        if self._expiry_handled:
+            return
+        self._expiry_handled = True
+        hours = self.active_seconds / 3600.0
+        print(f"[AIJudge] {hours:.1f}h active window elapsed - reviews are off.")
+        self._unload_ollama_model()
+
+    def _unload_ollama_model(self) -> None:
+        """Asks Ollama to drop the model from memory.
+
+        A zero keep_alive is Ollama's documented way to evict immediately; the server
+        answers with done_reason "unload". Best effort - a host that has already gone
+        away needs no eviction.
+        """
+        if self.backend != "ollama":
+            return
+        try:
+            body = json.dumps({"model": self.ollama_model, "keep_alive": 0}).encode()
+            req = urllib.request.Request(f"{self.ollama_url}/api/generate", data=body,
+                                         headers={"Content-Type": "application/json"},
+                                         method="POST")
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                resp.read()
+            print(f"[AIJudge] Released {self.ollama_model} on {self.ollama_url}.")
+        except Exception as e:  # noqa: BLE001 - eviction is advisory
+            print(f"[AIJudge] Could not unload {self.ollama_model}: {type(e).__name__}")
+
     @property
     def available(self) -> bool:
         if not self.enabled:
+            return False
+        if self.expired:
+            # Checked on every capture and every telemetry tick, so expiry is noticed
+            # and the model released promptly even when nothing is being captured.
+            self._handle_expiry()
             return False
         if self.backend == "anthropic":
             return self._client is not None
@@ -258,7 +326,12 @@ class AIJudge:
     def status_line(self) -> str:
         if self.available:
             where = "local" if self.backend == "ollama" else "Claude API"
-            return f"AI judge on ({self.active_model} via {where}, {self.calls_made} calls)"
+            left = self.seconds_remaining
+            window = "" if left == float("inf") else f", {int(left // 60)} min left"
+            return f"AI judge on ({self.active_model} via {where}, {self.calls_made} calls{window})"
+        if self.enabled and self.expired:
+            return (f"AI judge asleep - {self.active_seconds / 3600:.1f}h window elapsed "
+                    f"({self.calls_made} calls). Model released.")
         return f"AI judge off: {self._client_error or 'disabled in config'}"
 
     def announce_once(self) -> None:

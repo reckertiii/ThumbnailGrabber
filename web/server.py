@@ -207,6 +207,11 @@ def _telemetry() -> Dict[str, Any]:
             "ml_confidence": round(float(pm.confidence), 3) if pm else 0.0,
             "ml_samples": len(pm.samples) if pm else 0,
             "ai_judge": proc.judge.status_line() if proc and getattr(proc, "judge", None) else "AI judge off",
+            "ai_judge_active": bool(proc.judge.available) if proc and getattr(proc, "judge", None) else False,
+            "ai_judge_minutes_left": (
+                None if not (proc and getattr(proc, "judge", None))
+                else (None if proc.judge.seconds_remaining == float("inf")
+                      else int(proc.judge.seconds_remaining // 60))),
         })
 
     return payload
@@ -443,6 +448,32 @@ def click_video(payload: Dict[str, Any] = Body(...)):
         if bx <= fx <= bx + bw and by <= fy <= by + bh:
             return toggle_person(f.person_id, {})
     return {"ok": False, "detail": "No face at that point"}
+
+
+@app.post("/api/judge/wake")
+def wake_judge():
+    """Re-arms the judge for another full active window.
+
+    Lets someone who started the app early, or whose service ran long, bring the
+    reviewer back without restarting - the model reloads on the next review.
+    """
+    proc = state.processor
+    if not proc or not getattr(proc, "judge", None):
+        raise HTTPException(status_code=409, detail="Stream not running")
+    proc.judge.reset_window()
+    return {"ok": True, "status": proc.judge.status_line(),
+            "minutes_left": (None if proc.judge.seconds_remaining == float("inf")
+                             else int(proc.judge.seconds_remaining // 60))}
+
+
+@app.post("/api/judge/sleep")
+def sleep_judge():
+    """Ends the window now and releases the model on the Ollama host."""
+    proc = state.processor
+    if not proc or not getattr(proc, "judge", None):
+        raise HTTPException(status_code=409, detail="Stream not running")
+    proc.judge.sleep_now()
+    return {"ok": True, "status": proc.judge.status_line()}
 
 
 @app.get("/api/captures")

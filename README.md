@@ -61,6 +61,7 @@ Other settings, all optional — see `.env.example`:
 | `ANTHROPIC_API_KEY` | AI judge via the Claude API (see below) |
 | `OLLAMA_HOST` | AI judge via a self-hosted Ollama vision model instead |
 | `TG_AI_JUDGE_BACKEND` | `auto` (default), `anthropic`, `ollama`, or `off` |
+| `TG_AI_JUDGE_ACTIVE_HOURS` | Hours the judge stays active after startup (default 2, 0 = always) |
 
 Model weights (YuNet face detector, MediaPipe hand + pose landmarkers) download
 automatically into `models/` on first run — about 17 MB, and the first start is slower
@@ -94,6 +95,19 @@ cost guard. For file scans it reviews the finalists only.
 
 Live review runs on its own thread, so analysis never waits on the network; a failed
 call keeps the heuristic score and carries on.
+
+### Active window
+
+The judge only runs for **2 hours after startup** (`TG_AI_JUDGE_ACTIVE_HOURS`). When
+that elapses it stops reviewing and tells Ollama to unload the model, releasing ~20 GB
+on the host — a machine left running all week shouldn't hold a vision model in memory
+for a service that happens on Sunday. Captures carry on as normal on the heuristics
+alone.
+
+The web UI shows the countdown next to the AI model readout, with **Wake** to re-arm
+for another full window (useful if you started early or the service ran long) and
+**Sleep now** to release the model immediately. Stopping the app releases it too. Set
+`TG_AI_JUDGE_ACTIVE_HOURS=0` for no window.
 
 ### Self-hosted judge
 
@@ -185,6 +199,8 @@ at full source resolution.
 | `GET /api/captures` | Ranked gallery |
 | `GET /api/browse` | List server directories for the output-folder picker |
 | `POST /api/output` | Set the output folder |
+| `POST /api/judge/wake` | Re-arm the AI judge for another active window |
+| `POST /api/judge/sleep` | End the window now and release the model |
 | `POST /api/captures/{file}/feedback` | Train the preference model |
 | `POST /api/video/info` | Inspect metadata of a video recording file |
 | `POST /api/video/upload` | Upload a video recording for scanning |

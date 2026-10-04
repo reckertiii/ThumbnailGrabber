@@ -163,6 +163,11 @@ class StreamProcessor:
 
     def stop(self):
         """Stops processing loops and releases camera resources."""
+        # Release the judge's model first: with keep_alive=-1 a stopped app would
+        # otherwise leave ~20GB pinned on the Ollama host indefinitely.
+        judge = getattr(self, "judge", None)
+        if judge is not None and judge.backend == "ollama" and not judge._expiry_handled:
+            judge.sleep_now()
         self.running = False
         self._stop_event.set()  # interrupts an in-progress reconnect backoff
         if self.grabber_thread and self.grabber_thread.is_alive():

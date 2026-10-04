@@ -56,6 +56,13 @@ function render(d) {
   $("fps").textContent = `${d.fps ?? 0} fps`;
   $("outputDir").textContent = d.output_dir || "—";
   $("scanOutputDir").textContent = d.output_dir || "—";
+
+  // Outside the face-detected branch: the judge's countdown has to keep ticking
+  // while the stage is empty, which is exactly when you'd check how long is left.
+  const judgeMins = d.ai_judge_minutes_left;
+  $("mJudge").childNodes[0].nodeValue = d.ai_judge_active
+    ? `AI judge: active${judgeMins == null ? "" : ` · ${judgeMins} min left`} `
+    : `${d.ai_judge || "AI judge: off"} `;
   if (!sourceFocused && $("src").value !== d.source) $("src").value = d.source || "";
 
   // Start / stop button
@@ -544,6 +551,17 @@ $("btnFolderUse").onclick = async () => {
   } catch (e) {
     $("folderNote").textContent = "\u26a0 " + e.message;
   }
+};
+
+// The judge only runs for a window after startup, then releases the model on the
+// Ollama host. These re-arm or end that window without restarting the app.
+$("btnJudgeWake").onclick = async () => {
+  try { const r = await post("/api/judge/wake", {}); toast(r.status); }
+  catch (e) { toast(e.message); }
+};
+$("btnJudgeSleep").onclick = async () => {
+  try { const r = await post("/api/judge/sleep", {}); toast(r.status); }
+  catch (e) { toast(e.message); }
 };
 
 $("lbClose").onclick = () => $("lightbox").classList.add("hidden");

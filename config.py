@@ -158,6 +158,11 @@ class AppConfig:
     ai_judge_image_max_px: int = 768           # Longest side sent to the model
     ai_judge_min_interval_sec: float = 3.0     # Never review more often than this
     ai_judge_max_calls_per_session: int = 300  # Hard cost guard per process
+    # How long the judge stays active after startup. A service is an hour or two, so
+    # past that it stops reviewing and unloads the model from Ollama rather than
+    # holding ~20GB of weights on the host until the next restart. 0 = no window.
+    # The web UI can re-arm it without restarting.
+    ai_judge_active_hours: float = float(os.environ.get("TG_AI_JUDGE_ACTIVE_HOURS", "2") or 2)
 
     # Machine Learning User Preference
     use_ml_preference: bool = True          # Enable user preference machine learning
