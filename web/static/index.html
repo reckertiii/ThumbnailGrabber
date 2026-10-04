@@ -103,6 +103,15 @@
     </div>
 
     <div class="card">
+      <h2>Frame Buffer</h2>
+      <div class="row" style="align-items:center;gap:8px">
+        <input type="range" id="sldBuffer" min="0" max="20" step="1" value="5" style="flex:1">
+        <span id="outBuffer" style="min-width:42px;text-align:right">5s</span>
+      </div>
+      <div class="metric wide" id="mBuffer" style="margin-top:6px">Buffer: &mdash;</div>
+    </div>
+
+    <div class="card">
       <h2>Output Folder</h2>
       <code id="outputDir" class="path">—</code>
       <button id="btnPickFolder" class="btn" style="margin-top:8px">Change Folder…</button>

@@ -416,6 +416,61 @@ class StreamProcessor:
         # Allow peak at position 1, 2, 3, or 4
         return peak_idx >= 1
 
+    def buffer_stats(self) -> Dict[str, Any]:
+        """Measured memory held by the rolling buffer.
+
+        Reports what the frames actually occupy rather than a guess from the configured
+        resolution, so the number stays honest if the camera changes format - and so a
+        NAS deployment can be tuned against the real figure.
+        """
+        with self._dvr_lock:
+            frames = len(self._dvr)
+            held = sum(f.nbytes for _, f in self._dvr)
+            newest = self._dvr[-1][1] if frames else None
+            span = (self._dvr[-1][0] - self._dvr[0][0]) if frames > 1 else 0.0
+        capacity = self._dvr.maxlen or 0
+        per_frame = int(newest.nbytes) if newest is not None else 0
+        # What the camera is really delivering. dvr_buffer_fps only sizes the buffer;
+        # if the camera runs faster, the same frame count covers proportionally less
+        # time, so the configured seconds quietly become fewer. Reporting both makes
+        # that visible instead of leaving a buffer that is half the requested depth.
+        measured_fps = round(frames / span, 1) if span > 0.2 else 0.0
+        return {
+            "measured_fps": measured_fps,
+            "seconds_short": bool(measured_fps and span + 0.3 < float(self.config.dvr_buffer_seconds)),
+            "enabled": capacity > 0,
+            "seconds": float(self.config.dvr_buffer_seconds),
+            "fps": int(self.config.dvr_buffer_fps),
+            "frames_held": frames,
+            "frames_capacity": capacity,
+            "span_seconds": round(span, 2),
+            "bytes_held": held,
+            "bytes_capacity": per_frame * capacity,
+            "frame_bytes": per_frame,
+            "mb_held": round(held / (1024 * 1024), 1),
+            "mb_capacity": round(per_frame * capacity / (1024 * 1024), 1),
+        }
+
+    def set_buffer(self, seconds: float, fps: Optional[int] = None) -> Dict[str, Any]:
+        """Resizes the rolling buffer in place, keeping the most recent frames.
+
+        A deque's maxlen is fixed at construction, so this builds a new one. The newest
+        frames are the useful ones, so a shrink drops from the front.
+        """
+        seconds = max(0.0, min(60.0, float(seconds)))
+        if fps is not None:
+            self.config.dvr_buffer_fps = max(1, min(60, int(fps)))
+        self.config.dvr_buffer_seconds = seconds
+        new_max = int(seconds * self.config.dvr_buffer_fps)
+
+        with self._dvr_lock:
+            kept = list(self._dvr)[-new_max:] if new_max > 0 else []
+            self._dvr = deque(kept, maxlen=new_max) if new_max > 0 else deque(maxlen=0)
+        stats = self.buffer_stats()
+        print(f"[StreamProcessor] Frame buffer -> {seconds:.1f}s @ {self.config.dvr_buffer_fps}fps "
+              f"({new_max} frames, ~{stats['mb_capacity']:.0f} MB at this resolution)")
+        return stats
+
     def _refine_from_buffer(self, chosen_at: float, chosen_frame: np.ndarray,
                            chosen_analysis: AnalysisResult):
         """Looks for a crisper version of the chosen moment in the rolling buffer.

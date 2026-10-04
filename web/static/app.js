@@ -57,6 +57,26 @@ function render(d) {
   $("outputDir").textContent = d.output_dir || "—";
   $("scanOutputDir").textContent = d.output_dir || "—";
 
+  // Measured, not estimated from the configured resolution - so the number stays
+  // honest and a NAS deployment can be tuned against what is really held.
+  const buf = d.buffer;
+  if (buf) {
+    if (!holding.has("sldBuffer")) {
+      $("sldBuffer").value = Math.round(buf.seconds);
+      $("outBuffer").textContent = Math.round(buf.seconds) + "s";
+    }
+    $("mBuffer").textContent = buf.enabled
+      ? `Buffer: ${buf.frames_held}/${buf.frames_capacity} frames · `
+        + `${fmtMB(buf.mb_held)} held · ${fmtMB(buf.mb_capacity)} when full`
+        + (buf.span_seconds ? ` · ${buf.span_seconds.toFixed(1)}s covered` : "")
+        + (buf.measured_fps ? ` · camera ${buf.measured_fps}fps` : "")
+        + (buf.seconds_short
+            ? ` ⚠ only ${buf.span_seconds.toFixed(1)}s of the ${buf.seconds}s asked for`
+              + ` — set buffer fps to ${Math.ceil(buf.measured_fps)}`
+            : "")
+      : "Buffer: off (no frame history, captures use the sampled frame)";
+  }
+
   // Outside the face-detected branch: the judge's countdown has to keep ticking
   // while the stage is empty, which is exactly when you'd check how long is left.
   const judgeMins = d.ai_judge_minutes_left;
@@ -136,6 +156,7 @@ function render(d) {
 }
 
 const fmt = (v) => (v >= 0 ? "+" : "") + v.toFixed(1);
+const fmtMB = (mb) => (mb >= 1024 ? (mb / 1024).toFixed(2) + " GB" : Math.round(mb) + " MB");
 
 function renderPeople(selected, target) {
   const wrap = $("people");
@@ -555,6 +576,22 @@ $("btnFolderUse").onclick = async () => {
 
 // The judge only runs for a window after startup, then releases the model on the
 // Ollama host. These re-arm or end that window without restarting the app.
+// Slider is live while dragging but only committed on release, so a drag from 5s to
+// 20s doesn't reallocate the buffer at every step in between.
+$("sldBuffer").oninput = () => {
+  holding.add("sldBuffer");
+  $("outBuffer").textContent = $("sldBuffer").value + "s";
+};
+$("sldBuffer").onchange = async () => {
+  try {
+    const r = await post("/api/buffer", { seconds: Number($("sldBuffer").value) });
+    toast(r.buffer.enabled
+      ? `Buffer ${r.buffer.seconds}s — ${fmtMB(r.buffer.mb_capacity)} when full`
+      : "Frame buffer off");
+  } catch (e) { toast(e.message); }
+  holding.delete("sldBuffer");
+};
+
 $("btnJudgeWake").onclick = async () => {
   try { const r = await post("/api/judge/wake", {}); toast(r.status); }
   catch (e) { toast(e.message); }

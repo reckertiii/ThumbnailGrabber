@@ -207,6 +207,7 @@ def _telemetry() -> Dict[str, Any]:
             "ml_confidence": round(float(pm.confidence), 3) if pm else 0.0,
             "ml_samples": len(pm.samples) if pm else 0,
             "ai_judge": proc.judge.status_line() if proc and getattr(proc, "judge", None) else "AI judge off",
+            "buffer": proc.buffer_stats() if proc and hasattr(proc, "buffer_stats") else None,
             "ai_judge_active": bool(proc.judge.available) if proc and getattr(proc, "judge", None) else False,
             "ai_judge_minutes_left": (
                 None if not (proc and getattr(proc, "judge", None))
@@ -448,6 +449,25 @@ def click_video(payload: Dict[str, Any] = Body(...)):
         if bx <= fx <= bx + bw and by <= fy <= by + bh:
             return toggle_person(f.person_id, {})
     return {"ok": False, "detail": "No face at that point"}
+
+
+@app.post("/api/buffer")
+def set_buffer(payload: Dict[str, Any] = Body(...)):
+    """Resizes the rolling frame buffer and reports the measured memory it now holds."""
+    proc = state.processor
+    if not proc:
+        raise HTTPException(status_code=409, detail="Stream not running")
+    try:
+        seconds = float(payload.get("seconds", proc.config.dvr_buffer_seconds))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="seconds must be a number")
+    fps = payload.get("fps")
+    try:
+        fps = int(fps) if fps is not None else None
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="fps must be a whole number")
+    stats = proc.set_buffer(seconds, fps)
+    return {"ok": True, "buffer": stats}
 
 
 @app.post("/api/judge/wake")

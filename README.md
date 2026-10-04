@@ -201,6 +201,7 @@ at full source resolution.
 | `POST /api/output` | Set the output folder |
 | `POST /api/judge/wake` | Re-arm the AI judge for another active window |
 | `POST /api/judge/sleep` | End the window now and release the model |
+| `POST /api/buffer` | Resize the rolling frame buffer |
 | `POST /api/captures/{file}/feedback` | Train the preference model |
 | `POST /api/video/info` | Inspect metadata of a video recording file |
 | `POST /api/video/upload` | Upload a video recording for scanning |
@@ -300,6 +301,32 @@ Optional overrides: `python main.py --source 0 --output D:\shots`
   smooth even though scoring is slower. `pose_hand_interval` (default 2) re-detects
   hands and shoulders every Nth analysed frame; they move slowly enough that this
   halves their cost with no measurable change in output.
+## Frame buffer
+
+Analysis scores frames at `analysis_fps` while the camera sends several times that, so
+most frames are never examined and a brief good moment can fall between samples. A
+rolling buffer keeps every frame for a few seconds; when a moment is chosen, a short
+window around it is ranked by sharpness and the best few are fully re-scored, so the
+capture is the crispest version of that moment rather than whichever sample landed.
+
+Set it from the web UI (**Frame Buffer** slider) or `dvr_buffer_seconds` in
+`config.py`. The readout next to it is **measured, not estimated**:
+
+```
+Buffer: 150/150 frames · 890 MB held · 890 MB when full · 2.5s covered · camera 60.4fps
+```
+
+Memory is the whole constraint - a 1080p frame is 6.22 MB, so 5s at 30fps is ~0.9 GB.
+Tune against the readout rather than a guess, which matters when moving to a NAS.
+
+**Watch the "covered" figure.** `dvr_buffer_fps` only sizes the buffer; if the camera
+runs faster than that, the same frame count covers proportionally less time. A 60fps
+camera with the buffer sized for 30 gives half the depth asked for - the readout says
+so and names the value to set. Raising it raises memory in proportion.
+
+Set the slider to 0 to switch the buffer off entirely; captures then use the sampled
+frame, as before.
+
 - **Capturing keeps going all service.** A new shot is saved when it would improve the
   kept set — beat the weakest keeper, or beat a nearby one it would replace. Keepers are
   spread at least `min_capture_spacing_sec` (20s) apart so five variations of one moment
