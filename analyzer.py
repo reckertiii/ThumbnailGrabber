@@ -928,7 +928,10 @@ class PersonQualityAnalyzer:
             # cross-validated accuracy lets it grow into that influence as it learns.
             if self.preference_model.is_trained:
                 maturity = min(1.0, len(self.preference_model.samples) / 50.0)
-                trust = max(0.0, min(1.0, self.preference_model.confidence))
+                # trust is the distance past chance on balanced accuracy, so a model
+                # that has only learned to answer with the majority class gets zero
+                # influence rather than the high number raw accuracy would have given it.
+                trust = self.preference_model.trust
                 w = self.weights_ml_cap * maturity * trust
                 final_score = (1.0 - w) * rule_score + w * ml_pred
                 result.ml_weight_applied = round(w, 3)

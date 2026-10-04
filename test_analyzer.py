@@ -275,9 +275,11 @@ class TestPersonQualityAnalyzer(unittest.TestCase):
                 model = UserPreferenceModel()
 
                 feat_good = model.extract_features(sample_res_good)
-                self.assertEqual(len(feat_good), 9, "Feature vector should be 9-dimensional")
-                self.assertAlmostEqual(feat_good[5], 1.5 / 15.0, places=2,
-                                       msg="Feature index 5 should be normalized shoulder tilt")
+                self.assertEqual(len(feat_good), len(UserPreferenceModel.FEATURE_NAMES),
+                                 "Feature vector must match the declared feature names")
+                idx = UserPreferenceModel.FEATURE_NAMES.index("shoulder_tilt_norm")
+                self.assertAlmostEqual(feat_good[idx], 1.5 / 15.0, places=2,
+                                       msg="shoulder_tilt_norm should be the normalised tilt")
 
                 # Two ratings is not a model. Fitting them (previously padded with a
                 # synthetic row) produced a "trained" classifier with a meaningless
@@ -300,6 +302,40 @@ class TestPersonQualityAnalyzer(unittest.TestCase):
                 self.assertGreater(model.predict(feat_good),
                                    model.predict(model.extract_features(sample_res_bad)),
                                    "Favorited sample should outscore the rejected one")
+                self.assertGreater(model.trust, 0.0,
+                                   "Separable feedback should earn some influence")
+            finally:
+                UserPreferenceModel.JSON_DATA_PATH = original_path
+
+    def test_preference_model_earns_no_trust_from_noise(self):
+        """A model that has only learned to answer with the majority class must carry
+        no weight. Plain accuracy rewarded exactly that - on 4 favourites against 18
+        rejects it read 0.92, almost all of which came free from the label skew."""
+        import tempfile
+        import numpy as np
+        from preference_model import UserPreferenceModel
+
+        with tempfile.TemporaryDirectory() as tmp:
+            original_path = UserPreferenceModel.JSON_DATA_PATH
+            UserPreferenceModel.JSON_DATA_PATH = os.path.join(tmp, "prefs.json")
+            try:
+                rng = np.random.default_rng(0)
+                n_features = len(UserPreferenceModel.FEATURE_NAMES)
+                model = UserPreferenceModel()
+                model.samples = [(rng.random(n_features).tolist(), 1) for _ in range(4)]
+                model.samples += [(rng.random(n_features).tolist(), 0) for _ in range(18)]
+                model.fit()
+
+                self.assertLessEqual(model.confidence, 0.75,
+                                     "Balanced accuracy on noise should sit near chance")
+                self.assertEqual(model.trust, 0.0,
+                                 "A model no better than guessing must earn no trust")
+
+                model.samples = [(rng.random(n_features).tolist(), 1) for _ in range(2)]
+                model.samples += [(rng.random(n_features).tolist(), 0) for _ in range(20)]
+                model.fit()
+                self.assertFalse(model.is_trained,
+                                 "Fewer than MIN_PER_CLASS of a class should not train")
             finally:
                 UserPreferenceModel.JSON_DATA_PATH = original_path
 

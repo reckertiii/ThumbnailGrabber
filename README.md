@@ -297,6 +297,13 @@ Optional overrides: `python main.py --source 0 --output D:\shots`
 - **The web UI has no authentication.** It is designed for a trusted LAN. Uploaded
   filenames are sanitised and scan output is confined to the output directory, but if
   the port is reachable more widely, set `TG_VIDEO_ROOTS` to limit what can be read.
+- **The preference model has to earn its influence.** Its weight ramps with how many
+  ratings it has and how far past guessing it actually is, measured as cross-validated
+  *balanced* accuracy. That matters because ratings skew heavily towards rejects: a
+  model that only ever answers "reject" scored 0.92 on plain accuracy while learning
+  nothing, and at a flat 35% weight it was overriding the heuristics. Balanced accuracy
+  scores that model 0.5, which maps to zero influence. The readout shows both the
+  accuracy and the influence actually applied.
 - **Rating history is versioned.** The scoring metrics changed meaning in feature set
   v2, so ⭐/👎 ratings recorded before it are discarded on load rather than silently
   skewing scores. Rate a dozen or so captures to retrain.

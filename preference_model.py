@@ -8,6 +8,8 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
 from sklearn.model_selection import cross_val_score, StratifiedKFold
 
+from config import QualityThresholds
+
 class UserPreferenceModel:
     """Scikit-Learn ML Model (Logistic Regression with StandardScaler)
     that learns user visual preference for thumbnail selection.
@@ -30,11 +32,18 @@ class UserPreferenceModel:
     # model on nonsense; they are dropped on load instead.
     #   v2: sharpness renormalised to a fixed face size, blendshape-derived eye/mouth
     #       metrics, and cutout suitability replacing face centering.
-    FEATURE_VERSION = 2
+    #   v3: sharpness normalised against the configured thresholds instead of a constant
+    #       that no longer matched them (it saturated at a Laplacian of 70 while real
+    #       captures measure 100-166, so the feature was pinned at 1.0 for most rows),
+    #       plus the signals the scorer had gained since: whether anything crosses the
+    #       body, hand position, background cleanliness and subject size.
+    FEATURE_VERSION = 3
 
     # Below this many labelled samples the model isn't worth blending into the score.
     MIN_SAMPLES_TO_TRAIN = 12
-    
+    # Each class needs enough examples to say anything. Two of a class fits noise.
+    MIN_PER_CLASS = 3
+
     FEATURE_NAMES = [
         "head_yaw_norm",        # 0: Head Turn (0=facing camera)
         "head_pitch_norm",      # 1: Head Pitch (0=level)
@@ -44,7 +53,11 @@ class UserPreferenceModel:
         "shoulder_tilt_norm",   # 5: Shoulder Tilt (0=level)
         "sharpness_norm",       # 6: Laplacian Sharpness
         "exposure_score",       # 7: Exposure/Lighting
-        "cutout_score"          # 8: Cutout suitability (framing, size, clean background)
+        "cutout_score",         # 8: Cutout suitability (framing, size, clean background)
+        "torso_clear",          # 9: 1.0 = nothing crossing the body
+        "hands_clear",          # 10: 1.0 = hands off the torso
+        "background_score",     # 11: How plain the surroundings are
+        "subject_height",       # 12: Subject height as a fraction of the frame
     ]
 
     def __init__(self):
@@ -68,13 +81,24 @@ class UserPreferenceModel:
         smile = min(1.0, max(0.0, getattr(analysis, 'smile_ratio', 0.5) / 1.0))
         mar = min(1.0, max(0.0, getattr(analysis, 'mar', 0.2)))
         shoulder_tilt_norm = min(1.0, max(0.0, getattr(analysis, 'shoulder_tilt_deg', 0.0) / 15.0))
-        sharp = min(1.0, max(0.0, (getattr(analysis, 'laplacian_variance', 40.0) - 8.0) / 62.0))
+        # Normalised against the live thresholds rather than a hardcoded span, so a
+        # recalibration of the scorer cannot silently flatten this feature.
+        t = QualityThresholds()
+        floor, good = t.sharpness_floor, max(t.sharpness_floor + 1.0, t.sharpness_good)
+        lap = getattr(analysis, 'laplacian_variance', floor)
+        sharp = min(1.0, max(0.0, (lap - floor) / (good - floor)))
+
         exposure = min(1.0, max(0.0, getattr(analysis, 'exposure_score', 1.0)))
         cutout = min(1.0, max(0.0, getattr(analysis, 'cutout_score', 0.5)))
-        
+        torso_clear = min(1.0, max(0.0, getattr(analysis, 'torso_clear_score', 1.0)))
+        hands_clear = 0.0 if getattr(analysis, 'hands_on_torso', False) else 1.0
+        background = min(1.0, max(0.0, getattr(analysis, 'background_score', 1.0)))
+        subject_h = min(1.0, max(0.0, getattr(analysis, 'subject_height_ratio', 0.0)))
+
         return np.array([
             yaw_norm, pitch_norm, eye_open, smile,
-            mar, shoulder_tilt_norm, sharp, exposure, cutout
+            mar, shoulder_tilt_norm, sharp, exposure, cutout,
+            torso_clear, hands_clear, background, subject_h
         ], dtype=np.float64)
 
     def predict(self, features: np.ndarray) -> float:
@@ -115,12 +139,15 @@ class UserPreferenceModel:
         # about what distinguishes them. Waiting is better than fitting a synthetic
         # placeholder row and calling the result a trained model.
         classes, counts = np.unique(y, return_counts=True)
-        if len(classes) < 2 or counts.min() < 2:
+        if len(classes) < 2 or counts.min() < self.MIN_PER_CLASS:
             return
 
         try:
             self.scaler = StandardScaler()
-            self.clf = LogisticRegression(C=1.0, solver='liblinear')
+            # Ratings skew heavily towards rejects, and without balancing the fit mostly
+            # learns to say "reject", which scores well on raw accuracy while telling
+            # you nothing.
+            self.clf = LogisticRegression(C=1.0, solver='liblinear', class_weight='balanced')
             X_scaled = self.scaler.fit_transform(X)
             self.clf.fit(X_scaled, y)
             self.is_trained = True
@@ -128,20 +155,37 @@ class UserPreferenceModel:
         except Exception as e:
             print(f"[UserPreferenceModel] Scikit-Learn fit error: {e}")
 
-    def _cross_val_accuracy(self, X: np.ndarray, y: np.ndarray) -> float:
-        """Held-out accuracy via stratified k-fold.
+    @property
+    def trust(self) -> float:
+        """How far past guessing the model actually is, on 0..1.
 
-        Scoring the model on the same rows it was fitted to reports how well it memorised
-        them, not how well it predicts — on a few dozen samples across nine features that
-        reads high no matter what. Cross-validation gives a number worth showing.
+        Balanced accuracy is 0.5 for a model that has learned nothing, so the useful
+        quantity is the distance above that. With ratings running 4 favourites to 18
+        rejects, raw accuracy of 0.92 sounded authoritative while 0.82 of it came free
+        from always answering "reject" - this reports 0 for such a model.
+        """
+        if not self.is_trained:
+            return 0.0
+        return max(0.0, min(1.0, (self.confidence - 0.5) / 0.5))
+
+    def _cross_val_accuracy(self, X: np.ndarray, y: np.ndarray) -> float:
+        """Held-out *balanced* accuracy via stratified k-fold.
+
+        Two separate traps, both of which this avoids. Scoring on the rows it was fitted
+        to measures memorisation, not prediction. And plain accuracy on skewed labels
+        rewards always answering with the majority class - balanced accuracy averages
+        the per-class rates, so that strategy scores 0.5 and is seen for what it is.
         """
         try:
             n_splits = int(min(5, np.bincount(y).min()))
             if n_splits < 2:
                 return 0.0
-            pipe = make_pipeline(StandardScaler(), LogisticRegression(C=1.0, solver='liblinear'))
+            pipe = make_pipeline(
+                StandardScaler(),
+                LogisticRegression(C=1.0, solver='liblinear', class_weight='balanced'))
             cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=0)
-            return float(round(cross_val_score(pipe, X, y, cv=cv, scoring="accuracy").mean(), 4))
+            scores = cross_val_score(pipe, X, y, cv=cv, scoring="balanced_accuracy")
+            return float(round(scores.mean(), 4))
         except Exception:
             return 0.0
 
@@ -154,7 +198,8 @@ class UserPreferenceModel:
                 "feature_version": self.FEATURE_VERSION,
                 "is_trained": self.is_trained,
                 "confidence": self.confidence,
-                "confidence_metric": "cross_val_accuracy",
+                "confidence_metric": "cross_val_balanced_accuracy",
+            "trust": self.trust,
                 "sample_count": len(self.samples),
                 "samples": self.samples[-100:]
             }

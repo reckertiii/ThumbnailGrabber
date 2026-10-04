@@ -144,7 +144,7 @@ function render(d) {
       : (blockers.length ? `⏸ holding: ${blockers.slice(0, 2).join(" · ")}` : "⏸ holding");
     $("mStability").textContent = `Score: ${d.is_stable ? "🟢 Stable" : "🟡 Unstable"} · People detected: ${d.people_detected} · ${holdText}`;
     $("mModel").textContent = d.ml_trained
-      ? `AI Model: Trained (${Math.round(d.ml_confidence * 100)}% held-out accuracy · ${d.ml_samples} ratings · ML score ${Math.round(d.ml_score * 100)}%)`
+      ? `AI Model: Trained (${Math.round(d.ml_confidence * 100)}% balanced accuracy · ${d.ml_samples} ratings · ML score ${Math.round(d.ml_score * 100)}%)`
       : "AI Model: Untrained — click ⭐ Best on a shot to train it";
   } else {
     ["mHead", "mEyes", "mExpr", "mShoulder", "mSharp", "mExposure", "mCentering", "mHand", "mStability"]
@@ -218,7 +218,7 @@ function renderGallery(caps) {
 async function feedback(filename, favorite) {
   try {
     const r = await post(`/api/captures/${encodeURIComponent(filename)}/feedback`, { favorite });
-    toast(`${favorite ? "⭐ Learned as a winner" : "👎 Learned to penalize"} — ${r.samples} ratings` + (r.confidence ? `, ${Math.round(r.confidence * 100)}% held-out accuracy` : ", not enough ratings to train yet"));
+    toast(`${favorite ? "⭐ Learned as a winner" : "👎 Learned to penalize"} — ${r.samples} ratings` + (r.confidence ? `, ${Math.round(r.confidence * 100)}% balanced accuracy` : ", not enough ratings to train yet"));
   } catch (e) {
     toast("Training failed: " + e.message);
   }

@@ -205,6 +205,8 @@ def _telemetry() -> Dict[str, Any]:
             "faces": [_face_to_dict(f) for f in (analysis.faces or [])],
             "ml_trained": bool(pm.is_trained) if pm else False,
             "ml_confidence": round(float(pm.confidence), 3) if pm else 0.0,
+            "ml_trust": round(float(pm.trust), 3) if pm else 0.0,
+            "ml_weight_applied": round(float(getattr(analysis, "ml_weight_applied", 0.0)), 3),
             "ml_samples": len(pm.samples) if pm else 0,
             "ai_judge": proc.judge.status_line() if proc and getattr(proc, "judge", None) else "AI judge off",
             "buffer": proc.buffer_stats() if proc and hasattr(proc, "buffer_stats") else None,

@@ -1005,7 +1005,11 @@ class MainWindow(QMainWindow):
             # Live AI Model Telemetry Readout
             if self.processor and self.processor.analyzer.preference_model.is_trained:
                 pm = self.processor.analyzer.preference_model
-                self.lbl_ai_model.setText(f"AI Model: Trained ({pm.confidence*100:.0f}% held-out accuracy | {len(pm.samples)} ratings | ML Score: {int(analysis.ml_score*100)}%)")
+                self.lbl_ai_model.setText(
+                    f"AI Model: {len(pm.samples)} ratings | {pm.confidence*100:.0f}% balanced accuracy"
+                    f" | influence {getattr(analysis, 'ml_weight_applied', 0.0)*100:.0f}%"
+                    + (f" | ML Score: {int(analysis.ml_score*100)}%" if pm.trust > 0
+                       else " | no better than guessing, ignored"))
                 self.lbl_ai_model.setStyleSheet("color: #4ade80; font-weight: bold;")
             else:
                 self.lbl_ai_model.setText("AI Model: Untrained (Click ⭐ Best in gallery to train AI)")
