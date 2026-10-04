@@ -80,8 +80,13 @@ What makes a frame better:
 eyes closed or mid-blink is a serious one.
 - Mouth closed, or a natural pleasant expression. A slight smile is best. Caught mid-word is \
 a moderate flaw; a grimace or half-formed expression is worse.
-- Open posture. Hands gesturing outward or resting naturally are good. Arms folded, hands \
-clasped at the chest, or hands in pockets read as closed-off - a moderate flaw, not fatal.
+- Open posture. Hands gesturing outward or resting naturally are good. Arms folded or \
+hands clasped tight against the chest read as closed-off. Hands simply being somewhere in \
+front of the body is normal for someone speaking and is measured separately - only raise \
+it when they genuinely merge into the torso as a single shape.
+- Expression and gaze are what you are most useful for, because they are the hardest to \
+measure and the easiest for a person to notice. Weigh them above everything else: is he \
+engaged and present, or caught between two expressions, glancing away, or blank?
 - Nothing crossing the body. A microphone stand, iPad, or lectern edge in front of the torso \
 is a serious flaw because it breaks the cutout. A hand in front of the torso is a moderate \
 flaw. Anything covering the face is fatal.

@@ -9,7 +9,12 @@ speaker can be dropped onto a slide. It combines head pose (yaw/pitch/roll via
 `solvePnP`), eye openness, expression, shoulder level, sharpness, exposure, and a
 **cutout suitability** score — is the whole subject inside the frame, are they big
 enough to enlarge, are their hands clear of their torso, and is the background behind
-them plain enough to key cleanly. An optional preference model learns which shots you
+them plain enough to key cleanly, and is anything crossing their body. That last one
+matters most: a table, lectern or music stand in front of the speaker is the single
+worst thing for a cutout, because the matte either keeps it or punches a hole through
+them. It is detected as a long horizontal edge running across the body and applied as a
+graded penalty rather than a rejection - some speakers never step away from the table,
+and for them it scales every frame alike and leaves the ranking untouched. An optional preference model learns which shots you
 actually pick.
 
 Captures are written as **PNG** by default, alongside a **subject-tight crop**

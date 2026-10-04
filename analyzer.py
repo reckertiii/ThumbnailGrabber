@@ -127,6 +127,8 @@ class SingleFaceAnalysis:
     is_subject_clipped: bool = False    # Subject runs off an edge of the frame
     hands_on_torso: bool = False        # Hands overlap the body, which muddies the matte
     arms_clear: bool = False            # Arms held wide or at the sides - cuts out cleanly
+    torso_clear_score: float = 1.0      # 1.0 = nothing crossing the body, 0.0 = heavily crossed
+    torso_crossing: float = 0.0         # Raw measure: widest edge run across the body
     background_score: float = 1.0       # 1.0 = clean/plain behind the subject
     pose_points: Optional[Dict[str, Any]] = None
     
@@ -200,6 +202,8 @@ class AnalysisResult:
     is_subject_clipped: bool = False
     hands_on_torso: bool = False
     background_score: float = 1.0
+    torso_clear_score: float = 1.0
+    torso_crossing: float = 0.0
     disqualified_reasons: List[str] = field(default_factory=list)
     hands_covering_face: bool = False
     is_hand_blurry: bool = False
@@ -480,6 +484,13 @@ class PersonQualityAnalyzer:
             raw_score *= 0.20
         if f_res.is_shoulder_tilted:
             raw_score *= 0.80
+
+        # Something crossing the body - a table, lectern or music stand - is the worst
+        # thing for a cutout: the matte either keeps it or punches a hole through the
+        # subject. Graded rather than disqualifying, because some speakers never step
+        # away from the table, and for them this scales every frame alike and leaves the
+        # ranking untouched.
+        raw_score *= 0.55 + 0.45 * f_res.torso_clear_score
 
         # Heavy penalty for motion blur / low sharpness
         is_blurry = f_res.laplacian_variance < min_sharp
@@ -866,6 +877,8 @@ class PersonQualityAnalyzer:
         result.is_subject_clipped = primary.is_subject_clipped
         result.hands_on_torso = primary.hands_on_torso
         result.background_score = primary.background_score
+        result.torso_clear_score = primary.torso_clear_score
+        result.torso_crossing = primary.torso_crossing
         result.hand_pose_score = 0.70 if primary.hands_on_torso else (1.0 if primary.arms_clear else 0.90)
         result.mesh_points = primary.mesh_points
 
@@ -1300,6 +1313,18 @@ class PersonQualityAnalyzer:
         # --- 4. Background cleanliness --------------------------------------
         f_res.background_score = self._background_cleanliness(frame, (sx0, sy0, sx1, sy1))
 
+        # --- 5. Nothing crossing the body -----------------------------------
+        crossing = self._torso_crossing(frame, pose)
+        f_res.torso_crossing = round(crossing, 3)
+        # Calibrated on real captures: ~0.07 standing clear, ~0.29 with a table across
+        # the lower torso, ~0.39 pressed against it with both hands on top.
+        f_res.torso_clear_score = round(
+            max(0.0, min(1.0, 1.0 - (crossing - 0.05) / 0.35)), 3)
+
+        # Not folded into the cutout composite: at a fifth of an eighteen percent term it
+        # moved the final score by about three points, while the frames it flagged were
+        # the ones a matte cannot handle at all. It is applied as a multiplier below,
+        # alongside the other things that spoil a frame outright.
         cutout = (
             0.35 * completeness +
             0.25 * size_score +
@@ -1307,6 +1332,50 @@ class PersonQualityAnalyzer:
             0.25 * f_res.background_score
         )
         f_res.cutout_score = round(max(0.0, min(1.0, cutout)), 3)
+
+    @staticmethod
+    def _torso_crossing(frame: np.ndarray, pose: Dict[str, Any]) -> float:
+        """How far a horizontal edge runs across the body below the chest.
+
+        A table, lectern or music stand in front of the speaker reads as a long,
+        near-horizontal, high-contrast line spanning most of their width - and it is the
+        single worst thing for a cutout, because the matte either keeps it or punches a
+        hole through the body. Printed shirt text is high-contrast too, but it breaks
+        into short runs, so measuring the *fraction of body width* a single row crosses
+        separates the two.
+
+        Deliberately returns a graded value rather than a verdict. Some speakers never
+        step away from the table; for them every frame scores alike and the ranking is
+        unaffected, which is the right outcome. For a speaker who does move clear, the
+        clear frames win.
+        """
+        ls, rs = pose.get('left_shoulder'), pose.get('right_shoulder')
+        if not (ls and rs):
+            return 0.0
+        lh, rh = pose.get('left_hip'), pose.get('right_hip')
+        x0, x1 = min(ls[0], rs[0]), max(ls[0], rs[0])
+        y_top = min(ls[1], rs[1])
+        y_bot = max(lh[1], rh[1]) if (lh and rh) else y_top + int((x1 - x0) * 1.4)
+        span = max(1, y_bot - y_top)
+
+        h, w = frame.shape[:2]
+        pad = int((x1 - x0) * 0.15)
+        xa, xb = max(0, x0 - pad), min(w, x1 + pad)
+        # From mid-chest down past the hips - where a table or lectern edge falls.
+        ya, yb = max(0, int(y_top + span * 0.35)), min(h, int(y_bot + span * 0.45))
+        if xb - xa < 20 or yb - ya < 10:
+            return 0.0
+
+        roi = cv2.cvtColor(frame[ya:yb, xa:xb], cv2.COLOR_BGR2GRAY)
+        gy = np.abs(cv2.Sobel(roi, cv2.CV_32F, 0, 1, ksize=3))
+        peak = float(gy.max())
+        if peak <= 1e-6:
+            return 0.0
+        strong = (gy / peak) > 0.35
+        row_fraction = strong.mean(axis=1)
+        # Average of the worst few rows, so a single noisy line doesn't decide it.
+        worst = np.sort(row_fraction)[-5:]
+        return float(worst.mean())
 
     @staticmethod
     def _background_cleanliness(frame: np.ndarray, subject_rect: Tuple[int, int, int, int]) -> float:
