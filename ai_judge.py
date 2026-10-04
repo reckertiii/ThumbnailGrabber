@@ -85,8 +85,7 @@ clasped at the chest, or hands in pockets read as closed-off - a moderate flaw, 
 - Nothing crossing the body. A microphone stand, iPad, or lectern edge in front of the torso \
 is a serious flaw because it breaks the cutout. A hand in front of the torso is a moderate \
 flaw. Anything covering the face is fatal.
-- Sharp face. The image you see has been downscaled, so do not infer blur from soft fine \
-detail - only flag blur when the face is visibly smeared.
+- Sharp. Look specifically for motion blur - a smeared hand or arm caught mid-gesture, or a smeared face. Blur on a raised or gesturing hand is a real flaw, because that hand is part of the cutout and will look wrong frozen on a slide. Call it out when you see it: moderate when a hand or arm is smeared, serious when the face is.
 - Whole head in frame with a little room above it.
 
 First list every flaw you actually see, tagging each (small), (moderate) or (serious), \

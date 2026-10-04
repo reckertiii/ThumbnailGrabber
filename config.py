@@ -80,10 +80,19 @@ class QualityThresholds:
     # the numbers below are comparable across camera distances and source resolutions.
     # A raw (unnormalised) Laplacian grows with face size, which made a distant subject
     # look "blurry" and a close one always look perfect.
+    # Calibrated against lossless PNG captures, where a crisp face measures 100-160 and
+    # horizontal motion blur drops it fast: ~61 at 3px of smear, ~41 at 5px, ~33 at 7px.
+    # An earlier 'good' of 70 was derived from JPEG captures, whose compression softens
+    # the image; against PNG every real frame sat above it and scored a flat 1.00, so
+    # sharpness stopped separating a crisp frame from a soft one.
     sharpness_face_height: int = 160  # Face ROI is resized to this height before measuring
-    min_sharpness_laplacian: float = 18.0 # Below this the frame is treated as motion-blurred
+    min_sharpness_laplacian: float = 45.0 # Below this the frame is treated as motion-blurred
     sharpness_floor: float = 8.0     # Normalised variance scoring 0.0 (heavy blur)
-    sharpness_good: float = 70.0     # Normalised variance scoring 1.0 (crisp)
+    sharpness_good: float = 150.0    # Normalised variance scoring 1.0 (crisp)
+    # Hands are measured the same normalised way. A gesturing hand smears while the face
+    # stays sharp, so the ratio against the face is the reliable signal.
+    min_hand_sharpness: float = 25.0      # Absolute floor for a hand region
+    hand_sharpness_ratio: float = 0.45    # Blurry if the hand is below this share of the face
     min_brightness: float = 40.0     # Min mean brightness of face ROI (underexposure threshold)
     max_brightness: float = 220.0    # Max mean brightness of face ROI (overexposure threshold)
 
@@ -110,6 +119,20 @@ class AppConfig:
     # Nth analysed frame and the previous landmarks are re-matched in between. Set to 1
     # to detect them on every frame.
     pose_hand_interval: int = 2
+    # Rolling frame buffer ("DVR"). Analysis runs at analysis_fps while the camera sends
+    # ~30, so most frames are never examined and a brief good expression can fall between
+    # samples. The buffer keeps every frame for a few seconds so a chosen moment can be
+    # re-examined at full frame rate for the crispest version of itself.
+    # Memory is the constraint: a 1080p frame is 6.22 MB, so 5s x 30fps is about 0.93 GB.
+    # 0 disables the buffer and the refinement pass.
+    dvr_buffer_seconds: float = 5.0
+    dvr_buffer_fps: int = 30               # Frames per second retained (sizes the buffer)
+    dvr_refine_window_sec: float = 0.3     # Scrub +/- this around the chosen moment
+    dvr_refine_candidates: int = 3         # Fully re-score this many of the sharpest frames
+    # Candidates found while a judge review is in flight are queued rather than dropped,
+    # so a slow reviewer costs latency instead of lost moments.
+    review_queue_size: int = 10
+
     burst_window_seconds: float = 2.5      # Time window to find peak score candidate frame
     cooldown_seconds: float = 2.0          # Minimum cooldown between auto-saved screenshots
     single_winner_mode: bool = True        # Automatically delete inferior shots beyond Top 5

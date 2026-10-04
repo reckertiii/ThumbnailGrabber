@@ -126,6 +126,7 @@ class SingleFaceAnalysis:
     subject_height_ratio: float = 0.0   # Subject height as a fraction of frame height
     is_subject_clipped: bool = False    # Subject runs off an edge of the frame
     hands_on_torso: bool = False        # Hands overlap the body, which muddies the matte
+    arms_clear: bool = False            # Arms held wide or at the sides - cuts out cleanly
     background_score: float = 1.0       # 1.0 = clean/plain behind the subject
     pose_points: Optional[Dict[str, Any]] = None
     
@@ -151,6 +152,7 @@ class AnalysisResult:
     smoothed_score: float = 0.0    # EMA-smoothed composite score
     ml_score: float = 0.5          # Machine learning preference model score (0.0 - 1.0)
     ml_trained: bool = False       # Whether ML model is trained
+    ml_weight_applied: float = 0.0 # How much the learned model actually contributed
     is_qualified: bool = False
     is_stable: bool = False        # Whether score is stable (low variance over recent frames)
     
@@ -191,6 +193,7 @@ class AnalysisResult:
     is_talking_or_open: bool = False
     
     laplacian_variance: float = 0.0
+    hand_laplacian_variance: float = 0.0   # Normalised, comparable with laplacian_variance
     face_brightness: float = 128.0
     cutout_score: float = 0.5
     subject_height_ratio: float = 0.0
@@ -240,6 +243,9 @@ class PersonQualityAnalyzer:
         # available and should judge each frame on its own merits — with these gates on,
         # a single excellent frame surrounded by bad ones is thrown away.
         self.require_temporal_stability = require_temporal_stability
+        # Ceiling on how much the learned preference model may contribute once it is
+        # fully matured; the effective weight ramps up to this with samples and accuracy.
+        self.weights_ml_cap = 0.35
 
         # Hand/pose re-detection cadence, and the cached results reused in between.
         # The cached landmarks are re-matched against the current faces every frame, so
@@ -435,7 +441,7 @@ class PersonQualityAnalyzer:
         w = self.weights
         # hand_pose used to be multiplied by a hardcoded 1.0, so its weight was simply
         # dead score. It now reflects whether the hands are clear of the body.
-        hand_pose_score = 0.45 if f_res.hands_on_torso else 1.0
+        hand_pose_score = 0.70 if f_res.hands_on_torso else (1.0 if f_res.arms_clear else 0.90)
         raw_score = (
             w.head_pose * f_res.head_pose_score +
             w.eye_openness * f_res.eye_openness_score +
@@ -681,9 +687,28 @@ class PersonQualityAnalyzer:
                         hand_crop = frame[min_y:max_y, min_x:max_x]
                         
                         if hand_crop.size > 0:
+                            # Measured the same way as the face - resampled to a fixed
+                            # height first - so the two are comparable. Previously the
+                            # hand was a raw full-resolution Laplacian while the face
+                            # had been normalised, so the relative test compared two
+                            # different scales and never fired: visibly motion-blurred
+                            # hands were reported as sharp.
                             hand_gray = cv2.cvtColor(hand_crop, cv2.COLOR_BGR2GRAY)
-                            hand_lap_var = float(cv2.Laplacian(hand_gray, cv2.CV_64F).var())
-                            if hand_lap_var < 20.0 or (analyzed_faces[0].laplacian_variance > 50 and hand_lap_var < analyzed_faces[0].laplacian_variance * 0.25):
+                            hand_norm = self._resize_to_height(
+                                hand_gray, self.thresholds.sharpness_face_height)
+                            hand_lap_var = float(cv2.Laplacian(hand_norm, cv2.CV_64F).var())
+                            # Keep the worst hand: with two hands in frame, reporting
+                            # whichever happened to be measured last hid the blurry one.
+                            if (result.hand_laplacian_variance <= 0.0
+                                    or hand_lap_var < result.hand_laplacian_variance):
+                                result.hand_laplacian_variance = round(hand_lap_var, 1)
+
+                            face_lap = analyzed_faces[0].laplacian_variance
+                            # A gesturing hand smears while the face stays sharp, so the
+                            # giveaway is the ratio, not an absolute floor.
+                            if (hand_lap_var < self.thresholds.min_hand_sharpness or
+                                    (face_lap > 1.0 and
+                                     hand_lap_var < face_lap * self.thresholds.hand_sharpness_ratio)):
                                 result.is_hand_blurry = True
 
                         index_tip = np.array(pts_full_res[8])
@@ -841,7 +866,7 @@ class PersonQualityAnalyzer:
         result.is_subject_clipped = primary.is_subject_clipped
         result.hands_on_torso = primary.hands_on_torso
         result.background_score = primary.background_score
-        result.hand_pose_score = 0.45 if primary.hands_on_torso else 1.0
+        result.hand_pose_score = 0.70 if primary.hands_on_torso else (1.0 if primary.arms_clear else 0.90)
         result.mesh_points = primary.mesh_points
 
         # Composite Overall Score Calculation strictly for ACTIVE SELECTED faces
@@ -863,7 +888,16 @@ class PersonQualityAnalyzer:
         if result.hands_covering_face:
             raw_score *= 0.10
         if result.is_hand_blurry:
-            raw_score *= 0.45
+            # Graded by how smeared the hand is relative to the face, not a flat cut.
+            # A speaker gesturing while they talk has some hand motion in most frames,
+            # so a fixed 0.45 was a near-constant halving that buried everything else
+            # and left no way for the sharpest-handed frame of a moment to win. Now a
+            # slightly soft hand costs little and a badly smeared one costs real score,
+            # which is what lets buffer refinement pick the crisp version.
+            face_lap = max(1.0, result.laplacian_variance)
+            ratio = max(0.0, min(1.0, result.hand_laplacian_variance / face_lap))
+            limit = max(0.01, self.thresholds.hand_sharpness_ratio)
+            raw_score *= 0.70 + 0.30 * min(1.0, ratio / limit)
 
         rule_score = max(0.0, min(1.0, raw_score))
         
@@ -874,11 +908,20 @@ class PersonQualityAnalyzer:
             result.ml_score = ml_pred
             result.ml_trained = self.preference_model.is_trained
             
-            # Blend Rule Score (65%) and ML Model Score (35%) if trained
+            # Blend the rule score with the learned preference, but scale the learned
+            # half by how much it has actually earned. At a flat 0.35 a model trained on
+            # a couple of dozen ratings was overriding the heuristics outright - pulling
+            # a frame the rules scored 0.87 down to 0.34. Weighting by sample count and
+            # cross-validated accuracy lets it grow into that influence as it learns.
             if self.preference_model.is_trained:
-                final_score = 0.65 * rule_score + 0.35 * ml_pred
+                maturity = min(1.0, len(self.preference_model.samples) / 50.0)
+                trust = max(0.0, min(1.0, self.preference_model.confidence))
+                w = self.weights_ml_cap * maturity * trust
+                final_score = (1.0 - w) * rule_score + w * ml_pred
+                result.ml_weight_applied = round(w, 3)
             else:
                 final_score = rule_score
+                result.ml_weight_applied = 0.0
         except Exception:
             result.ml_score = 0.5
             result.ml_trained = False
@@ -1191,6 +1234,7 @@ class PersonQualityAnalyzer:
         # --- 3. Hands clear of the torso ------------------------------------
         # Hands crossed over the chest merge into the body and read as a blob.
         hands_on_torso = False
+        arms_clear = False
         ls, rs = pose.get('left_shoulder'), pose.get('right_shoulder')
         lh, rh = pose.get('left_hip'), pose.get('right_hip')
         if ls and rs:
@@ -1226,8 +1270,32 @@ class PersonQualityAnalyzer:
                     if wrist and _in_torso(wrist):
                         hands_on_torso = True
                         break
+            # Arms held clear of the body - gesturing wide, or hanging at the sides -
+            # cut out cleanly and read as open posture. Worth rewarding rather than
+            # merely not penalising: a speaker who gestures constantly has hands near
+            # the torso in most frames, so "not on the torso" alone barely separates
+            # them. The rare wide-arm moment is what should win.
+            span = max(1.0, float(torso_x1 - torso_x0))
+            for wrist in (pose.get('left_wrist'), pose.get('right_wrist')):
+                if not wrist:
+                    continue
+                outboard = (wrist[0] < torso_x0 - span * 0.25) or (wrist[0] > torso_x1 + span * 0.25)
+                below = wrist[1] > torso_y1
+                if outboard or below:
+                    arms_clear = True
+                    break
+
         f_res.hands_on_torso = hands_on_torso
-        hands_score = 0.45 if hands_on_torso else 1.0
+        f_res.arms_clear = arms_clear
+        # Softened from 0.45: this fires on most frames of a speaker who gestures while
+        # talking, so a heavy penalty was a near-constant subtraction rather than a
+        # discriminator, and it drowned out eyes, expression and framing.
+        if hands_on_torso:
+            hands_score = 0.70
+        elif arms_clear:
+            hands_score = 1.00
+        else:
+            hands_score = 0.90
 
         # --- 4. Background cleanliness --------------------------------------
         f_res.background_score = self._background_cleanliness(frame, (sx0, sy0, sx1, sy1))

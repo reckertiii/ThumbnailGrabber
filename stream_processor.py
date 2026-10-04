@@ -118,6 +118,22 @@ class StreamProcessor:
         self.latest_analysis: Optional[AnalysisResult] = None
         self.frame_lock = threading.Lock()
         
+        # Rolling raw-frame buffer. The grabber fills it at camera rate; a chosen moment
+        # is then re-examined across it at full frame rate, rather than being stuck with
+        # whichever of the analysis_fps samples happened to land.
+        dvr_frames = int(max(0.0, config.dvr_buffer_seconds) * max(1, config.dvr_buffer_fps))
+        self._dvr: deque = deque(maxlen=dvr_frames) if dvr_frames > 0 else deque(maxlen=0)
+        self._dvr_lock = threading.Lock()
+        # Refinement scores buffered frames, which would otherwise churn the live
+        # analyzer's EMA, stability window and consecutive-qualified counter. A separate
+        # instance keeps that state clean, and judges each frame standalone - which is
+        # exactly what picking the best single frame of a moment calls for. Built on
+        # first use so it costs nothing when the buffer is off.
+        self._refine_analyzer: Optional[PersonQualityAnalyzer] = None
+        if dvr_frames > 0:
+            print(f"[StreamProcessor] Frame buffer: {config.dvr_buffer_seconds:.0f}s "
+                  f"({dvr_frames} frames, ~{dvr_frames * 6.22 / 1024:.2f} GB at 1080p)")
+
         # Buffer for peak detection & Single Winner tracking
         self.candidate_buffer = deque()
         self.saved_captures: List[CapturedScreenshot] = []
@@ -132,6 +148,13 @@ class StreamProcessor:
         self.judge = AIJudge(config)
         self._review_lock = threading.Lock()
         self._review_in_flight: bool = False
+        # Candidates found while a review is running are queued, not discarded. A review
+        # on a local model can take a minute; dropping everything for that minute meant
+        # good moments passed by unseen. The queue is bounded and evicts oldest first,
+        # so a reviewer that falls permanently behind loses the stalest work, not the
+        # freshest.
+        self._review_queue: deque = deque(maxlen=max(1, int(getattr(config, "review_queue_size", 10))))
+        self._review_worker: Optional[threading.Thread] = None
         
         
         # Connection status tracking
@@ -280,9 +303,15 @@ class StreamProcessor:
                         break
 
             # Store latest frame
+            now_grab = time.time()
             with self.frame_lock:
                 self.latest_frame = frame
                 self.frames_grabbed += 1
+            if self._dvr.maxlen:
+                with self._dvr_lock:
+                    # deque(maxlen) evicts the oldest, so memory stays bounded without
+                    # any trimming pass on the hot path.
+                    self._dvr.append((now_grab, frame))
 
             # Yield slightly to prevent 100% CPU lock in grabber thread
             time.sleep(0.001)
@@ -326,9 +355,23 @@ class StreamProcessor:
             if analysis.face_detected:
                 self._score_history.append(analysis.overall_score)
             
-            # Rolling peak candidate selection - strictly require qualified clean frames
+            # Rolling peak candidate selection. Frames whose *only* problem is blur are
+            # admitted too: the buffer very likely holds a sharp version of the same
+            # moment a frame or two away, and refinement will find it. Without this a
+            # fast gesture or a camera pan disqualified the moment outright and it was
+            # gone, which is the "good shot passed by" case. Anything refinement can't
+            # rescue is rejected again after the fact.
             now = time.time()
-            if analysis.face_detected and analysis.is_qualified:
+            primary = (analysis.faces or [None])[0]
+            reasons = list(getattr(primary, "disqualified_reasons", []) or []) if primary else []
+            # Blur also drags the score under the threshold, so a smeared frame lists
+            # both reasons. Treat it as blur-only when every reason is blur or the
+            # score it caused - but require at least one actual blur reason, or every
+            # low-scoring frame would be admitted.
+            has_blur = any("blurry" in r for r in reasons)
+            blur_only = has_blur and all(
+                ("blurry" in r) or r.startswith("score ") for r in reasons)
+            if analysis.face_detected and (analysis.is_qualified or blur_only):
                 self.candidate_buffer.append((now, frame.copy(), analysis))
             
             # Clean old entries outside burst window
@@ -373,6 +416,80 @@ class StreamProcessor:
         # Allow peak at position 1, 2, 3, or 4
         return peak_idx >= 1
 
+    def _refine_from_buffer(self, chosen_at: float, chosen_frame: np.ndarray,
+                           chosen_analysis: AnalysisResult):
+        """Looks for a crisper version of the chosen moment in the rolling buffer.
+
+        Analysis samples at analysis_fps while the camera sends roughly four times that,
+        so the frame that got scored is rarely the sharpest one available - a gesturing
+        hand smears badly from one frame to the next. This scrubs a short window around
+        the chosen moment, ranks every buffered frame by a cheap sharpness proxy, and
+        then fully re-scores only the best few. Sharpness alone would be the wrong thing
+        to trust: half a second is enough to start a blink, so the winner has to earn it
+        on the whole score, not just on clarity.
+
+        Returns (frame, analysis) - the originals if nothing better is found.
+        """
+        window = float(getattr(self.config, "dvr_refine_window_sec", 0.0) or 0.0)
+        top_n = int(getattr(self.config, "dvr_refine_candidates", 0) or 0)
+        if window <= 0 or top_n <= 0 or not self._dvr.maxlen:
+            return chosen_frame, chosen_analysis
+
+        with self._dvr_lock:
+            nearby = [(t, f) for (t, f) in self._dvr if abs(t - chosen_at) <= window]
+        if len(nearby) < 2:
+            return chosen_frame, chosen_analysis
+
+        # Cheap proxy first: sharpness over the subject region, normalised the same way
+        # the analyzer does it so the numbers mean the same thing.
+        faces = chosen_analysis.faces or []
+        rect = getattr(faces[0], "subject_bbox", None) if faces else None
+        if not rect:
+            rect = chosen_analysis.face_bbox
+        if not rect:
+            return chosen_frame, chosen_analysis
+        rx, ry, rw, rh = rect
+        height = self.analyzer.thresholds.sharpness_face_height
+
+        scored = []
+        for t, f in nearby:
+            roi = f[max(0, ry):ry + rh, max(0, rx):rx + rw]
+            if roi.size == 0:
+                continue
+            gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+            norm = self.analyzer._resize_to_height(gray, height)
+            scored.append((float(cv2.Laplacian(norm, cv2.CV_64F).var()), t, f))
+        if not scored:
+            return chosen_frame, chosen_analysis
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+
+        if self._refine_analyzer is None:
+            self._refine_analyzer = PersonQualityAnalyzer(
+                self.config.weights, self.config.thresholds,
+                max_people_target=self.config.max_people_target,
+                pose_hand_interval=getattr(self.config, "pose_hand_interval", 1),
+                require_temporal_stability=False,
+            )
+
+        started_qualified = chosen_analysis.is_qualified
+        best_frame, best_analysis = chosen_frame, chosen_analysis
+        best_score = chosen_analysis.overall_score if started_qualified else -1.0
+
+        for _sharp, _t, f in scored[:top_n]:
+            try:
+                a = self._refine_analyzer.analyze_frame(f)
+            except Exception:
+                continue
+            if a.face_detected and a.is_qualified and a.overall_score > best_score:
+                best_score, best_frame, best_analysis = a.overall_score, f, a
+
+        if best_analysis is not chosen_analysis:
+            print(f"[Refine] {chosen_analysis.overall_score:.0%} -> {best_score:.0%} "
+                  f"(sharpness {chosen_analysis.laplacian_variance:.0f} -> "
+                  f"{best_analysis.laplacian_variance:.0f}) from {len(nearby)} buffered frames")
+        return best_frame, best_analysis
+
     def _would_improve_retained(self, score: float, now: float) -> bool:
         """Is this capture worth writing, given what is already kept?
 
@@ -409,14 +526,25 @@ class StreamProcessor:
         best_candidate = max(self.candidate_buffer, key=lambda item: item[2].overall_score)
         cand_time, best_frame, best_analysis = best_candidate
 
-        # Must exceed threshold
-        if best_analysis.overall_score < self.config.thresholds.min_overall_score:
-            return
-        
+        # The score threshold is deliberately NOT checked here. Blur pushes a frame under
+        # it, and refinement below may well replace that frame with a sharp version of
+        # the same moment that clears it comfortably. The post-refinement is_qualified
+        # guard enforces the threshold on whatever frame actually wins.
+
         # === Score Trend: require local peak ===
         if not self._is_at_local_peak():
             return
         
+        # === Scrub the buffer for a crisper version of this same moment ===
+        # Done before the retention test, since refinement can only raise the score and
+        # a sharper frame may clear a bar the sampled one missed.
+        best_frame, best_analysis = self._refine_from_buffer(cand_time, best_frame, best_analysis)
+
+        # Blur-only candidates were admitted on the chance the buffer held a sharp
+        # version of the same moment. If it didn't, the frame is still blurry - drop it.
+        if not best_analysis.is_qualified:
+            return
+
         # === Would this actually improve what we're keeping? ===
         if not self._would_improve_retained(best_analysis.overall_score, now):
             return
@@ -449,18 +577,35 @@ class StreamProcessor:
         self.candidate_buffer.clear()
 
     def _start_review(self, frame: np.ndarray, analysis: AnalysisResult, now: float) -> bool:
-        """Kicks off an asynchronous judge review. Returns False if one is already running."""
+        """Queues a candidate for judge review and makes sure the worker is running."""
         with self._review_lock:
-            if self._review_in_flight:
-                return False
-            self._review_in_flight = True
-        # Cooldown starts at hand-off, not at save, so the analysis loop doesn't queue
-        # up a second candidate while the first is still being reviewed.
+            dropped = len(self._review_queue) == self._review_queue.maxlen
+            self._review_queue.append((frame.copy(), analysis))
+            if dropped:
+                print(f"[AIJudge] Review queue full ({self._review_queue.maxlen}); "
+                      f"dropped the oldest pending candidate.")
+            if self._review_worker is None or not self._review_worker.is_alive():
+                self._review_worker = threading.Thread(target=self._review_worker_loop, daemon=True)
+                self._review_worker.start()
+        # Cooldown starts at hand-off rather than at save, so the analysis loop paces
+        # candidates by the capture cooldown instead of by how slow the reviewer is.
         self.last_capture_time = now
         self.candidate_buffer.clear()
-        threading.Thread(target=self._review_and_save, args=(frame.copy(), analysis),
-                         daemon=True).start()
         return True
+
+    def _review_worker_loop(self) -> None:
+        """Drains the review queue one candidate at a time."""
+        while not self._stop_event.is_set():
+            with self._review_lock:
+                if not self._review_queue:
+                    self._review_in_flight = False
+                    return
+                frame, analysis = self._review_queue.popleft()
+                self._review_in_flight = True
+            try:
+                self._review_and_save(frame, analysis)
+            except Exception as e:  # noqa: BLE001 - one bad candidate must not end the worker
+                print(f"[AIJudge] Review worker error: {e}")
 
     def _review_and_save(self, frame: np.ndarray, analysis: AnalysisResult) -> None:
         try:
@@ -493,10 +638,7 @@ class StreamProcessor:
 
             self.save_screenshot(frame, analysis, review=result)
         except Exception as e:  # noqa: BLE001 - a review failure must not kill the worker
-            print(f"[AIJudge] Review worker error: {e}")
-        finally:
-            with self._review_lock:
-                self._review_in_flight = False
+            print(f"[AIJudge] Review failed for one candidate: {e}")
 
     def save_screenshot(self, frame: np.ndarray, analysis: AnalysisResult,
                         review: Optional[JudgeResult] = None) -> CapturedScreenshot:
