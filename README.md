@@ -225,6 +225,12 @@ In addition to live streams, Thumbnail Grabber can scan through entire pre-recor
   python main.py --scan-video /path/to/recording.mp4 --top 5 --headless
   ```
 
+## Installing on TrueNAS SCALE
+
+See **[INSTALL.md](INSTALL.md)** for the full deployment: datasets, the custom-app
+settings, wiring the AI judge to the Ollama app, first-run checks, tuning the frame
+buffer against real memory, and troubleshooting.
+
 ## Running with Docker (Recommended for 24/7 Headless Server)
 
 The entire application can be run in a lightweight Docker container with persistent volumes for captured screenshots and trained machine learning preference models:
