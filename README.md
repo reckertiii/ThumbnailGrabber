@@ -355,3 +355,14 @@ frame, as before.
 - **One camera per server process.** The FFMPEG capture options are set process-wide,
   and the analyzer keeps per-stream state, so run one process per camera.
 - Each open browser tab gets its own MJPEG encode. Fine for a handful of viewers on a LAN.
+
+## Licence
+
+Proprietary — copyright (c) 2026 Robert Eckert, all rights reserved. See `LICENSE`.
+This is not open source: no permission is granted to use, copy, modify or distribute
+it without written permission.
+
+Third-party dependencies carry their own licences; see `THIRD-PARTY-NOTICES.md`.
+Note in particular that **PyQt6 is GPL-3.0-only** unless commercially licensed, which
+matters only if the *desktop* app is distributed — the container image filters PyQt6
+out, and the web UI and headless scanner never import it.
