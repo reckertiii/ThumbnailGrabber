@@ -4,15 +4,27 @@
 # `docker compose up -d` from a shell on the NAS.
 #
 # Datasets are mounted at the same path they have on the host, so a folder is
-# called the same thing in the picker, in the TrueNAS UI and over SMB. Any
-# folder inside a mounted dataset can be chosen without redeploying.
+# called the same thing in the picker, in the TrueNAS UI and over SMB. Any folder
+# inside a mounted dataset can be chosen from the UI without redeploying.
 #
-# Change before deploying:
-#   1. /mnt/main/apps -> the dataset(s) you want reachable
-#   2. user:          -> see the note on it below
-#   3. OLLAMA_HOST    -> your NAS IP and the Ollama app's actual port
+# ---------------------------------------------------------------------------
+# ADDING A SHARE AS A CAPTURE DESTINATION
 #
-# The UI is then at http://<nas-ip>:9080
+# Two edits, and they must agree:
+#   1. a line under `volumes`, as  /host/path:/host/path  (same both sides)
+#   2. that same path appended to TG_OUTPUT_ROOTS, colon-separated
+#
+# Get the real paths — a share's name is not its dataset path:
+#   zfs list -o name,mountpoint
+# or TrueNAS UI -> Shares -> Windows (SMB) Shares, which lists each share's path.
+#
+# Mount the DATASET, not a pool root. A bind mount is not recursive, so mounting
+# /mnt/pool carries that dataset alone and every child dataset arrives as the
+# bare empty directory its mountpoint sits on. The app will then create its
+# folders in that empty directory, the host has the real dataset mounted over the
+# top, and the captures are invisible over SMB while the app insists they exist.
+# The app warns when a chosen folder is not on a mount, but mount it properly.
+# ---------------------------------------------------------------------------
 
 services:
   thumbnail-grabber:
@@ -30,45 +42,46 @@ services:
       - "9080:8000"
 
     volumes:
-      # Mount the DATASET, not the pool root.
-      #
-      # A bind mount is not recursive, so mounting /mnt/main carries the `main`
-      # dataset alone. Every child dataset -- `apps` is one -- comes through as
-      # the bare empty directory its mountpoint sits on. The app then happily
-      # creates its folders inside that empty directory, where the host has the
-      # real dataset mounted over the top, and the captures are invisible over
-      # SMB while the app insists they exist.
-      #
-      # So list each dataset you want reachable, at its own path. Check which
-      # paths are datasets with:  zfs list -o name,mountpoint
+      # Confirmed: this is the dataset behind the \<nas>\apps share, and it holds
+      # the capture folder and the app's own data below.
       - /mnt/main/apps:/mnt/main/apps
-      # Add more the same way, and extend TG_OUTPUT_ROOTS to match:
-      # - /mnt/main/media:/mnt/main/media
+
+      # Your other shares. Uncomment the ones you want as destinations and fix the
+      # paths from `zfs list` — these names are guesses and almost certainly wrong.
+      # - /mnt/main/grace-shared:/mnt/main/grace-shared
+      # - /mnt/main/grace-central:/mnt/main/grace-central
+      # - /mnt/main/grace-dryden:/mnt/main/grace-dryden
+      # - /mnt/main/grace-cortland:/mnt/main/grace-cortland
+      # - /mnt/main/companion:/mnt/main/companion
+      # - /mnt/main/companion-modules:/mnt/main/companion-modules
 
     # Run as the user that owns these folders, NOT root. The PNGs are reached over
     # SMB from Windows and Mac, and a root-owned 0644 file can be opened but not
-    # deleted or renamed — deleting needs write on the parent directory. This
-    # dataset already has files in it, so match what is there:
-    #     ls -ln /mnt/main/apps/capture | head     (shows the numeric uid and gid)
-    # then uncomment and set both numbers. Left commented it runs as root, which
-    # works but leaves files you cannot tidy up from a Mac or PC.
+    # deleted or renamed — deleting needs write on the parent directory. Find the
+    # numbers with:   ls -ln /mnt/main/apps/capture | head
+    # then uncomment. Left commented it runs as root, which works but leaves files
+    # you cannot tidy up from a Mac or PC.
     # user: "3000:3000"
 
     environment:
       # --- where things go ----------------------------------------------------
-      # Real paths, because the mount above mirrors them. These must agree with
-      # the mount or captures land in the container's own throwaway layer.
+      # Real paths, because the mounts above mirror them. These must sit inside a
+      # mounted dataset or captures land in the container's throwaway layer.
       TG_OUTPUT_DIR: "/mnt/main/apps/capture"
-      # The folder picker may browse anywhere under here. Colon-separated for
-      # several. Narrow it to /mnt/main/apps to keep the rest of the pool out of
-      # reach — the web UI has no authentication.
+
+      # How far the folder picker may browse. Colon-separated. Every path here
+      # needs a matching volume above, or the picker offers a folder it cannot
+      # actually reach. Append the shares you uncommented, e.g.
+      #   "/mnt/main/apps:/mnt/main/grace-shared:/mnt/main/companion"
       TG_OUTPUT_ROOTS: "/mnt/main/apps"
-      # Where the saved camera and your star/reject ratings live. Under the mount,
-      # so it survives the app being recreated. Without this they sit in the
-      # container and you re-enter the camera after every update.
-      TG_DATA_DIR: "/mnt/main/apps/tg-models"
-      # Directories the video scanner may read.
+
+      # Directories the video scanner may read. Same rule.
       TG_VIDEO_ROOTS: "/mnt/main/apps"
+
+      # The saved camera and your star/reject ratings. Must be on a mount, or you
+      # re-enter the camera after every update.
+      TG_DATA_DIR: "/mnt/main/apps/tg-models"
+
       TG_MAX_UPLOAD_MB: "4096"
 
       # --- camera -------------------------------------------------------------
@@ -91,15 +104,16 @@ services:
       # Must match the CPU limit on the Ollama app. Left at 0, Ollama spawns one
       # thread per host core, overruns its quota and is throttled — about 3x slower.
       TG_AI_JUDGE_OLLAMA_NUM_THREAD: "20"
-      # The judge stops reviewing this long after startup and unloads the model,
-      # releasing ~20 GB. Press Wake in the UI to re-arm it and load it again.
+      # The judge stops reviewing this long after startup and releases the model.
+      # Press Wake in the UI to re-arm it and load it again.
       TG_AI_JUDGE_ACTIVE_HOURS: "2"
 
-    # The frame buffer is the largest allocation — about 0.9 GB at the 5s default,
-    # and it is adjustable from the UI, so leave headroom above what you plan to use.
+    # The frame buffer is the largest single allocation and is adjustable from the
+    # UI, so the limit needs headroom above whatever you set it to. 5s at 1080p is
+    # ~0.9 GB; 20s is ~3.5 GB, which does not fit in 4G alongside everything else.
     deploy:
       resources:
         limits:
-          memory: 4G
+          memory: 8G
         reservations:
           memory: 2G
