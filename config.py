@@ -69,6 +69,31 @@ def home_dir() -> Optional[Path]:
         return None
 
 
+def _initial_stream_source() -> str:
+    """The stream source to start with: a camera saved from the UI, else the
+    environment, else webcam 0.
+
+    A camera chosen in the app wins over TG_STREAM_SOURCE, and does so here rather
+    than in either front end, so the desktop app, the web server and the CLI all
+    start on the same camera. The environment still provides the first-run default
+    and is returned to if the saved camera is forgotten.
+
+    camera_store is imported inside the function: it reaches back into this module
+    for redaction, and a module-level import would be a cycle.
+    """
+    try:
+        import camera_store
+        saved = camera_store.load()
+        if saved and saved.is_configured():
+            url = saved.url()
+            if url:
+                print(f"[Config] Using saved camera {redact_credentials(url)}")
+                return url
+    except Exception as e:                      # never block startup over this
+        print(f"[Config] Could not read the saved camera ({e}); using the environment.")
+    return _default_stream_source()
+
+
 def _default_output_dir() -> str:
     """TG_OUTPUT_DIR if set, else Pictures/ThumbnailGrabber, else ./captures."""
     override = os.environ.get("TG_OUTPUT_DIR", "").strip()
@@ -136,7 +161,7 @@ class AppConfig:
     # Sony SRG-A40 RTSP format with auth: rtsp://<user>:<pass>@<IP>:554/media/video1
     # Configured via TG_STREAM_SOURCE in .env — never hardcode credentials here.
     sony_srg_a40_preset_url: str = field(default_factory=_default_stream_source)
-    stream_source: str = field(default_factory=_default_stream_source)
+    stream_source: str = field(default_factory=_initial_stream_source)
 
 
     # Analysis & Capture settings

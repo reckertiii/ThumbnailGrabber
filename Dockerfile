@@ -42,7 +42,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # Copy application source code. Tests are intentionally not shipped in the runtime image.
 # main.py is included for the headless CLI scanner; it only imports PyQt6 inside the
 # GUI branch, so it runs fine in this image without the desktop dependency.
-COPY analyzer.py config.py overlay.py preference_model.py stream_processor.py video_scanner.py ai_judge.py main.py ./
+COPY analyzer.py config.py overlay.py preference_model.py stream_processor.py video_scanner.py ai_judge.py camera_probe.py camera_store.py main.py ./
 COPY web/ ./web/
 
 # Create directories for baked models, persistent user data, and captures

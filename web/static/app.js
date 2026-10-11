@@ -18,8 +18,17 @@ async function post(url, body) {
     body: JSON.stringify(body || {}),
   });
   if (!res.ok) {
-    const detail = await res.json().catch(() => ({}));
-    throw new Error(detail.detail || res.statusText);
+    const payload = await res.json().catch(() => ({}));
+    const d = payload.detail;
+    // FastAPI's detail can be a string or an object. An object passed straight
+    // to Error() stringifies to "[object Object]", so pull the message out and
+    // keep the rest on the error for callers that want the hint.
+    const msg = typeof d === "string" ? d
+      : (d && d.message) ? d.message
+      : res.statusText || "Request failed (" + res.status + ")";
+    const err = new Error(msg);
+    if (d && typeof d === "object") err.detail = d;
+    throw err;
   }
   return res.json();
 }
@@ -633,7 +642,161 @@ document.addEventListener("keydown", (e) => {
     $("lightbox").classList.add("hidden");
     $("videoScanModal").classList.add("hidden");
     $("folderModal").classList.add("hidden");
+    $("cameraModal").classList.add("hidden");
   }
 });
+
+
+/* ---------------------------------------------------------------------------
+ * Camera connection
+ *
+ * Typing a whole RTSP URL means getting address, port, credentials and stream
+ * path all right at once, and a failure used to report only that the source
+ * would not open. This takes the parts separately and asks the camera which one
+ * is wrong. The password is never sent back by the server, so a blank password
+ * field means "keep the saved one" rather than "clear it".
+ * ------------------------------------------------------------------------- */
+
+function camKind() { return $("camKind").value; }
+
+function camShowFields() {
+  const k = camKind();
+  $("camRtspFields").classList.toggle("hidden", k !== "rtsp");
+  $("camWebcamFields").classList.toggle("hidden", k !== "webcam");
+  $("camFileFields").classList.toggle("hidden", k !== "file");
+}
+
+function camPayload() {
+  const k = camKind();
+  const p = { kind: k };
+  if (k === "rtsp") {
+    p.host = $("camHost").value.trim();
+    p.port = Number($("camPort").value) || 554;
+    p.username = $("camUser").value.trim();
+    p.path = $("camPath").value.trim();
+    // Blank means unchanged; only send it when the operator actually typed one.
+    const pw = $("camPass").value;
+    if (pw) p.password = pw;
+  } else if (k === "webcam") {
+    p.webcam_index = Number($("camIndex").value) || 0;
+  } else {
+    p.file_path = $("camFile").value.trim();
+  }
+  return p;
+}
+
+function camResult(cls, message, hint, detail) {
+  const el = $("camResult");
+  el.classList.remove("hidden", "ok", "bad", "busy");
+  if (cls) el.classList.add(cls);
+  el.innerHTML = "";
+  const main = document.createElement("b");
+  main.textContent = message;
+  el.appendChild(main);
+  if (hint) {
+    const h = document.createElement("span");
+    h.className = "cam-hint";
+    h.textContent = hint;
+    el.appendChild(h);
+  }
+  if (detail) {
+    const d = document.createElement("span");
+    d.className = "cam-detail";
+    d.textContent = detail;
+    el.appendChild(d);
+  }
+}
+
+function camDetailLine(r) {
+  const bits = [];
+  if (r.rtsp_status) bits.push("RTSP " + r.rtsp_status);
+  if (r.server) bits.push(r.server);
+  if (r.video) bits.push(r.video);
+  if (r.tried_paths && r.tried_paths.length > 1) {
+    bits.push(r.tried_paths.length + " paths tried");
+  }
+  if (r.elapsed_ms) bits.push(r.elapsed_ms + " ms");
+  return bits.join(" \u00b7 ");
+}
+
+async function camOpen() {
+  $("cameraModal").classList.remove("hidden");
+  $("camResult").classList.add("hidden");
+  try {
+    const d = await fetch("/api/camera").then((r) => r.json());
+    const c = d.settings || {};
+    $("camKind").value = c.kind || "rtsp";
+    $("camHost").value = c.host || "";
+    $("camPort").value = c.port || 554;
+    $("camUser").value = c.username || "";
+    $("camPath").value = c.path || "";
+    $("camIndex").value = c.webcam_index || 0;
+    $("camFile").value = c.file_path || "";
+    // Never prefilled -- the server does not hand it out. The placeholder says
+    // whether one is already stored.
+    $("camPass").value = "";
+    $("camPass").placeholder = c.has_password ? "(unchanged)" : "camera password";
+    $("camActive").textContent = d.active_source ? "Now: " + d.active_source : "";
+
+    const dl = $("camPaths");
+    dl.innerHTML = "";
+    (d.common_paths || []).forEach((path) => {
+      const o = document.createElement("option");
+      o.value = path;
+      dl.appendChild(o);
+    });
+    camShowFields();
+  } catch (e) {
+    camResult("bad", "Could not read the saved camera settings.", e.message);
+  }
+}
+
+function camClose() { $("cameraModal").classList.add("hidden"); }
+
+$("btnOpenCamera").onclick = camOpen;
+$("btnCamCloseX").onclick = camClose;
+$("btnCamClose").onclick = camClose;
+$("camKind").onchange = () => { camShowFields(); $("camResult").classList.add("hidden"); };
+
+$("btnCamTest").onclick = async () => {
+  const btn = $("btnCamTest");
+  btn.disabled = true;
+  camResult("busy", "Asking the camera\u2026",
+    "Trying the stream paths in turn; this can take a few seconds.");
+  try {
+    const r = await post("/api/camera/test", camPayload());
+    if (r.ok) {
+      camResult("ok", r.message, r.hint, camDetailLine(r));
+      // Discovery found the path, so put it in the field ready to connect.
+      if (r.working_path) $("camPath").value = r.working_path;
+    } else {
+      camResult("bad", r.message, r.hint, camDetailLine(r));
+    }
+  } catch (e) {
+    camResult("bad", "The test could not run.", e.message);
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+$("btnCamConnect").onclick = async () => {
+  const btn = $("btnCamConnect");
+  btn.disabled = true;
+  camResult("busy", "Connecting\u2026", "Checking the camera before switching over.");
+  try {
+    const r = await post("/api/camera/connect", camPayload());
+    camResult("ok", "Connected. " + (r.source || ""),
+      "Saved \u2014 this camera will be used after a restart too.");
+    toast("Camera connected");
+    setTimeout(camClose, 1200);
+  } catch (e) {
+    // The server refuses rather than tearing down a working stream, and says why.
+    const tail = "Nothing changed \u2014 the previous source is still running.";
+    const hint = (e.detail && e.detail.hint) ? e.detail.hint + " " + tail : tail;
+    camResult("bad", e.message || "Could not connect.", hint);
+  } finally {
+    btn.disabled = false;
+  }
+};
 
 connect();

@@ -492,3 +492,38 @@ button:disabled {
   opacity: 0.45;
   cursor: not-allowed;
 }
+
+/* Camera connection dialog */
+.cam-field { width: 100%; margin-bottom: 10px; }
+.cam-grid {
+  display: grid;
+  grid-template-columns: 110px 1fr;
+  gap: 8px 10px;
+  align-items: center;
+}
+.cam-grid label { color: var(--muted); font-size: 12px; }
+.cam-note {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+  margin: 10px 0 0;
+}
+.cam-result {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: 6px;
+  font-size: 13px;
+  line-height: 1.5;
+  border-left: 3px solid var(--muted);
+  background: rgba(148, 163, 184, 0.10);
+}
+.cam-result.ok     { border-left-color: #22c55e; background: rgba(34, 197, 94, 0.10); }
+.cam-result.bad    { border-left-color: #ef4444; background: rgba(239, 68, 68, 0.10); }
+.cam-result.busy   { border-left-color: #eab308; background: rgba(234, 179, 8, 0.10); }
+.cam-result .cam-hint { color: var(--muted); display: block; margin-top: 5px; }
+.cam-result .cam-detail {
+  color: var(--muted);
+  display: block;
+  margin-top: 5px;
+  font-size: 11px;
+}

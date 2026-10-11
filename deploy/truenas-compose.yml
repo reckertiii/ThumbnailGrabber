@@ -8,7 +8,7 @@
 #
 # Change before deploying:
 #   1. The two volume host paths  -> your datasets (the pool is probably not "tank")
-#   2. TG_STREAM_SOURCE           -> your camera's RTSP URL, with credentials
+#   2. nothing else -- the camera is entered in the UI, not here
 #   3. OLLAMA_HOST                -> your NAS IP and the Ollama app's actual port
 #   4. TG_AI_JUDGE_OLLAMA_NUM_THREAD -> the CPU limit you gave the Ollama app
 
@@ -49,8 +49,11 @@ services:
 
     environment:
       # --- camera -------------------------------------------------------------
-      # Also accepts a webcam index ("0") or a path to a video file.
-      TG_STREAM_SOURCE: "rtsp://USER:PASSWORD@192.168.1.100:554/media/video1"
+      # First-run default only. Connecting a camera in the UI saves it to
+      # /app/models/camera.json and that wins from then on, so you can leave this
+      # out entirely and keep the password out of the app config. The UI also
+      # finds the stream path for you. Accepts a webcam index ("0") or a file path.
+      TG_STREAM_SOURCE: ""
       TG_OUTPUT_DIR: "/app/captures"
       TZ: "America/New_York"          # capture filenames use local time
       # The uid above has no passwd entry, so give it somewhere to call home.

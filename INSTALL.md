@@ -19,8 +19,11 @@ You need:
   ```
   That is a 20 GB download and needs roughly 20 GB of RAM to run. `qwen3-vl:4b`
   (3.3 GB) works on a smaller box and judges less well.
-- **The camera's RTSP URL**, reachable from the NAS. Check before deploying — the NAS
-  and the camera are often on different VLANs:
+- **The camera's address and streaming credentials.** You enter these in the app, not
+  here — see §4. You do not need to know the RTSP path; the app finds it.
+
+  What does matter is that the NAS can reach the camera at all, since the two are
+  often on different VLANs. Check from a TrueNAS shell before deploying:
   ```bash
   curl -v telnet://<camera-ip>:554
   ```
@@ -78,7 +81,7 @@ every start, which fails outright on a box with no outbound internet.
 
 | Name | Value | Why |
 |---|---|---|
-| `TG_STREAM_SOURCE` | `rtsp://user:pass@<camera-ip>:554/media/video1` | Your camera |
+| `TG_STREAM_SOURCE` | *optional* | First-run default only. A camera connected in the UI is saved and overrides it, so you can leave this out and avoid putting the password in the app config |
 | `TG_OUTPUT_DIR` | `/app/captures` | Where captures land |
 | `OLLAMA_HOST` | `http://192.168.32.104:30068` | The Ollama app. Use the NAS LAN IP, **not** `localhost` — inside a container that is the container itself |
 | `TG_AI_JUDGE_OLLAMA_MODEL` | `qwen3-vl:30b` | Must match what you pulled |
@@ -108,10 +111,19 @@ Open `http://192.168.32.104:9080`.
 That is the node port from §3. The container still listens on 8000 internally;
 only the outside port changed.
 
-Check these three things in order:
+Do these three things in order:
 
-1. **Stream status says Connected** with a frame rate. If not, the camera URL or network
-   path is wrong — see §9.
+1. **Connect the camera.** Press **📷 Camera…** and fill in the address, username
+   and password. Leave **Stream path** blank and press **Test** — the usual paths are
+   tried and the one that answers is filled in. Then press **Connect**.
+
+   The test says which part is wrong rather than just failing: a rejected password,
+   a path that does not exist, a closed port, an unreachable address. Connect refuses
+   outright if the camera says no, so a mistyped password cannot take down a stream
+   that was working.
+
+   The camera is saved to `/app/models/camera.json`, mode 0600, and used on every
+   restart — so it is entered once, not after every redeploy.
 2. **AI judge says `qwen3-vl:30b via local`** with minutes remaining. If it says "no
    Ollama at…", the host or port is wrong.
 3. **Capture is refused until you confirm the output folder.** This is deliberate — on a
@@ -243,11 +255,19 @@ GitHub personal access token as a registry credential in TrueNAS.
 
 ## 9. If something is wrong
 
-**Stream says Disconnected.** Test the path from the NAS itself, not your desktop:
+**Stream says Disconnected.** Press **📷 Camera…** and then **Test**. It
+reports the actual cause — rejected credentials, wrong stream path, closed port,
+unreachable address — instead of a generic failure.
+
+If it reports the address as unreachable, confirm it from a TrueNAS shell rather than
+your desktop, since camera and NAS are frequently on different VLANs:
 ```bash
 curl -v telnet://<camera-ip>:554
 ```
-Camera and NAS are frequently on different VLANs.
+
+**The camera is forgotten after a restart.** It is saved to `/app/models/camera.json`,
+so this means that mount is missing or not writable. Check the app runs as the user
+that owns the dataset (§6) and that `/app/models` is mounted.
 
 **Judge says "no Ollama at…".** Check the port — the catalog app usually remaps 11434:
 ```bash

@@ -17,6 +17,7 @@
   <label class="src-label" for="src">Source</label>
   <input id="src" type="text" placeholder="rtsp://… , 0, or file path">
   <button id="btnSource" class="btn">Connect Stream</button>
+  <button id="btnOpenCamera" class="btn btn-purple">📷 Camera…</button>
   <button id="btnStartStop" class="btn btn-start">▶ Start Capture</button>
 </header>
 
@@ -249,6 +250,71 @@
 </div>
 
 <div id="toast" class="toast hidden"></div>
+
+
+<div id="cameraModal" class="modal hidden">
+  <div class="modal-inner" style="max-width:560px">
+    <div class="modal-header">
+      <h2>Connect to Camera</h2>
+      <button id="btnCamCloseX" class="btn-close">✕</button>
+    </div>
+    <div class="modal-section">
+
+      <label class="chk" for="camKind">What are we watching?</label>
+      <select id="camKind" class="cam-field">
+        <option value="rtsp">Network camera (RTSP)</option>
+        <option value="webcam">Webcam attached to the server</option>
+        <option value="file">Video file on the server</option>
+      </select>
+
+      <div id="camRtspFields">
+        <div class="cam-grid">
+          <label for="camHost">Address</label>
+          <input type="text" id="camHost" placeholder="192.168.1.100">
+          <label for="camPort">Port</label>
+          <input type="number" id="camPort" value="554" min="1" max="65535">
+          <label for="camUser">Username</label>
+          <input type="text" id="camUser" autocomplete="off" placeholder="admin">
+          <label for="camPass">Password</label>
+          <input type="password" id="camPass" autocomplete="new-password"
+                 placeholder="(unchanged)">
+          <label for="camPath">Stream path</label>
+          <input type="text" id="camPath" list="camPaths"
+                 placeholder="leave blank and press Test to find it">
+        </div>
+        <datalist id="camPaths"></datalist>
+        <p class="cam-note">Leave the stream path blank and press <b>Test</b> &mdash;
+        the usual paths are tried and the one that answers is filled in.</p>
+      </div>
+
+      <div id="camWebcamFields" class="hidden">
+        <div class="cam-grid">
+          <label for="camIndex">Device index</label>
+          <input type="number" id="camIndex" value="0" min="0" max="9">
+        </div>
+        <p class="cam-note">Usually 0. This is a camera plugged into the machine
+        running the app, which on a server is rarely what you want.</p>
+      </div>
+
+      <div id="camFileFields" class="hidden">
+        <div class="cam-grid">
+          <label for="camFile">File path</label>
+          <input type="text" id="camFile" placeholder="/app/captures/service.mp4">
+        </div>
+        <p class="cam-note">As the server sees it, not as your own machine does.</p>
+      </div>
+
+      <div id="camResult" class="cam-result hidden"></div>
+    </div>
+    <div class="modal-footer">
+      <span id="camActive" class="muted"></span>
+      <span class="spacer"></span>
+      <button id="btnCamTest" class="btn">Test</button>
+      <button id="btnCamConnect" class="btn btn-green">Connect</button>
+      <button id="btnCamClose" class="btn">Cancel</button>
+    </div>
+  </div>
+</div>
 
 <script src="/static/app.js"></script>
 </body>

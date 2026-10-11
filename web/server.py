@@ -30,6 +30,8 @@ from fastapi.responses import StreamingResponse, FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from config import AppConfig, home_dir, redact_credentials
+import camera_probe
+import camera_store
 from analyzer import AnalysisResult
 from stream_processor import StreamProcessor, CapturedScreenshot
 from overlay import draw_overlay
@@ -368,6 +370,169 @@ def set_source(payload: Dict[str, Any] = Body(...)):
     else:
         state.start_processor()
     return {"ok": True, "source": redact_credentials(src)}
+
+
+# ---------------------------------------------------------------------------
+# Camera connection
+#
+# Typing a whole RTSP URL means getting four things right at once, and when it
+# fails OpenCV reports only that the source would not open. These endpoints take
+# the parts separately, say which one is wrong, and remember the answer so a
+# restart does not send the operator back to the environment default.
+# ---------------------------------------------------------------------------
+
+def _settings_from_payload(payload: Dict[str, Any]) -> camera_store.CameraSettings:
+    """Builds settings from a request, keeping the saved password when the
+    request omits it -- the UI is never given the password, so it cannot send it
+    back, and a blank field on a reconnect must not wipe it."""
+    saved = camera_store.load()
+    kind = str(payload.get("kind", "rtsp")).strip().lower()
+    if kind not in ("rtsp", "webcam", "file"):
+        raise HTTPException(status_code=400, detail=f"Unknown camera kind '{kind}'")
+
+    password = payload.get("password", None)
+    if password is None or password == "":
+        password = saved.password if (saved and saved.kind == kind) else ""
+
+    try:
+        port = int(payload.get("port") or camera_probe.DEFAULT_PORT)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Port must be a number")
+
+    return camera_store.CameraSettings(
+        kind=kind,
+        host=str(payload.get("host", "") or "").strip(),
+        port=port,
+        path=str(payload.get("path", "") or "").strip(),
+        username=str(payload.get("username", "") or "").strip(),
+        password=str(password),
+        webcam_index=int(payload.get("webcam_index") or 0),
+        file_path=str(payload.get("file_path", "") or "").strip(),
+    )
+
+
+@app.get("/api/camera")
+def get_camera():
+    """Saved settings, without the password."""
+    saved = camera_store.load()
+    return {
+        "configured": bool(saved and saved.is_configured()),
+        "settings": saved.public() if saved else camera_store.CameraSettings().public(),
+        "active_source": redact_credentials(state.config.stream_source),
+        "common_paths": camera_probe.COMMON_PATHS,
+    }
+
+
+@app.post("/api/camera/test")
+def test_camera(payload: Dict[str, Any] = Body(...)):
+    """Asks the camera directly, without touching the running stream."""
+    cfg = _settings_from_payload(payload)
+
+    if cfg.kind == "file":
+        if not cfg.file_path or not os.path.exists(cfg.file_path):
+            return {"ok": False, "stage": "file", "code": "missing",
+                    "message": f"No file at {cfg.file_path or '(blank)'}.",
+                    "hint": "Check the path as the server sees it, not your own machine."}
+        return {"ok": True, "stage": "file", "code": "ok",
+                "message": f"Found {os.path.basename(cfg.file_path)}.", "hint": ""}
+
+    if cfg.kind == "webcam":
+        cap = cv2.VideoCapture(cfg.webcam_index,
+                               cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY)
+        try:
+            opened = cap.isOpened()
+        finally:
+            cap.release()
+        return {"ok": opened, "stage": "webcam", "code": "ok" if opened else "no_device",
+                "message": (f"Webcam {cfg.webcam_index} opened."
+                            if opened else f"No webcam at index {cfg.webcam_index}."),
+                "hint": "" if opened else "Try index 0 or 1."}
+
+    if not cfg.host:
+        raise HTTPException(status_code=400, detail="Enter the camera's address")
+
+    # discover=True so a wrong path is reported as a wrong path, with the one
+    # that actually answered, rather than as a bare failure.
+    result = camera_probe.probe(
+        host=cfg.host, port=cfg.port, path=cfg.path,
+        user=cfg.username, password=cfg.password,
+        discover=True,
+    )
+    return result.as_dict()
+
+
+@app.post("/api/camera/connect")
+def connect_camera(payload: Dict[str, Any] = Body(...)):
+    """Tests, saves, then switches the stream over.
+
+    The test comes first on purpose: switching to a source that cannot be opened
+    tears down a working stream, which mid-service is the worst moment to find
+    out the password was mistyped. `force` skips it for the rare case where the
+    probe is wrong but the stream works.
+    """
+    cfg = _settings_from_payload(payload)
+    force = bool(payload.get("force", False))
+
+    # Only the address is required up front. The stream path may legitimately be
+    # blank here -- discovery below fills it in, which is the point of leaving it
+    # blank -- so the full is_configured() check waits until after the probe.
+    if cfg.kind == "rtsp" and not cfg.host:
+        raise HTTPException(status_code=400, detail="Enter the camera's address")
+    if cfg.kind == "file" and not cfg.file_path:
+        raise HTTPException(status_code=400, detail="Enter the path to the video file")
+
+    verdict: Dict[str, Any] = {}
+    if cfg.kind == "rtsp" and not force:
+        result = camera_probe.probe(
+            host=cfg.host, port=cfg.port, path=cfg.path,
+            user=cfg.username, password=cfg.password, discover=True)
+        verdict = result.as_dict()
+        if not result.ok:
+            # 409, not 400: the request was fine, the camera said no.
+            raise HTTPException(status_code=409, detail={
+                "message": result.message, "hint": result.hint,
+                "code": result.code, "stage": result.stage,
+            })
+        # Take the path that answered, so discovery actually fixes the setting.
+        if result.working_path:
+            cfg.path = result.working_path
+
+    if not cfg.is_configured():
+        raise HTTPException(
+            status_code=400,
+            detail="Enter the stream path, or press Test to find it automatically")
+
+    source = cfg.url()
+    if not source:
+        raise HTTPException(status_code=400, detail="Could not build a stream URL")
+
+    try:
+        path_written = camera_store.save(cfg)
+    except OSError as e:
+        raise HTTPException(status_code=500,
+                            detail=f"Could not save camera settings: {e}")
+
+    state.config.stream_source = source
+    if state.processor:
+        state.processor.update_source(source)
+    else:
+        state.start_processor()
+
+    print(f"[Camera] Connected to {redact_credentials(source)} "
+          f"(settings saved to {path_written})")
+    return {
+        "ok": True,
+        "source": redact_credentials(source),
+        "settings": cfg.public(),
+        "verdict": verdict,
+    }
+
+
+@app.post("/api/camera/forget")
+def forget_camera():
+    """Drops the saved camera so startup falls back to the environment."""
+    removed = camera_store.clear()
+    return {"ok": True, "removed": removed}
 
 
 @app.post("/api/capture/toggle")
