@@ -1,0 +1,70 @@
+# Thumbnail Grabber — TrueNAS SCALE deployment
+#
+# Paste into Apps -> Discover Apps -> Custom App -> Install via YAML, or run with
+# `docker compose up -d` from a shell on the NAS.
+#
+# Unlike the docker-compose.yml at the repo root, this one pulls the published image
+# rather than building, and uses absolute dataset paths instead of relative ones.
+#
+# Change before deploying:
+#   1. The two volume host paths  -> your datasets (the pool is probably not "tank")
+#   2. TG_STREAM_SOURCE           -> your camera's RTSP URL, with credentials
+#   3. OLLAMA_HOST                -> your NAS IP and the Ollama app's actual port
+#   4. TG_AI_JUDGE_OLLAMA_NUM_THREAD -> the CPU limit you gave the Ollama app
+
+services:
+  thumbnail-grabber:
+    image: ghcr.io/reckertiii/thumbnailgrabber:latest
+    container_name: thumbnail-grabber
+    restart: unless-stopped
+
+    # Set to "always" only if you want every restart to re-pull. With the repo private
+    # that needs a registry credential, so IfNotPresent-equivalent is the safer default.
+    pull_policy: missing
+
+    ports:
+      - "8000:8000"
+
+    volumes:
+      # Captures and their subject crops. Grows over time — put it where there is room.
+      - /mnt/tank/apps/thumbnail-grabber/captures:/app/captures
+      # Your star/reject ratings only. Small. NOT the ML weights — those are baked into
+      # the image at /opt/tg-models, deliberately off any mounted path so a mount cannot
+      # hide them and force a re-download on every start.
+      - /mnt/tank/apps/thumbnail-grabber/models:/app/models
+
+    environment:
+      # --- camera -------------------------------------------------------------
+      # Also accepts a webcam index ("0") or a path to a video file.
+      TG_STREAM_SOURCE: "rtsp://USER:PASSWORD@192.168.1.100:554/media/video1"
+      TG_OUTPUT_DIR: "/app/captures"
+      TZ: "America/New_York"          # capture filenames use local time
+
+      # --- AI judge, via the Ollama app on this same NAS -----------------------
+      # Use the NAS's LAN IP, never localhost: inside a container that is the
+      # container itself. The catalog Ollama app usually remaps 11434 to a 30000-range
+      # port — check with: curl http://<nas-ip>:<port>/api/tags
+      OLLAMA_HOST: "http://NAS-IP:30068"
+      TG_AI_JUDGE_BACKEND: "ollama"
+      TG_AI_JUDGE_OLLAMA_MODEL: "qwen3-vl:30b"
+      # Must match the CPU limit on the Ollama app. Left at 0, Ollama spawns one thread
+      # per host core, overruns its quota and gets throttled — measured about 3x slower.
+      TG_AI_JUDGE_OLLAMA_NUM_THREAD: "20"
+      # Judge stops reviewing this long after startup and unloads the model, releasing
+      # ~20 GB on the NAS. 0 disables the window. Re-arm from the UI without restarting.
+      TG_AI_JUDGE_ACTIVE_HOURS: "2"
+
+      # --- safety: these endpoints have no authentication ----------------------
+      # Confine the video scanner and the output-folder picker to the mounted dataset.
+      TG_VIDEO_ROOTS: "/app/captures"
+      TG_OUTPUT_ROOTS: "/app/captures"
+      TG_MAX_UPLOAD_MB: "4096"
+
+    # The frame buffer is the largest allocation — about 0.9 GB at the 5s default, and
+    # it is adjustable from the UI, so leave headroom above what you plan to use.
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 2G
