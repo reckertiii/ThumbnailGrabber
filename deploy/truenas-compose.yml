@@ -3,19 +3,16 @@
 # Paste into Apps -> Discover Apps -> Custom App -> Install via YAML, or run with
 # `docker compose up -d` from a shell on the NAS.
 #
-# Unlike the docker-compose.yml at the repo root, this one pulls the published image
-# rather than building, and uses absolute dataset paths instead of relative ones.
+# The whole pool is mounted at the same path it has on the host, so a folder is
+# called the same thing in the picker, in the TrueNAS UI and over SMB. Captures
+# can then be sent to any folder on the pool without redeploying.
 #
 # Change before deploying:
-#   1. The models dataset        -> create /mnt/main/apps/tg-models if missing
-#   2. nothing else -- the camera is entered in the UI, not here
-#   3. OLLAMA_HOST                -> your NAS IP and the Ollama app's actual port
-#   4. TG_AI_JUDGE_OLLAMA_NUM_THREAD -> the CPU limit you gave the Ollama app
-
-# The UI is then at http://<nas-ip>:9080
+#   1. /mnt/main      -> your pool, if it is not called "main"
+#   2. user:          -> see the note on it below
+#   3. OLLAMA_HOST    -> your NAS IP and the Ollama app's actual port
 #
-# Share the captures dataset over SMB to reach the PNGs from Windows and Mac as a
-# mapped drive -- see section 6 of INSTALL.md.
+# The UI is then at http://<nas-ip>:9080
 
 services:
   thumbnail-grabber:
@@ -23,68 +20,73 @@ services:
     container_name: thumbnail-grabber
     restart: unless-stopped
 
-    # Set to "always" only if you want every restart to re-pull. With the repo private
-    # that needs a registry credential, so IfNotPresent-equivalent is the safer default.
+    # "always" would re-pull on every restart, which needs a registry credential
+    # once the repo is private. This is the equivalent of IfNotPresent.
     pull_policy: missing
 
-    # Run as the user that owns the captures dataset, NOT root. The PNGs are
-    # reached over SMB from Windows and Mac, and a root-owned 0644 file can be
-    # opened from there but not deleted or renamed -- deleting needs write on the
-    # parent directory, which a root-owned 0755 dataset grants to nobody else.
-    # Get the numbers with `id <username>` in a TrueNAS shell.
-    user: "3000:3000"
-
     ports:
-      # host:container. The container side is fixed at 8000 -- that is what the app
+      # host:container. The container side is fixed at 8000 — that is what the app
       # binds. Change only the left number, and TrueNAS wants it at 9000 or above.
       - "9080:8000"
 
     volumes:
-      # Captures and their subject crops. Grows over time — put it where there is room.
-      # Host path is the dataset's mountpoint: on TrueNAS that is
-      # /mnt/<pool>/... -- the pool name on its own is not a path.
-      # The container side stays /app/captures, which is what TG_OUTPUT_DIR
-      # points at and what you pick in the UI's folder dialog.
-      - /mnt/main/apps/capture:/app/captures
-      # Your star/reject ratings only. Small. NOT the ML weights — those are baked into
-      # the image at /opt/tg-models, deliberately off any mounted path so a mount cannot
-      # hide them and force a re-download on every start.
-      - /mnt/main/apps/tg-models:/app/models
+      # One mount, same path inside and out. Everything the app needs lives under
+      # it: captures, the saved camera and the ratings. Mounting the pool at its
+      # own path is what lets the folder picker reach anywhere on it.
+      - /mnt/main:/mnt/main
+
+    # Run as the user that owns these folders, NOT root. The PNGs are reached over
+    # SMB from Windows and Mac, and a root-owned 0644 file can be opened but not
+    # deleted or renamed — deleting needs write on the parent directory. This
+    # dataset already has files in it, so match what is there:
+    #     ls -ln /mnt/main/apps/capture | head     (shows the numeric uid and gid)
+    # then uncomment and set both numbers. Left commented it runs as root, which
+    # works but leaves files you cannot tidy up from a Mac or PC.
+    # user: "3000:3000"
 
     environment:
+      # --- where things go ----------------------------------------------------
+      # Real paths, because the mount above mirrors them. These must agree with
+      # the mount or captures land in the container's own throwaway layer.
+      TG_OUTPUT_DIR: "/mnt/main/apps/capture"
+      # The folder picker may browse anywhere under here. Colon-separated for
+      # several. Narrow it to /mnt/main/apps to keep the rest of the pool out of
+      # reach — the web UI has no authentication.
+      TG_OUTPUT_ROOTS: "/mnt/main"
+      # Where the saved camera and your star/reject ratings live. Under the mount,
+      # so it survives the app being recreated. Without this they sit in the
+      # container and you re-enter the camera after every update.
+      TG_DATA_DIR: "/mnt/main/apps/tg-models"
+      # Directories the video scanner may read.
+      TG_VIDEO_ROOTS: "/mnt/main"
+      TG_MAX_UPLOAD_MB: "4096"
+
       # --- camera -------------------------------------------------------------
-      # First-run default only. Connecting a camera in the UI saves it to
-      # /app/models/camera.json and that wins from then on, so you can leave this
-      # out entirely and keep the password out of the app config. The UI also
-      # finds the stream path for you. Accepts a webcam index ("0") or a file path.
+      # First-run default only, and not needed: connect the camera in the UI and
+      # it is saved to TG_DATA_DIR and used from then on. Leaving this empty keeps
+      # the camera password out of the app config.
       TG_STREAM_SOURCE: ""
-      TG_OUTPUT_DIR: "/app/captures"
+
       TZ: "America/New_York"          # capture filenames use local time
-      # The uid above has no passwd entry, so give it somewhere to call home.
+      # The uid above has no passwd entry when user: is set, so give it a home.
       HOME: "/tmp"
 
       # --- AI judge, via the Ollama app on this same NAS -----------------------
       # Use the NAS's LAN IP, never localhost: inside a container that is the
-      # container itself. The catalog Ollama app usually remaps 11434 to a 30000-range
-      # port — check with: curl http://<nas-ip>:<port>/api/tags
-      OLLAMA_HOST: "http://NAS-IP:30068"
+      # container itself. The catalog Ollama app usually remaps 11434 to a
+      # 30000-range port — check with: curl http://<nas-ip>:<port>/api/tags
+      OLLAMA_HOST: "http://192.168.32.104:30068"
       TG_AI_JUDGE_BACKEND: "ollama"
       TG_AI_JUDGE_OLLAMA_MODEL: "qwen3-vl:30b"
-      # Must match the CPU limit on the Ollama app. Left at 0, Ollama spawns one thread
-      # per host core, overruns its quota and gets throttled — measured about 3x slower.
+      # Must match the CPU limit on the Ollama app. Left at 0, Ollama spawns one
+      # thread per host core, overruns its quota and is throttled — about 3x slower.
       TG_AI_JUDGE_OLLAMA_NUM_THREAD: "20"
-      # Judge stops reviewing this long after startup and unloads the model, releasing
-      # ~20 GB on the NAS. 0 disables the window. Re-arm from the UI without restarting.
+      # The judge stops reviewing this long after startup and unloads the model,
+      # releasing ~20 GB. Press Wake in the UI to re-arm it and load it again.
       TG_AI_JUDGE_ACTIVE_HOURS: "2"
 
-      # --- safety: these endpoints have no authentication ----------------------
-      # Confine the video scanner and the output-folder picker to the mounted dataset.
-      TG_VIDEO_ROOTS: "/app/captures"
-      TG_OUTPUT_ROOTS: "/app/captures"
-      TG_MAX_UPLOAD_MB: "4096"
-
-    # The frame buffer is the largest allocation — about 0.9 GB at the 5s default, and
-    # it is adjustable from the UI, so leave headroom above what you plan to use.
+    # The frame buffer is the largest allocation — about 0.9 GB at the 5s default,
+    # and it is adjustable from the UI, so leave headroom above what you plan to use.
     deploy:
       resources:
         limits:

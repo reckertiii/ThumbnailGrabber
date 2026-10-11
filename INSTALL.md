@@ -74,25 +74,24 @@ every start, which fails outright on a box with no outbound internet.
 
 | Host path | Mount path |
 |---|---|
-| your captures dataset, e.g. `/mnt/main/apps/capture` | `/app/captures` |
-| your models dataset, e.g. `/mnt/main/apps/tg-models` | `/app/models` |
+| `/mnt/main` (your pool) | `/mnt/main` |
 
-Host paths are dataset **mountpoints**, so they begin `/mnt/<pool>/`. The pool name
-on its own is not a path. The mount paths on the right are fixed — `/app/captures`
-is what `TG_OUTPUT_DIR` points at and what you choose in the UI's folder dialog, so
-you change the host side only.
+One mount, at the same path inside the container as outside. That is what lets the
+folder picker reach any folder on the pool, and it means a folder is called the same
+thing in the picker, in the TrueNAS UI and over SMB — no translating `/app/captures`
+in your head.
 
-`/app/models` is small but must be mounted: it holds your ⭐/👎 ratings **and the
-saved camera**. Left unmounted, both live in the container's writable layer and are
-lost the next time the app is recreated — you would be re-entering the camera after
-every update.
+Narrow it to `/mnt/main/apps` on both sides if you would rather the rest of the pool
+stayed out of reach; the web UI has no authentication.
 
 **Environment variables**
 
 | Name | Value | Why |
 |---|---|---|
 | `TG_STREAM_SOURCE` | *optional* | First-run default only. A camera connected in the UI is saved and overrides it, so you can leave this out and avoid putting the password in the app config |
-| `TG_OUTPUT_DIR` | `/app/captures` | Where captures land |
+| `TG_OUTPUT_DIR` | `/mnt/main/apps/capture` | Where captures land. Must sit under the mount above |
+| `TG_DATA_DIR` | `/mnt/main/apps/tg-models` | Saved camera and your ⭐/👎 ratings. Under the mount, so they survive the app being recreated |
+| `TG_OUTPUT_ROOTS` | `/mnt/main` | How far the folder picker may browse. Colon-separated for several |
 | `OLLAMA_HOST` | `http://192.168.32.104:30068` | The Ollama app. Use the NAS LAN IP, **not** `localhost` — inside a container that is the container itself |
 | `TG_AI_JUDGE_OLLAMA_MODEL` | `qwen3-vl:30b` | Must match what you pulled |
 | `TG_AI_JUDGE_OLLAMA_NUM_THREAD` | match the Ollama app's CPU limit | Ollama otherwise spawns one thread per host core, overruns its quota and is throttled — measured ~3× slower |
