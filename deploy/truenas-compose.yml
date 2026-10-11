@@ -12,6 +12,8 @@
 #   3. OLLAMA_HOST                -> your NAS IP and the Ollama app's actual port
 #   4. TG_AI_JUDGE_OLLAMA_NUM_THREAD -> the CPU limit you gave the Ollama app
 
+# The UI is then at http://<nas-ip>:9080
+
 services:
   thumbnail-grabber:
     image: ghcr.io/reckertiii/thumbnailgrabber:latest
@@ -23,7 +25,9 @@ services:
     pull_policy: missing
 
     ports:
-      - "8000:8000"
+      # host:container. The container side is fixed at 8000 -- that is what the app
+      # binds. Change only the left number, and TrueNAS wants it at 9000 or above.
+      - "9080:8000"
 
     volumes:
       # Captures and their subject crops. Grows over time — put it where there is room.

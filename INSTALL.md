@@ -65,7 +65,7 @@ every start, which fails outright on a box with no outbound internet.
 | Field | Value |
 |---|---|
 | Container port | `8000` |
-| Node port | `8000` (or any free port above 9000 if TrueNAS objects) |
+| Node port | `9080` — TrueNAS requires 9000 or above; any free port in that range works |
 
 **Storage**
 
@@ -103,7 +103,10 @@ Deploy.
 
 ## 4. First run
 
-Open `http://192.168.32.104:8000`.
+Open `http://192.168.32.104:9080`.
+
+That is the node port from §3. The container still listens on 8000 internally;
+only the outside port changed.
 
 Check these three things in order:
 
