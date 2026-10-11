@@ -294,6 +294,11 @@ Optional overrides: `python main.py --source 0 --output D:\shots`
   `max_retained_captures` (default 5) is removed from disk as better shots arrive,
   including each shot's companion `_subject` crop. Turn it off in the UI if you want
   to keep everything.
+- **Capture is blocked until the output folder is confirmed.** On a hosted instance the
+  default is whatever the image or compose file set, and a whole service written to the
+  wrong place is only noticed afterwards. Open **Output Folder → Change Folder…** and
+  choose a folder - picking the current one counts. It is asked once per process, and
+  the API refuses too, not just the button. Stopping a capture is never blocked.
 - **The web UI has no authentication.** It is designed for a trusted LAN. Uploaded
   filenames are sanitised and scan output is confined to the output directory, but if
   the port is reachable more widely, set `TG_VIDEO_ROOTS` to limit what can be read.

@@ -91,6 +91,16 @@ function render(d) {
   btn.textContent = isCapturing ? "⏹ Stop Capture" : "▶ Start Capture";
   setClass(btn, "btn-stop", isCapturing);
   setClass(btn, "btn-start", !isCapturing);
+  // Disabled rather than failing on click, so the reason is visible up front instead
+  // of arriving as an error after you have already pressed it.
+  const needsFolder = !d.output_confirmed && !isCapturing;
+  btn.disabled = needsFolder;
+  btn.title = needsFolder ? "Confirm the output folder first" : "";
+  $("btnManual").disabled = !d.output_confirmed;
+  setClass($("outputCard"), "needs-attention", !d.output_confirmed);
+  $("outputHint").textContent = d.output_confirmed
+    ? ""
+    : "Confirm where captures should go before starting — pick this folder or another.";
   $("chkAuto").checked = !!d.auto_capture;
   $("chkWinner").checked = !!d.single_winner;
   $("chkMesh").checked = !!d.show_mesh;

@@ -476,3 +476,19 @@ input[type=number] {
   cursor: pointer;
 }
 .btn-mini:hover { background: #334155; color: #f1f5f9; }
+
+/* Output folder needs confirming before capture can start */
+.card.needs-attention {
+  border: 1px solid #f59e0b;
+  box-shadow: 0 0 0 1px rgba(245, 158, 11, 0.25);
+}
+.output-hint {
+  margin-top: 6px;
+  font-size: 12px;
+  color: #fbbf24;
+  line-height: 1.4;
+}
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}

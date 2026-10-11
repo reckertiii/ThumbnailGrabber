@@ -47,6 +47,12 @@ class AppState:
         self.show_mesh: bool = True
         self.show_hud: bool = True
         self.is_capturing: bool = False
+        # Captures only start once someone has confirmed where they land. On a hosted
+        # instance the default is whatever the image or compose file happened to set,
+        # and a whole service written to the wrong place is only noticed afterwards.
+        # Confirming is one click - picking the current folder counts - and it is asked
+        # once per process, so a long-running server asks once at startup.
+        self.output_confirmed: bool = False
         self._lock = threading.Lock()
 
         # Video file scanner state
@@ -209,6 +215,7 @@ def _telemetry() -> Dict[str, Any]:
             "ml_weight_applied": round(float(getattr(analysis, "ml_weight_applied", 0.0)), 3),
             "ml_samples": len(pm.samples) if pm else 0,
             "ai_judge": proc.judge.status_line() if proc and getattr(proc, "judge", None) else "AI judge off",
+            "output_confirmed": bool(state.output_confirmed),
             "buffer": proc.buffer_stats() if proc and hasattr(proc, "buffer_stats") else None,
             "ai_judge_active": bool(proc.judge.available) if proc and getattr(proc, "judge", None) else False,
             "ai_judge_minutes_left": (
@@ -364,6 +371,11 @@ def set_source(payload: Dict[str, Any] = Body(...)):
 @app.post("/api/capture/toggle")
 def toggle_capture(payload: Dict[str, Any] = Body(...)):
     enabled = bool(payload.get("enabled", False))
+    if enabled and not state.output_confirmed:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Confirm the output folder before capturing. Currently "
+                   f"{state.config.output_dir} - open Output Folder and choose it, or pick another.")
     state.is_capturing = enabled
     if state.processor:
         state.processor.auto_capture_enabled = enabled
@@ -375,6 +387,10 @@ def manual_capture():
     proc = state.processor
     if not proc:
         raise HTTPException(status_code=409, detail="Stream not running")
+    if not state.output_confirmed:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Confirm the output folder first. Currently {state.config.output_dir}.")
     frame = None
     with proc.frame_lock:
         if proc.latest_frame is not None:
@@ -801,7 +817,9 @@ def set_output_dir(payload: Dict[str, Any] = Body(...)):
     state.config.output_dir = str(target)
     if state.processor:
         state.processor.config.output_dir = str(target)
-    return {"ok": True, "output_dir": str(target)}
+    # Choosing a folder - including re-choosing the current one - is the confirmation.
+    state.output_confirmed = True
+    return {"ok": True, "output_dir": str(target), "output_confirmed": True}
 
 
 @app.post("/api/video/info")
