@@ -7,7 +7,7 @@
 # rather than building, and uses absolute dataset paths instead of relative ones.
 #
 # Change before deploying:
-#   1. The two volume host paths  -> your datasets (the pool is probably not "tank")
+#   1. The models dataset        -> create /mnt/main/apps/tg-models if missing
 #   2. nothing else -- the camera is entered in the UI, not here
 #   3. OLLAMA_HOST                -> your NAS IP and the Ollama app's actual port
 #   4. TG_AI_JUDGE_OLLAMA_NUM_THREAD -> the CPU limit you gave the Ollama app
@@ -41,11 +41,15 @@ services:
 
     volumes:
       # Captures and their subject crops. Grows over time — put it where there is room.
-      - /mnt/tank/apps/thumbnail-grabber/captures:/app/captures
+      # Host path is the dataset's mountpoint: on TrueNAS that is
+      # /mnt/<pool>/... -- the pool name on its own is not a path.
+      # The container side stays /app/captures, which is what TG_OUTPUT_DIR
+      # points at and what you pick in the UI's folder dialog.
+      - /mnt/main/apps/capture:/app/captures
       # Your star/reject ratings only. Small. NOT the ML weights — those are baked into
       # the image at /opt/tg-models, deliberately off any mounted path so a mount cannot
       # hide them and force a re-download on every start.
-      - /mnt/tank/apps/thumbnail-grabber/models:/app/models
+      - /mnt/main/apps/tg-models:/app/models
 
     environment:
       # --- camera -------------------------------------------------------------

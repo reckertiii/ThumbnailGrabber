@@ -74,8 +74,18 @@ every start, which fails outright on a box with no outbound internet.
 
 | Host path | Mount path |
 |---|---|
-| your `captures` dataset | `/app/captures` |
-| your `tg-models` dataset | `/app/models` |
+| your captures dataset, e.g. `/mnt/main/apps/capture` | `/app/captures` |
+| your models dataset, e.g. `/mnt/main/apps/tg-models` | `/app/models` |
+
+Host paths are dataset **mountpoints**, so they begin `/mnt/<pool>/`. The pool name
+on its own is not a path. The mount paths on the right are fixed — `/app/captures`
+is what `TG_OUTPUT_DIR` points at and what you choose in the UI's folder dialog, so
+you change the host side only.
+
+`/app/models` is small but must be mounted: it holds your ⭐/👎 ratings **and the
+saved camera**. Left unmounted, both live in the container's writable layer and are
+lost the next time the app is recreated — you would be re-entering the camera after
+every update.
 
 **Environment variables**
 
