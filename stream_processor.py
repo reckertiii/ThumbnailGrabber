@@ -205,13 +205,23 @@ class StreamProcessor:
         self.connection_status = self.STATUS_DISCONNECTED
 
     def update_source(self, new_source: str):
-        """Switches video input source (e.g. RTSP URL, Webcam, File)."""
-        was_running = self.running
+        """Switches video input source (e.g. RTSP URL, Webcam, File).
+
+        Always restarts. This used to start again only if it had been running,
+        which left the processor dead exactly when it mattered: a source that
+        fails to open stops the grabber loop and clears `running`, so pointing it
+        at a camera that works found `running` already false and never started.
+        The result was a correctly saved camera, a "connected" message, and a feed
+        that stayed empty forever.
+
+        There is no separate stop control for the stream -- capture is toggled
+        independently via auto_capture_enabled -- so the stream running whenever a
+        source is set is the behaviour the UI already implies.
+        """
         self.stop()
         self.config.stream_source = new_source
         self.reconnect_attempt = 0
-        if was_running:
-            self.start()
+        self.start()
 
     def _set_status(self, status: str):
         """Update connection status and notify GUI."""

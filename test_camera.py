@@ -270,3 +270,76 @@ class TestStore(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSourceSwitching(unittest.TestCase):
+    """Changing the source must leave the stream running.
+
+    The failure this pins down looked like a working connection: the camera was
+    saved, the UI said connected, and the feed stayed empty forever, because a
+    source that failed to open had already cleared `running`, and the restart was
+    conditional on it.
+
+    The dead state is set directly rather than produced by a real bad source --
+    FFmpeg takes tens of seconds to give up on an unroutable address, and the
+    invariant under test is "restarts when not running", not how it stopped.
+    """
+
+    def setUp(self):
+        self._prev = os.environ.get("TG_DATA_DIR")
+        os.environ["TG_DATA_DIR"] = tempfile.mkdtemp()
+
+    def tearDown(self):
+        if self._prev is None:
+            os.environ.pop("TG_DATA_DIR", None)
+        else:
+            os.environ["TG_DATA_DIR"] = self._prev
+
+    def _processor(self, source):
+        from config import AppConfig
+        from stream_processor import StreamProcessor
+        cfg = AppConfig()
+        cfg.stream_source = source
+        # Keep the test off the network: constructing a judge would otherwise
+        # reach the configured Ollama host.
+        cfg.ai_judge_backend = "off"
+        cfg.dvr_buffer_seconds = 0.0
+        return StreamProcessor(config=cfg)
+
+    def test_update_source_restarts_a_processor_that_died(self):
+        proc = self._processor("0")
+        try:
+            # Exactly the state _grabber_loop leaves behind when a source will
+            # not open.
+            proc.running = False
+            proc._stop_event.set()
+            proc.connection_status = proc.STATUS_FAILED
+
+            proc.update_source("0")
+
+            self.assertTrue(proc.running,
+                            "a source change must restart a processor that had died")
+            self.assertFalse(proc._stop_event.is_set(),
+                             "the stop event must be cleared or the threads exit at once")
+            self.assertNotEqual(proc.connection_status, proc.STATUS_DISCONNECTED)
+        finally:
+            proc.stop()
+
+    def test_update_source_keeps_a_live_processor_running(self):
+        proc = self._processor("0")
+        try:
+            proc.start()
+            proc.update_source("0")
+            self.assertTrue(proc.running)
+        finally:
+            proc.stop()
+
+    def test_update_source_applies_the_new_source(self):
+        proc = self._processor("0")
+        try:
+            proc.running = False
+            proc.update_source("rtsp://10.0.0.9/media/video1")
+            self.assertEqual(proc.config.stream_source, "rtsp://10.0.0.9/media/video1")
+            self.assertEqual(proc.reconnect_attempt, 0)
+        finally:
+            proc.stop()
