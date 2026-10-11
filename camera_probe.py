@@ -264,7 +264,7 @@ def probe(host: str, port: int = DEFAULT_PORT, path: str = "",
         r.stage, r.code = "tcp", "refused"
         r.message = f"{host} refused the connection on port {port}."
         r.hint = ("The host is reachable but nothing is serving RTSP there. Check the "
-                  "port -- some cameras use 8554 -- and that RTSP is enabled.")
+                  "port — some cameras use 8554 — and that RTSP is enabled.")
         r.elapsed_ms = int((time.monotonic() - started) * 1000)
         return r
     except OSError as e:
