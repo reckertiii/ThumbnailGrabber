@@ -74,15 +74,24 @@ every start, which fails outright on a box with no outbound internet.
 
 | Host path | Mount path |
 |---|---|
-| `/mnt/main` (your pool) | `/mnt/main` |
+| `/mnt/main/apps` | `/mnt/main/apps` |
 
-One mount, at the same path inside the container as outside. That is what lets the
-folder picker reach any folder on the pool, and it means a folder is called the same
-thing in the picker, in the TrueNAS UI and over SMB — no translating `/app/captures`
-in your head.
+Mounted at the same path inside the container as outside, so a folder is called the
+same thing in the picker, in the TrueNAS UI and over SMB — no translating paths in
+your head. Any folder inside it can be chosen without redeploying.
 
-Narrow it to `/mnt/main/apps` on both sides if you would rather the rest of the pool
-stayed out of reach; the web UI has no authentication.
+**Mount datasets, not the pool root.** A bind mount is not recursive: mounting
+`/mnt/main` carries the `main` dataset alone, and every child dataset arrives as the
+bare empty directory its mountpoint sits on. The app then creates its folders inside
+that empty directory, the host has the real dataset mounted over the top, and the
+captures are invisible over SMB while the app insists they exist. List which paths
+are datasets before deciding what to mount:
+
+```bash
+zfs list -o name,mountpoint
+```
+
+Add a line per dataset you want reachable, and extend `TG_OUTPUT_ROOTS` to match.
 
 **Environment variables**
 
@@ -91,7 +100,7 @@ stayed out of reach; the web UI has no authentication.
 | `TG_STREAM_SOURCE` | *optional* | First-run default only. A camera connected in the UI is saved and overrides it, so you can leave this out and avoid putting the password in the app config |
 | `TG_OUTPUT_DIR` | `/mnt/main/apps/capture` | Where captures land. Must sit under the mount above |
 | `TG_DATA_DIR` | `/mnt/main/apps/tg-models` | Saved camera and your ⭐/👎 ratings. Under the mount, so they survive the app being recreated |
-| `TG_OUTPUT_ROOTS` | `/mnt/main` | How far the folder picker may browse. Colon-separated for several |
+| `TG_OUTPUT_ROOTS` | `/mnt/main/apps` | How far the folder picker may browse. Colon-separated for several |
 | `OLLAMA_HOST` | `http://192.168.32.104:30068` | The Ollama app. Use the NAS LAN IP, **not** `localhost` — inside a container that is the container itself |
 | `TG_AI_JUDGE_OLLAMA_MODEL` | `qwen3-vl:30b` | Must match what you pulled |
 | `TG_AI_JUDGE_OLLAMA_NUM_THREAD` | match the Ollama app's CPU limit | Ollama otherwise spawns one thread per host core, overruns its quota and is throttled — measured ~3× slower |

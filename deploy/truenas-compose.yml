@@ -3,12 +3,12 @@
 # Paste into Apps -> Discover Apps -> Custom App -> Install via YAML, or run with
 # `docker compose up -d` from a shell on the NAS.
 #
-# The whole pool is mounted at the same path it has on the host, so a folder is
-# called the same thing in the picker, in the TrueNAS UI and over SMB. Captures
-# can then be sent to any folder on the pool without redeploying.
+# Datasets are mounted at the same path they have on the host, so a folder is
+# called the same thing in the picker, in the TrueNAS UI and over SMB. Any
+# folder inside a mounted dataset can be chosen without redeploying.
 #
 # Change before deploying:
-#   1. /mnt/main      -> your pool, if it is not called "main"
+#   1. /mnt/main/apps -> the dataset(s) you want reachable
 #   2. user:          -> see the note on it below
 #   3. OLLAMA_HOST    -> your NAS IP and the Ollama app's actual port
 #
@@ -30,10 +30,20 @@ services:
       - "9080:8000"
 
     volumes:
-      # One mount, same path inside and out. Everything the app needs lives under
-      # it: captures, the saved camera and the ratings. Mounting the pool at its
-      # own path is what lets the folder picker reach anywhere on it.
-      - /mnt/main:/mnt/main
+      # Mount the DATASET, not the pool root.
+      #
+      # A bind mount is not recursive, so mounting /mnt/main carries the `main`
+      # dataset alone. Every child dataset -- `apps` is one -- comes through as
+      # the bare empty directory its mountpoint sits on. The app then happily
+      # creates its folders inside that empty directory, where the host has the
+      # real dataset mounted over the top, and the captures are invisible over
+      # SMB while the app insists they exist.
+      #
+      # So list each dataset you want reachable, at its own path. Check which
+      # paths are datasets with:  zfs list -o name,mountpoint
+      - /mnt/main/apps:/mnt/main/apps
+      # Add more the same way, and extend TG_OUTPUT_ROOTS to match:
+      # - /mnt/main/media:/mnt/main/media
 
     # Run as the user that owns these folders, NOT root. The PNGs are reached over
     # SMB from Windows and Mac, and a root-owned 0644 file can be opened but not
@@ -52,13 +62,13 @@ services:
       # The folder picker may browse anywhere under here. Colon-separated for
       # several. Narrow it to /mnt/main/apps to keep the rest of the pool out of
       # reach — the web UI has no authentication.
-      TG_OUTPUT_ROOTS: "/mnt/main"
+      TG_OUTPUT_ROOTS: "/mnt/main/apps"
       # Where the saved camera and your star/reject ratings live. Under the mount,
       # so it survives the app being recreated. Without this they sit in the
       # container and you re-enter the camera after every update.
       TG_DATA_DIR: "/mnt/main/apps/tg-models"
       # Directories the video scanner may read.
-      TG_VIDEO_ROOTS: "/mnt/main"
+      TG_VIDEO_ROOTS: "/mnt/main/apps"
       TG_MAX_UPLOAD_MB: "4096"
 
       # --- camera -------------------------------------------------------------
