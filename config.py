@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 _PROJECT_ROOT = Path(__file__).resolve().parent
 
@@ -37,6 +37,20 @@ def _default_stream_source() -> str:
     """
     return os.environ.get("TG_STREAM_SOURCE", "").strip() or "0"
 
+def home_dir() -> Optional[Path]:
+    """The user's home directory, or None when there isn't one.
+
+    In a container told to run as a bare uid:gid -- which is how the captures
+    dataset gets files owned by the SMB user rather than root -- that uid has no
+    passwd entry, and Path.home() raises RuntimeError instead of returning
+    something. Callers treat None as "no home-relative paths available".
+    """
+    try:
+        return Path.home()
+    except (RuntimeError, KeyError, OSError):
+        return None
+
+
 def _default_output_dir() -> str:
     """TG_OUTPUT_DIR if set, else Pictures/ThumbnailGrabber, else ./captures."""
     override = os.environ.get("TG_OUTPUT_DIR", "").strip()
@@ -44,10 +58,12 @@ def _default_output_dir() -> str:
         Path(override).mkdir(parents=True, exist_ok=True)
         return override
 
-    pictures = Path.home() / "Pictures" / "ThumbnailGrabber"
-    if pictures.parent.exists():
-        pictures.mkdir(parents=True, exist_ok=True)
-        return str(pictures)
+    home = home_dir()
+    if home is not None:
+        pictures = home / "Pictures" / "ThumbnailGrabber"
+        if pictures.parent.exists():
+            pictures.mkdir(parents=True, exist_ok=True)
+            return str(pictures)
     return os.path.join(os.getcwd(), "captures")
 
 @dataclass

@@ -13,6 +13,9 @@
 #   4. TG_AI_JUDGE_OLLAMA_NUM_THREAD -> the CPU limit you gave the Ollama app
 
 # The UI is then at http://<nas-ip>:9080
+#
+# Share the captures dataset over SMB to reach the PNGs from Windows and Mac as a
+# mapped drive -- see section 6 of INSTALL.md.
 
 services:
   thumbnail-grabber:
@@ -23,6 +26,13 @@ services:
     # Set to "always" only if you want every restart to re-pull. With the repo private
     # that needs a registry credential, so IfNotPresent-equivalent is the safer default.
     pull_policy: missing
+
+    # Run as the user that owns the captures dataset, NOT root. The PNGs are
+    # reached over SMB from Windows and Mac, and a root-owned 0644 file can be
+    # opened from there but not deleted or renamed -- deleting needs write on the
+    # parent directory, which a root-owned 0755 dataset grants to nobody else.
+    # Get the numbers with `id <username>` in a TrueNAS shell.
+    user: "3000:3000"
 
     ports:
       # host:container. The container side is fixed at 8000 -- that is what the app
@@ -43,6 +53,8 @@ services:
       TG_STREAM_SOURCE: "rtsp://USER:PASSWORD@192.168.1.100:554/media/video1"
       TG_OUTPUT_DIR: "/app/captures"
       TZ: "America/New_York"          # capture filenames use local time
+      # The uid above has no passwd entry, so give it somewhere to call home.
+      HOME: "/tmp"
 
       # --- AI judge, via the Ollama app on this same NAS -----------------------
       # Use the NAS's LAN IP, never localhost: inside a container that is the

@@ -29,7 +29,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Body
 from fastapi.responses import StreamingResponse, FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
-from config import AppConfig
+from config import AppConfig, home_dir
 from analyzer import AnalysisResult
 from stream_processor import StreamProcessor, CapturedScreenshot
 from overlay import draw_overlay
@@ -765,12 +765,17 @@ def browse_folders(path: str = ""):
     entries.sort(key=lambda d: d["name"].lower())
     parent = str(target.parent) if target.parent != target else None
 
-    home = Path.home()
-    shortcuts = [{"name": "Home", "path": str(home)}]
-    for sub in ("Pictures", "Videos", "Desktop", "Downloads"):
-        q = home / sub
-        if q.is_dir():
-            shortcuts.append({"name": sub, "path": str(q)})
+    # No home directory when the container runs as a bare uid:gid, which is how
+    # captures end up owned by the SMB user. Shortcuts are a convenience, so they
+    # are simply omitted rather than allowed to fail the whole listing.
+    home = home_dir()
+    shortcuts = []
+    if home is not None:
+        shortcuts.append({"name": "Home", "path": str(home)})
+        for sub in ("Pictures", "Videos", "Desktop", "Downloads"):
+            q = home / sub
+            if q.is_dir():
+                shortcuts.append({"name": sub, "path": str(q)})
     shortcuts.append({"name": "Current output", "path": str(Path(state.config.output_dir))})
 
     return {

@@ -58,7 +58,7 @@ every start, which fails outright on a box with no outbound internet.
 |---|---|
 | Repository | `ghcr.io/reckertiii/thumbnailgrabber` |
 | Tag | `latest` |
-| Pull policy | `IfNotPresent` — see §7 if you make the repo private |
+| Pull policy | `IfNotPresent` — see §8 if you make the repo private |
 
 **Port**
 
@@ -95,7 +95,7 @@ authentication**:
 | `TG_OUTPUT_ROOTS` | `/app/captures` — limits where the output-folder picker may browse |
 
 **Resources.** Give it 4 GB RAM and 4 CPUs to start. The frame buffer alone defaults to
-about 0.9 GB — see §6.
+about 0.9 GB — see §7.
 
 Deploy.
 
@@ -111,7 +111,7 @@ only the outside port changed.
 Check these three things in order:
 
 1. **Stream status says Connected** with a frame rate. If not, the camera URL or network
-   path is wrong — see §8.
+   path is wrong — see §9.
 2. **AI judge says `qwen3-vl:30b via local`** with minutes remaining. If it says "no
    Ollama at…", the host or port is wrong.
 3. **Capture is refused until you confirm the output folder.** This is deliberate — on a
@@ -143,7 +143,75 @@ If the gallery stays empty, the readout tells you why — the Score line ends wi
 
 ---
 
-## 6. Tune the frame buffer
+## 6. Reach the captures from Windows and Mac
+
+The app writes to the NAS, because that is the only disk it has. To work on the
+PNGs you share that dataset and mount it on each machine, where it behaves like any
+other folder -- open a `_subject.png` straight from it into your background remover.
+
+A browser cannot be given a folder on your own machine to write into, which is why
+this is done at the filesystem level rather than in the app.
+
+### Share it on TrueNAS
+
+1. **Credentials -> Local Users.** Either note an existing user or add one for this.
+   In a shell, `id <username>` prints the uid and gid.
+2. **Set `user:` in the compose file to those numbers** (or the app's Run-As
+   settings, if you deployed through the GUI). The container otherwise runs as root
+   and writes files nobody else can delete -- you could open them from Windows but
+   not clear them out. Redeploy after changing it.
+3. **Datasets -> your `captures` dataset -> Edit Permissions.** Give that user
+   Full Control, and apply recursively if captures already exist.
+4. **Shares -> Windows (SMB) Shares -> Add.**
+
+   | Field | Value |
+   |---|---|
+   | Path | your `captures` dataset |
+   | Name | `tgcaptures` |
+   | Purpose | Default share parameters |
+
+   Save, and enable the SMB service when prompted.
+
+### Mount it on Windows
+
+File Explorer -> This PC -> **Map network drive**, pick a letter, and enter:
+
+```
+\\192.168.32.104\tgcaptures
+```
+
+Tick **Reconnect at sign-in** and **Connect using different credentials**, then give
+the NAS username and password. Or from a terminal:
+
+```
+net use Z: \\192.168.32.104\tgcaptures /persistent:yes
+```
+
+### Mount it on Mac
+
+Finder -> Go -> **Connect to Server** (Cmd-K):
+
+```
+smb://192.168.32.104/tgcaptures
+```
+
+Connect, authenticate, and tick **Remember this password in my keychain**. To have it
+mount at login, drag the mounted volume into **System Settings -> General -> Login
+Items**.
+
+### Notes
+
+- **Use the share, don't move it.** `TG_OUTPUT_DIR` must stay `/app/captures`. The
+  gallery, the star and thumbs-down ratings, and the AI judge all read back from
+  there, so pointing the app somewhere else to "save locally" breaks them.
+- **Copy, don't cut, during a service.** The app keeps its own list of what it has
+  saved; deleting files it is still ranking makes the gallery show gaps.
+- **Both platforms, one share.** SMB is native to Windows and macOS, so the same
+  share serves every machine with no per-machine browser setup.
+
+---
+
+## 7. Tune the frame buffer
 
 The buffer keeps recent frames so a chosen moment can be re-examined at full frame rate
 for its sharpest version. It is the largest allocation in the process, so size it
@@ -160,7 +228,7 @@ raising it raises memory in proportion. Slider is in the UI; 0 turns the buffer 
 
 ---
 
-## 7. After you make the repo private
+## 8. After you make the repo private
 
 Repo visibility and **package** visibility are separate. A private repo publishes a
 private image, and TrueNAS then needs a token to pull it.
@@ -173,7 +241,7 @@ GitHub personal access token as a registry credential in TrueNAS.
 
 ---
 
-## 8. If something is wrong
+## 9. If something is wrong
 
 **Stream says Disconnected.** Test the path from the NAS itself, not your desktop:
 ```bash
@@ -203,7 +271,7 @@ a hard reload (Ctrl-Shift-R) settles it.
 
 ---
 
-## 9. Updating
+## 10. Updating
 
 ```bash
 docker pull ghcr.io/reckertiii/thumbnailgrabber:latest
