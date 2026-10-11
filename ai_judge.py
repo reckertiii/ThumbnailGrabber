@@ -333,17 +333,52 @@ class AIJudge:
         finally:
             self._preloading = False
 
-    def sleep_now(self) -> None:
+    def sleep_now(self, reason: str = "") -> None:
         """Ends the window early and releases the model."""
         self.started_at = time.time() - max(self.active_seconds, 1.0)
-        self._handle_expiry()
+        self._handle_expiry(reason or "stopped")
 
-    def _handle_expiry(self) -> None:
+    def suspend(self) -> float:
+        """Releases the model but remembers how much window was left.
+
+        Restarting the stream -- which is what changing the camera does -- stops
+        the processor, and stopping it releases the model so a dormant app does
+        not pin 20GB. That must not read as "the window elapsed": the judge used
+        to come back permanently asleep from a reconnect that took two seconds.
+        The caller passes the returned value to resume().
+        """
+        left = self.seconds_remaining
+        if left == float("inf"):
+            left = -1.0
+        self.sleep_now(reason="stream restarting")
+        return left
+
+    def resume(self, seconds_left: float) -> None:
+        """Re-arms the judge with the window it had before suspend()."""
+        if seconds_left is None:
+            return
+        self._expiry_handled = False
+        if seconds_left < 0:
+            self.started_at = time.time()          # unlimited window
+        else:
+            self.started_at = time.time() - max(0.0, self.active_seconds - seconds_left)
+        if self.enabled and not self.expired:
+            print(f"[AIJudge] Resumed with {int(self.seconds_remaining // 60)} min left.")
+            # The model was released on suspend, so pull it back rather than
+            # making the next capture wait for it.
+            self.preload_async()
+
+    def _handle_expiry(self, reason: str = "") -> None:
         if self._expiry_handled:
             return
         self._expiry_handled = True
-        hours = self.active_seconds / 3600.0
-        print(f"[AIJudge] {hours:.1f}h active window elapsed - reviews are off.")
+        if reason:
+            # Said plainly, because the log used to claim a 2h window had elapsed
+            # ninety seconds after startup whenever the camera was reconnected.
+            print(f"[AIJudge] Reviews off ({reason}).")
+        else:
+            hours = self.active_seconds / 3600.0
+            print(f"[AIJudge] {hours:.1f}h active window elapsed - reviews are off.")
         self._unload_ollama_model()
 
     def _unload_ollama_model(self) -> None:

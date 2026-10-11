@@ -218,10 +218,21 @@ class StreamProcessor:
         independently via auto_capture_enabled -- so the stream running whenever a
         source is set is the behaviour the UI already implies.
         """
+        # stop() releases the judge's model, which is right for a shutdown but
+        # not for a two-second reconnect -- the judge used to come back
+        # permanently asleep. Carry the remaining window across the restart.
+        judge = getattr(self, "judge", None)
+        left = None
+        if judge is not None and judge.enabled and not judge.expired:
+            left = judge.suspend()
+
         self.stop()
         self.config.stream_source = new_source
         self.reconnect_attempt = 0
         self.start()
+
+        if judge is not None and left is not None:
+            judge.resume(left)
 
     def _set_status(self, status: str):
         """Update connection status and notify GUI."""

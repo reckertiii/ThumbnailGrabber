@@ -18,11 +18,19 @@ ENV TG_MODELS_DIR=/opt/tg-models
 # User ratings do need to survive restarts, so they stay on the mounted volume.
 ENV TG_DATA_DIR=/app/models
 
-# Install required system runtime libraries for OpenCV, MediaPipe, FFMPEG, and Timezone support
+# System runtime libraries for OpenCV, MediaPipe, FFMPEG and timezones.
+#
+# libgles2/libegl1 matter more than they look: MediaPipe's task runners
+# resolve a GL context even when inference is on CPU. Without them all three
+# landmarkers fail with 'libGLESv2.so.2: cannot open shared object file' and
+# are skipped with only a warning, leaving scoring to the plain face box --
+# no 478-point mesh, no blendshapes, no shoulder line, no hands.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     libglib2.0-0 \
     libgomp1 \
+    libgles2 \
+    libegl1 \
     ffmpeg \
     curl \
     ca-certificates \

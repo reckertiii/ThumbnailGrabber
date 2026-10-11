@@ -132,3 +132,72 @@ class TestWakeLoadsTheModel(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSuspendResume(unittest.TestCase):
+    """A source change must not leave the judge asleep.
+
+    Stopping the processor releases the model, which is correct for a shutdown.
+    A camera reconnect goes through the same stop, and the judge used to come
+    back permanently expired from it -- and the log claimed a two-hour window had
+    elapsed ninety seconds after startup.
+    """
+
+    def setUp(self):
+        self.srv = _serve()
+        host, port = self.srv.server_address
+        cfg = AppConfig()
+        cfg.ai_judge_backend = "ollama"
+        cfg.ai_judge_ollama_url = f"http://{host}:{port}"
+        cfg.ai_judge_ollama_model = MODEL
+        cfg.ai_judge_active_hours = 2.0
+        self.judge = AIJudge(cfg)
+
+    def tearDown(self):
+        self.srv.shutdown()
+
+    def _settle(self, timeout=10):
+        end = time.time() + timeout
+        while self.judge._preloading and time.time() < end:
+            time.sleep(0.05)
+
+    def test_suspend_then_resume_keeps_the_remaining_window(self):
+        # Burn half an hour of a two-hour window.
+        self.judge.started_at = time.time() - 1800
+        before = self.judge.seconds_remaining
+
+        left = self.judge.suspend()
+        self.assertTrue(self.judge.expired, "suspend should release the model")
+        self.assertAlmostEqual(left, before, delta=5)
+
+        self.judge.resume(left)
+        self._settle()
+
+        self.assertFalse(self.judge.expired, "resume must re-arm the judge")
+        self.assertAlmostEqual(self.judge.seconds_remaining, before, delta=5)
+
+    def test_resume_reloads_the_model(self):
+        left = self.judge.suspend()
+        self.srv.requests.clear()
+        self.judge.resume(left)
+        self._settle()
+        loads = [b for p, b in self.srv.requests
+                 if p == "/api/generate" and b.get("prompt") == ""]
+        self.assertTrue(loads, "resume should pull the model back")
+
+    def test_suspend_does_not_claim_the_window_elapsed(self):
+        import io as _io, contextlib
+        buf = _io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.judge.suspend()
+        out = buf.getvalue()
+        self.assertNotIn("elapsed", out,
+                         "a restart must not be reported as the window elapsing")
+
+    def test_a_genuinely_elapsed_window_still_says_so(self):
+        import io as _io, contextlib
+        self.judge.started_at = time.time() - (self.judge.active_seconds + 60)
+        buf = _io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.judge._handle_expiry()
+        self.assertIn("elapsed", buf.getvalue())
