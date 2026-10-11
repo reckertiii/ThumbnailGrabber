@@ -29,6 +29,8 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Body
 from fastapi.responses import StreamingResponse, FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
+import posixpath
+from pathlib import PurePosixPath
 from config import AppConfig, home_dir, redact_credentials
 import camera_probe
 import camera_store
@@ -832,6 +834,68 @@ def _resolve_video_path(raw: str) -> Path:
     return target
 
 
+def _mount_points() -> set:
+    """Every path this process has a filesystem mounted at.
+
+    Read per call rather than cached: a volume can be added and the app
+    redeployed without this module being reimported in between.
+    """
+    points = set()
+    try:
+        with open("/proc/self/mountinfo", "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) > 4:
+                    points.add(parts[4])
+    except OSError:
+        pass            # not Linux, or no procfs - caller treats this as "unknown"
+    return points
+
+
+def is_ephemeral(path) -> bool:
+    """True when `path` lives in the container's own writable layer.
+
+    Anything written there survives a restart but is destroyed when the app is
+    recreated, which is every update. The failure is silent and very convincing:
+    the app creates its own output folder, writes to it, serves the files back,
+    and reports everything as fine, while the host sees an empty dataset. That
+    happens whenever a bind mount misses -- most easily by mounting a pool root
+    and expecting child datasets to come with it, which a non-recursive bind
+    mount does not do.
+
+    Walks POSIX paths explicitly rather than through pathlib's native flavour:
+    mountinfo entries are POSIX whatever the host running the tests is.
+
+    Returns False when it cannot tell, so this only ever reports a problem it
+    has actually established.
+    """
+    points = _mount_points()
+    if not points:
+        return False                      # no procfs: say nothing
+    raw = str(path)
+    if os.name == "posix":
+        try:
+            raw = os.path.realpath(raw)   # follow symlinks out of the layer
+        except OSError:
+            pass
+    target = PurePosixPath(posixpath.normpath(raw.replace("\\", "/")))
+    for c in [target] + list(target.parents):
+        if str(c) in points:
+            # The deepest enclosing mount. Only the image root means ephemeral.
+            return str(c) == "/"
+    return False
+
+
+def _persistence_warning(path) -> str:
+    """The sentence to show about a folder, or "" when there is nothing to say."""
+    if not is_ephemeral(path):
+        return ""
+    return (f"{path} is inside the container, not on a mounted volume. Captures "
+            f"written here are lost the next time the app is updated. Add a bind "
+            f"mount for this path - and note that mounting a pool root does not "
+            f"bring its child datasets with it; each dataset needs its own mount.")
+
+
 def _resolve_output_dir(raw: str) -> str:
     """Keeps scan output inside the configured output directory.
 
@@ -989,12 +1053,19 @@ def set_output_dir(payload: Dict[str, Any] = Body(...)):
     if not _is_writable(target):
         raise HTTPException(status_code=400, detail="Folder is not writable by the server")
 
+    # Writable is not the same as persistent: the container's own filesystem is
+    # perfectly writable and is wiped on the next update.
+    warning = _persistence_warning(target)
+    if warning:
+        print(f"[Output] WARNING: {warning}")
+
     state.config.output_dir = str(target)
     if state.processor:
         state.processor.config.output_dir = str(target)
     # Choosing a folder - including re-choosing the current one - is the confirmation.
     state.output_confirmed = True
-    return {"ok": True, "output_dir": str(target), "output_confirmed": True}
+    return {"ok": True, "output_dir": str(target), "output_confirmed": True,
+            "warning": warning}
 
 
 @app.post("/api/video/info")

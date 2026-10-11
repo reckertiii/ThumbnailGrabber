@@ -601,6 +601,13 @@ $("btnFolderUse").onclick = async () => {
     const d = await post("/api/output", { path, create: $("folderCreate").checked });
     $("outputDir").textContent = d.output_dir;
     $("scanOutputDir").textContent = d.output_dir;
+    if (d.warning) {
+      // Writable is not persistent. Keep the dialog open and say so, rather than
+      // reporting success for a folder whose contents vanish on the next update.
+      $("folderNote").textContent = "⚠ " + d.warning;
+      toast("Folder set, but it is not on a mounted volume");
+      return;
+    }
     toast("Saving captures to " + d.output_dir);
     closeFolderModal();
   } catch (e) {
