@@ -660,12 +660,15 @@ def wake_judge():
     """Re-arms the judge for another full active window.
 
     Lets someone who started the app early, or whose service ran long, bring the
-    reviewer back without restarting - the model reloads on the next review.
+    reviewer back without restarting. The model is pulled into memory now rather
+    than on the first review, so the first capture of a service does not wait for
+    20GB to come off disk. Loading runs in the background; the status line reports
+    when it finishes.
     """
     proc = state.processor
     if not proc or not getattr(proc, "judge", None):
         raise HTTPException(status_code=409, detail="Stream not running")
-    proc.judge.reset_window()
+    proc.judge.wake()
     return {"ok": True, "status": proc.judge.status_line(),
             "minutes_left": (None if proc.judge.seconds_remaining == float("inf")
                              else int(proc.judge.seconds_remaining // 60))}

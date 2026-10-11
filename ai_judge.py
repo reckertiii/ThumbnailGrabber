@@ -169,6 +169,8 @@ class AIJudge:
         self.active_seconds = max(0.0, float(getattr(config, "ai_judge_active_hours", 2.0)) * 3600.0)
         self.started_at: float = time.time()
         self._expiry_handled: bool = False
+        self._preloading: bool = False      # a load is in flight
+        self._preload_error: str = ""
 
         self._client: Any = None            # Anthropic client, when that backend is active
         self._client_error: Optional[str] = None
@@ -277,6 +279,60 @@ class AIJudge:
         if self.enabled:
             print(f"[AIJudge] Woken for another {self.active_seconds / 3600:.1f}h.")
 
+    def wake(self) -> None:
+        """Re-arms the window and pulls the model back into memory.
+
+        Resetting the timer alone left Ollama idle at a few MB until the first
+        review, so the first capture of a service paid for loading 20GB off disk.
+        Waking before the service is exactly when you want that cost paid, so the
+        load is started here and runs on its own thread -- it can take minutes,
+        which is far too long to hold an HTTP request open.
+        """
+        self.reset_window()
+        self.preload_async()
+
+    def preload_async(self) -> None:
+        """Starts a model load in the background, if one is not already running."""
+        if self.backend != "ollama" or not self.enabled:
+            return
+        if self._preloading:
+            return
+        self._preloading = True
+        self._preload_error = ""
+        threading.Thread(target=self._load_ollama_model, daemon=True).start()
+
+    def _load_ollama_model(self) -> None:
+        """Asks Ollama to hold the model in memory.
+
+        An empty prompt is Ollama's documented way to load without generating. The
+        keep_alive sent here is the configured one, so the model stays resident on
+        the same terms a real review would give it.
+        """
+        started = time.time()
+        try:
+            body = json.dumps({
+                "model": self.ollama_model,
+                "prompt": "",
+                "keep_alive": _keep_alive_value(self.ollama_keep_alive),
+            }).encode()
+            req = urllib.request.Request(f"{self.ollama_url}/api/generate", data=body,
+                                         headers={"Content-Type": "application/json"},
+                                         method="POST")
+            # Generous: a 20GB model off spinning disk is minutes, not seconds.
+            with urllib.request.urlopen(req, timeout=600) as resp:
+                resp.read()
+            print(f"[AIJudge] Loaded {self.ollama_model} on {self.ollama_url} "
+                  f"in {time.time() - started:.0f}s.")
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")[:200]
+            self._preload_error = f"HTTP {e.code}: {detail}"
+            print(f"[AIJudge] Could not load {self.ollama_model}: {self._preload_error}")
+        except Exception as e:  # noqa: BLE001
+            self._preload_error = f"{type(e).__name__}: {e}"
+            print(f"[AIJudge] Could not load {self.ollama_model}: {self._preload_error}")
+        finally:
+            self._preloading = False
+
     def sleep_now(self) -> None:
         """Ends the window early and releases the model."""
         self.started_at = time.time() - max(self.active_seconds, 1.0)
@@ -332,6 +388,13 @@ class AIJudge:
             where = "local" if self.backend == "ollama" else "Claude API"
             left = self.seconds_remaining
             window = "" if left == float("inf") else f", {int(left // 60)} min left"
+            if self._preloading:
+                return (f"AI judge waking ({self.active_model} loading on {where}"
+                        f"{window})")
+            if self._preload_error:
+                return (f"AI judge on ({self.active_model} via {where}, "
+                        f"{self.calls_made} calls{window}) - load failed: "
+                        f"{self._preload_error}")
             return f"AI judge on ({self.active_model} via {where}, {self.calls_made} calls{window})"
         if self.enabled and self.expired:
             return (f"AI judge asleep - {self.active_seconds / 3600:.1f}h window elapsed "
