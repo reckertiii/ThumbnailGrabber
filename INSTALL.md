@@ -80,6 +80,12 @@ Mounted at the same path inside the container as outside, so a folder is called 
 same thing in the picker, in the TrueNAS UI and over SMB — no translating paths in
 your head. Any folder inside it can be chosen without redeploying.
 
+**Host paths are case sensitive.** A pool shown as `Main` lives at `/mnt/Main`, and
+`/mnt/main` is a different path. Docker does not reject a host path that does not
+exist — it creates an empty directory and mounts that, so the app writes to the
+system drive while the pool stays empty and the shares show nothing. Copy the pool
+name exactly as `zfs list` prints it.
+
 **Mount datasets, not the pool root.** A bind mount is not recursive: mounting
 `/mnt/main` carries the `main` dataset alone, and every child dataset arrives as the
 bare empty directory its mountpoint sits on. The app then creates its folders inside

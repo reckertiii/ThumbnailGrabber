@@ -8,22 +8,20 @@
 # inside a mounted dataset can be chosen from the UI without redeploying.
 #
 # ---------------------------------------------------------------------------
-# ADDING A SHARE AS A CAPTURE DESTINATION
+# THE PATH IS CASE SENSITIVE. The pool is "Main", so it is /mnt/Main and not
+# /mnt/main. Docker does not complain about a host path that does not exist: it
+# creates an empty directory and mounts that, so the app writes happily to the
+# system drive while the pool stays empty and the shares show nothing.
 #
-# Two edits, and they must agree:
+# ADDING A SHARE AS A DESTINATION — two edits, and they must agree:
 #   1. a line under `volumes`, as  /host/path:/host/path  (same both sides)
 #   2. that same path appended to TG_OUTPUT_ROOTS, colon-separated
 #
-# Get the real paths — a share's name is not its dataset path:
-#   zfs list -o name,mountpoint
-# or TrueNAS UI -> Shares -> Windows (SMB) Shares, which lists each share's path.
+# Mount the DATASET, not the pool root. A bind mount is not recursive, so
+# mounting /mnt/Main carries that dataset alone and every child dataset arrives as
+# the bare empty directory its mountpoint sits on.
 #
-# Mount the DATASET, not a pool root. A bind mount is not recursive, so mounting
-# /mnt/pool carries that dataset alone and every child dataset arrives as the
-# bare empty directory its mountpoint sits on. The app will then create its
-# folders in that empty directory, the host has the real dataset mounted over the
-# top, and the captures are invisible over SMB while the app insists they exist.
-# The app warns when a chosen folder is not on a mount, but mount it properly.
+# Paths containing spaces must be quoted, as below.
 # ---------------------------------------------------------------------------
 
 services:
@@ -42,45 +40,42 @@ services:
       - "9080:8000"
 
     volumes:
-      # Confirmed: this is the dataset behind the \<nas>\apps share, and it holds
-      # the capture folder and the app's own data below.
-      - /mnt/main/apps:/mnt/main/apps
+      - "/mnt/Main/apps:/mnt/Main/apps"
+      - "/mnt/Main/Grace Shared:/mnt/Main/Grace Shared"
+      - "/mnt/Main/Grace Central Services:/mnt/Main/Grace Central Services"
+      - "/mnt/Main/Grace Cortland:/mnt/Main/Grace Cortland"
+      - "/mnt/Main/Grace Dryden:/mnt/Main/Grace Dryden"
 
-      # Your other shares. Uncomment the ones you want as destinations and fix the
-      # paths from `zfs list` — these names are guesses and almost certainly wrong.
-      # - /mnt/main/grace-shared:/mnt/main/grace-shared
-      # - /mnt/main/grace-central:/mnt/main/grace-central
-      # - /mnt/main/grace-dryden:/mnt/main/grace-dryden
-      # - /mnt/main/grace-cortland:/mnt/main/grace-cortland
-      # - /mnt/main/companion:/mnt/main/companion
-      # - /mnt/main/companion-modules:/mnt/main/companion-modules
+      # The rest of the pool, if you ever want them as destinations. Uncomment
+      # and add the same path to TG_OUTPUT_ROOTS.
+      # - "/mnt/Main/FinalCut:/mnt/Main/FinalCut"
+      # - "/mnt/Main/Backups:/mnt/Main/Backups"
+      # - "/mnt/Main/Companion:/mnt/Main/Companion"
+      # - "/mnt/Main/CompanionModules:/mnt/Main/CompanionModules"
+      # - "/mnt/Main/QLC:/mnt/Main/QLC"
 
     # Run as the user that owns these folders, NOT root. The PNGs are reached over
     # SMB from Windows and Mac, and a root-owned 0644 file can be opened but not
     # deleted or renamed — deleting needs write on the parent directory. Find the
-    # numbers with:   ls -ln /mnt/main/apps/capture | head
+    # numbers with:   ls -ln "/mnt/Main/apps" | head
     # then uncomment. Left commented it runs as root, which works but leaves files
     # you cannot tidy up from a Mac or PC.
     # user: "3000:3000"
 
     environment:
       # --- where things go ----------------------------------------------------
-      # Real paths, because the mounts above mirror them. These must sit inside a
-      # mounted dataset or captures land in the container's throwaway layer.
-      TG_OUTPUT_DIR: "/mnt/main/apps/capture"
+      TG_OUTPUT_DIR: "/mnt/Main/apps/capture"
 
-      # How far the folder picker may browse. Colon-separated. Every path here
-      # needs a matching volume above, or the picker offers a folder it cannot
-      # actually reach. Append the shares you uncommented, e.g.
-      #   "/mnt/main/apps:/mnt/main/grace-shared:/mnt/main/companion"
-      TG_OUTPUT_ROOTS: "/mnt/main/apps"
+      # How far the folder picker may browse. Colon-separated; every entry needs a
+      # matching volume above, or the picker offers a folder it cannot reach.
+      TG_OUTPUT_ROOTS: "/mnt/Main/apps:/mnt/Main/Grace Shared:/mnt/Main/Grace Central Services:/mnt/Main/Grace Cortland:/mnt/Main/Grace Dryden"
 
       # Directories the video scanner may read. Same rule.
-      TG_VIDEO_ROOTS: "/mnt/main/apps"
+      TG_VIDEO_ROOTS: "/mnt/Main/apps:/mnt/Main/Grace Shared:/mnt/Main/Grace Central Services:/mnt/Main/Grace Cortland:/mnt/Main/Grace Dryden"
 
       # The saved camera and your star/reject ratings. Must be on a mount, or you
       # re-enter the camera after every update.
-      TG_DATA_DIR: "/mnt/main/apps/tg-models"
+      TG_DATA_DIR: "/mnt/Main/apps/tg-models"
 
       TG_MAX_UPLOAD_MB: "4096"
 
@@ -96,8 +91,7 @@ services:
 
       # --- AI judge, via the Ollama app on this same NAS -----------------------
       # Use the NAS's LAN IP, never localhost: inside a container that is the
-      # container itself. The catalog Ollama app usually remaps 11434 to a
-      # 30000-range port — check with: curl http://<nas-ip>:<port>/api/tags
+      # container itself. Check the port with: curl http://<nas-ip>:<port>/api/tags
       OLLAMA_HOST: "http://192.168.32.104:30068"
       TG_AI_JUDGE_BACKEND: "ollama"
       TG_AI_JUDGE_OLLAMA_MODEL: "qwen3-vl:30b"
