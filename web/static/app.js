@@ -83,7 +83,22 @@ function render(d) {
   $("mJudge").childNodes[0].nodeValue = d.ai_judge_active
     ? `AI judge: active${judgeMins == null ? "" : ` · ${judgeMins} min left`} `
     : `${d.ai_judge || "AI judge: off"} `;
-  if (!sourceFocused && $("src").value !== d.source) $("src").value = d.source || "";
+  // The server reports the source with its password masked, which must never be
+  // typed back into the box -- pressing Connect would send "***" as the password
+  // and the camera would refuse it. A masked source goes in the placeholder, so
+  // the operator can see what is connected while the box stays empty for a real
+  // URL. Anything without credentials (a webcam index, a file path) still fills in.
+  if (!sourceFocused) {
+    const src = d.source || "";
+    const masked = src.includes("://***@");
+    if (masked) {
+      $("src").placeholder = src;
+      if ($("src").value.includes("://***@")) $("src").value = "";
+    } else {
+      $("src").placeholder = "rtsp://… , 0, or file path";
+      if ($("src").value !== src) $("src").value = src;
+    }
+  }
 
   // Start / stop button
   isCapturing = !!d.is_capturing;

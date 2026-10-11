@@ -29,7 +29,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Body
 from fastapi.responses import StreamingResponse, FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
-from config import AppConfig, home_dir
+from config import AppConfig, home_dir, redact_credentials
 from analyzer import AnalysisResult
 from stream_processor import StreamProcessor, CapturedScreenshot
 from overlay import draw_overlay
@@ -160,7 +160,9 @@ def _telemetry() -> Dict[str, Any]:
         "single_winner": cfg.single_winner_mode,
         "show_mesh": state.show_mesh,
         "show_hud": state.show_hud,
-        "source": cfg.stream_source,
+        # Redacted: this endpoint is unauthenticated, so the camera password
+        # must not be in it. /api/source accepts the real URL, never returns it.
+        "source": redact_credentials(cfg.stream_source),
         "output_dir": cfg.output_dir,
         "frame_size": [int(frame.shape[1]), int(frame.shape[0])] if frame is not None else None,
         "settings": {
@@ -365,7 +367,7 @@ def set_source(payload: Dict[str, Any] = Body(...)):
         state.processor.update_source(src)
     else:
         state.start_processor()
-    return {"ok": True, "source": src}
+    return {"ok": True, "source": redact_credentials(src)}
 
 
 @app.post("/api/capture/toggle")

@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Callable, Dict, Any, List, Tuple
 import numpy as np
 
-from config import AppConfig
+from config import AppConfig, redact_credentials
 from analyzer import PersonQualityAnalyzer, AnalysisResult
 from ai_judge import AIJudge, JudgeResult
 
@@ -234,7 +234,8 @@ class StreamProcessor:
             cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
             
         if not cap.isOpened():
-            print(f"[StreamProcessor] Error: Failed to open video source: '{source}'")
+            print("[StreamProcessor] Error: Failed to open video source: "
+                  f"'{redact_credentials(source)}'")
             return None
             
         # Minimal buffer size to ensure zero frame delay

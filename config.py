@@ -1,4 +1,5 @@
 import os
+import re
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional
@@ -28,6 +29,23 @@ def _load_dotenv():
         print(f"[config] Could not read .env: {e}")
 
 _load_dotenv()
+
+def redact_credentials(url: str) -> str:
+    """Masks the user:password in a stream URL.
+
+    Camera credentials must not leave this process in readable form. The web UI
+    has no authentication, so anything in an API response or a log line is
+    readable by anyone who can reach the port or open the app's logs. Every path
+    that reports a stream source goes through here.
+    """
+    return re.sub(r"://[^@/]+@", "://***@", url or "")
+
+
+def is_redacted(url: str) -> bool:
+    """True if this came back from redact_credentials and must not be reused as
+    an actual source -- connecting with '***' as the password just fails."""
+    return "://***@" in (url or "")
+
 
 def _default_stream_source() -> str:
     """Stream source from TG_STREAM_SOURCE, else webcam 0.
@@ -242,7 +260,7 @@ class AppConfig:
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "stream_source": self.stream_source,
+            "stream_source": redact_credentials(self.stream_source),
             "analysis_fps": self.analysis_fps,
             "burst_window_seconds": self.burst_window_seconds,
             "cooldown_seconds": self.cooldown_seconds,
