@@ -129,6 +129,43 @@ class TestRetention(unittest.TestCase):
                          "Video scan captures must not be deleted by live pruning")
         self.assertTrue(os.path.exists(scan_cap.filepath))
 
+    def test_pinned_captures_protected_from_deletion_and_do_not_consume_rolling_slots(self):
+        """Pinned captures are never deleted by prune_to_best_n and don't block the N rolling slots."""
+        self.cfg.max_retained_captures = 3
+
+        # Capture 3 shots and pin the weakest one (0.65)
+        c1 = _capture(self.cfg, 0.80, 100.0)
+        c2 = _capture(self.cfg, 0.75, 200.0)
+        c3 = _capture(self.cfg, 0.65, 300.0)
+        self.proc.saved_captures.extend([c1, c2, c3])
+
+        state = self.proc.set_capture_pinned(c3.filepath, True)
+        self.assertTrue(state)
+        self.assertTrue(c3.is_pinned)
+
+        # Because c3 is pinned, only 2 unpinned rolling slots are used (out of 3),
+        # so a new 0.60 shot should still be accepted!
+        self.assertTrue(self.proc._would_improve_retained(0.60, 400.0))
+
+        # Add 3 stronger shots (0.90, 0.88, 0.85) and prune to top 3
+        for i, s in enumerate([0.90, 0.88, 0.85]):
+            self.proc.saved_captures.append(_capture(self.cfg, s, 500.0 + i * 100.0))
+        self.proc.prune_to_best_n(self.cfg.max_retained_captures)
+
+        # Should have 3 unpinned winners (0.90, 0.88, 0.85) PLUS the 1 pinned shot (0.65) = 4 total
+        self.assertEqual(len(self.proc.saved_captures), 4)
+        self.assertIn(c3, self.proc.saved_captures)
+        self.assertTrue(os.path.exists(c3.filepath), "Pinned file must still exist on disk")
+        self.assertFalse(os.path.exists(c1.filepath), "Unpinned displaced shot must be deleted from disk")
+
+    def test_adjustable_max_retained_captures(self):
+        """Operator can increase or decrease max_retained_captures (e.g., to 8 instead of 5)."""
+        self.cfg.max_retained_captures = 8
+        for i in range(10):
+            self.proc.saved_captures.append(_capture(self.cfg, 0.90 - i * 0.02, i * 50.0))
+        self.proc.prune_to_best_n(self.cfg.max_retained_captures)
+        self.assertEqual(len(self.proc.saved_captures), 8)
+
 
 class TestJudgeBlending(unittest.TestCase):
     """The judge must refine, never block: any failure leaves the heuristic score."""

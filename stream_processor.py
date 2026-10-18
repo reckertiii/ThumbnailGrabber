@@ -26,6 +26,7 @@ class CapturedScreenshot:
     judge_issues: List[str] = field(default_factory=list)
     is_prop_moment: bool = False          # True when speaker is holding/presenting a stage prop
     from_video_scan: bool = False         # True when produced by the offline video scanner
+    is_pinned: bool = False               # True when flagged/locked by operator to protect from auto-deletion
 
 
 def subject_crop_rect(analysis: AnalysisResult, frame_w: int, frame_h: int,
@@ -598,7 +599,10 @@ class StreamProcessor:
             return True
         n = max(1, self.config.max_retained_captures)
         with getattr(self, "captures_lock", contextlib.nullcontext()):
-            kept = [c for c in self.saved_captures if not getattr(c, "from_video_scan", False)]
+            kept = [
+                c for c in self.saved_captures
+                if not getattr(c, "from_video_scan", False) and not getattr(c, "is_pinned", False)
+            ]
         if len(kept) < n:
             return True
 
@@ -815,6 +819,20 @@ class StreamProcessor:
                 self.captures_count = len([c for c in keep if not getattr(c, "from_video_scan", False)])
         return removed
 
+    def set_capture_pinned(self, filepath: str, pinned: Optional[bool] = None) -> Optional[bool]:
+        """Pins or unpins a capture so it is protected from auto-deletion when pruning to Top N."""
+        target_name = os.path.basename(filepath)
+        new_state: Optional[bool] = None
+        with getattr(self, "captures_lock", contextlib.nullcontext()):
+            for c in self.saved_captures:
+                if c.filepath == filepath or os.path.basename(c.filepath) == target_name:
+                    new_state = (not getattr(c, "is_pinned", False)) if pinned is None else bool(pinned)
+                    c.is_pinned = new_state
+                    break
+            if new_state is False and self.config.single_winner_mode:
+                self.prune_to_best_n(self.config.max_retained_captures)
+        return new_state
+
     def save_screenshot(self, frame: np.ndarray, analysis: AnalysisResult,
                         review: Optional[JudgeResult] = None,
                         captured_at: Optional[float] = None) -> CapturedScreenshot:
@@ -872,14 +890,24 @@ class StreamProcessor:
         return capture_item
 
     def prune_to_best_n(self, n: int = 1):
-        """Analyzes all captures, keeps the top N highest-scoring screenshots, and deletes inferior candidate files from disk."""
+        """Analyzes all captures, keeps the top N highest-scoring screenshots (plus any pinned shots), and deletes inferior candidate files from disk."""
         with getattr(self, "captures_lock", contextlib.nullcontext()):
             if not self.saved_captures:
                 return
 
             scan_items = [c for c in self.saved_captures if getattr(c, "from_video_scan", False)]
-            live_items = [c for c in self.saved_captures if not getattr(c, "from_video_scan", False)]
+            pinned_items = [
+                c for c in self.saved_captures
+                if not getattr(c, "from_video_scan", False) and getattr(c, "is_pinned", False)
+            ]
+            live_items = [
+                c for c in self.saved_captures
+                if not getattr(c, "from_video_scan", False) and not getattr(c, "is_pinned", False)
+            ]
             if not live_items:
+                kept_live = sorted(pinned_items, key=lambda item: item.overall_score, reverse=True)
+                self.saved_captures = kept_live + scan_items
+                self.captures_count = len(kept_live)
                 return
 
             # Best first, but five shots from the same ten seconds are one shot with
@@ -918,9 +946,9 @@ class StreamProcessor:
                         continue
                     winners.append(c)
             losers = [c for c in ordered if c not in winners]
-            winners.sort(key=lambda item: item.overall_score, reverse=True)
+            kept_live = sorted(pinned_items + winners, key=lambda item: item.overall_score, reverse=True)
             
-            # Delete inferior screenshot files from disk
+            # Delete inferior screenshot files from disk (pinned shots are never in losers)
             for loser in losers:
                 # Remove the companion subject crop alongside the full frame, otherwise
                 # pruning leaves orphaned crops of shots that were deleted.
@@ -932,9 +960,9 @@ class StreamProcessor:
                         except Exception as e:
                             print(f"[StreamProcessor] Error deleting file {path}: {e}")
 
-            self.saved_captures = winners + scan_items
-            self.captures_count = len(winners)
+            self.saved_captures = kept_live + scan_items
+            self.captures_count = len(kept_live)
 
         # Notify callback with the champion winner
-        if winners and self.on_capture_callback:
-            self.on_capture_callback(winners[0])
+        if kept_live and self.on_capture_callback:
+            self.on_capture_callback(kept_live[0])

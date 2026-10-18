@@ -201,15 +201,18 @@ class ThumbnailCard(QFrame):
     def __init__(self, capture: CapturedScreenshot, rank: int,
                  on_click_callback: Callable[[CapturedScreenshot], None],
                  on_favorite_callback: Optional[Callable[[CapturedScreenshot], None]] = None,
-                 on_reject_callback: Optional[Callable[[CapturedScreenshot], None]] = None):
+                 on_reject_callback: Optional[Callable[[CapturedScreenshot], None]] = None,
+                 on_pin_callback: Optional[Callable[[CapturedScreenshot], None]] = None):
         super().__init__()
         self.capture = capture
         self.on_click_callback = on_click_callback
         self.on_favorite_callback = on_favorite_callback
         self.on_reject_callback = on_reject_callback
-        
+        self.on_pin_callback = on_pin_callback
+
+        is_pinned = bool(getattr(capture, "is_pinned", False))
         self.setFrameShape(QFrame.Shape.StyledPanel)
-        rank_border = "#eab308" if rank == 1 else "#38bdf8"
+        rank_border = "#eab308" if rank == 1 else ("#0ea5e9" if is_pinned else "#38bdf8")
         self.setStyleSheet(f"""
             QFrame {{
                 background-color: #1e293b;
@@ -222,7 +225,7 @@ class ThumbnailCard(QFrame):
                 background-color: #334155;
             }}
         """)
-        self.setFixedWidth(145)
+        self.setFixedWidth(165)
         
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -230,39 +233,51 @@ class ThumbnailCard(QFrame):
         
         # Image label
         img_label = QLabel()
-        img_label.setFixedSize(135, 75)
+        img_label.setFixedSize(155, 84)
         img_label.setStyleSheet("border-radius: 4px;")
         pixmap = QPixmap(capture.filepath)
         if not pixmap.isNull():
-            img_label.setPixmap(pixmap.scaled(135, 75, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation))
+            img_label.setPixmap(pixmap.scaled(155, 84, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation))
         layout.addWidget(img_label)
         
         # Rank & Score label
         score_pct = int(capture.overall_score * 100)
-        rank_badge = f"<span style='color: #f59e0b; font-weight: bold;'>🏆 Rank #{rank}</span>"
+        rank_badge = f"<span style='color: #f59e0b; font-weight: bold;'>🏆 #{rank}</span>"
         prop_tag = " | 🎭" if getattr(capture, "is_prop_moment", False) else ""
-        info_label = QLabel(f"{rank_badge} | <b>{score_pct}%</b>{prop_tag}")
+        pin_tag = " | <span style='color: #38bdf8; font-weight: bold;'>📌</span>" if is_pinned else ""
+        info_label = QLabel(f"{rank_badge} | <b>{score_pct}%</b>{prop_tag}{pin_tag}")
         info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(info_label)
         
-        # ML Feedback Training Buttons
+        # Pin + ML Feedback Training Buttons
         btn_bar = QHBoxLayout()
         btn_bar.setContentsMargins(0, 0, 0, 0)
         btn_bar.setSpacing(2)
+
+        btn_pin = QPushButton("📌 Saved" if is_pinned else "📌 Keep")
+        btn_pin.setToolTip("Protect this screenshot from auto-deletion when new Top-N shots arrive")
+        pin_bg = "#0369a1" if is_pinned else "#334155"
+        btn_pin.setStyleSheet(f"background-color: {pin_bg}; color: white; padding: 2px 4px; font-size: 10px; font-weight: bold; border-radius: 3px;")
+        btn_pin.clicked.connect(self._on_pin_click)
         
         btn_fav = QPushButton("⭐ Best")
-        btn_fav.setToolTip("Train AI: Mark this screenshot as a Favorite/Winner")
-        btn_fav.setStyleSheet("background-color: #15803d; color: white; padding: 2px 4px; font-size: 11px; font-weight: bold; border-radius: 3px;")
+        btn_fav.setToolTip("Train AI: Mark this screenshot as a Favorite/Winner & protect from deletion")
+        btn_fav.setStyleSheet("background-color: #15803d; color: white; padding: 2px 4px; font-size: 10px; font-weight: bold; border-radius: 3px;")
         btn_fav.clicked.connect(self._on_fav_click)
         
         btn_rej = QPushButton("👎 Bad")
         btn_rej.setToolTip("Train AI: Mark this shot as Bad / Inferior")
-        btn_rej.setStyleSheet("background-color: #991b1b; color: white; padding: 2px 4px; font-size: 11px; border-radius: 3px;")
+        btn_rej.setStyleSheet("background-color: #991b1b; color: white; padding: 2px 4px; font-size: 10px; border-radius: 3px;")
         btn_rej.clicked.connect(self._on_rej_click)
         
+        btn_bar.addWidget(btn_pin)
         btn_bar.addWidget(btn_fav)
         btn_bar.addWidget(btn_rej)
         layout.addLayout(btn_bar)
+
+    def _on_pin_click(self):
+        if self.on_pin_callback:
+            self.on_pin_callback(self.capture)
 
     def _on_fav_click(self):
         if self.on_favorite_callback:
@@ -759,9 +774,17 @@ class MainWindow(QMainWindow):
         self.chk_auto_capture.setChecked(False)
         self.chk_auto_capture.toggled.connect(self._on_toggle_auto_capture)
         
-        self.chk_single_winner = QCheckBox(f"🏆 Keep Top {self.config.max_retained_captures} Shots Only")
+        self.chk_single_winner = QCheckBox("🏆 Keep Top")
         self.chk_single_winner.setChecked(self.config.single_winner_mode)
         self.chk_single_winner.toggled.connect(self._on_toggle_single_winner)
+
+        self.spn_max_retained = QSpinBox()
+        self.spn_max_retained.setRange(1, 200)
+        self.spn_max_retained.setValue(int(self.config.max_retained_captures))
+        self.spn_max_retained.setSuffix(" Shots")
+        self.spn_max_retained.setToolTip("Number of top auto-captured shots to keep (pinned 📌 shots are always saved)")
+        self.spn_max_retained.setFixedWidth(92)
+        self.spn_max_retained.valueChanged.connect(self._on_max_retained_changed)
 
         self.chk_prop_moments = QCheckBox("🎭 Capture Stage Props")
         self.chk_prop_moments.setChecked(getattr(self.config, "capture_prop_moments", True))
@@ -775,6 +798,7 @@ class MainWindow(QMainWindow):
         hud_bar.addWidget(self.chk_hud)
         hud_bar.addWidget(self.chk_auto_capture)
         hud_bar.addWidget(self.chk_single_winner)
+        hud_bar.addWidget(self.spn_max_retained)
         hud_bar.addWidget(self.chk_prop_moments)
         hud_bar.addStretch()
         hud_bar.addWidget(btn_manual_capture)
@@ -1052,8 +1076,19 @@ class MainWindow(QMainWindow):
 
     def _on_toggle_single_winner(self, checked: bool):
         self.config.single_winner_mode = checked
-        if checked and self.processor:
-            self.processor.prune_to_best_n(self.config.max_retained_captures)
+        if self.processor:
+            self.processor.config.single_winner_mode = checked
+            if checked:
+                self.processor.prune_to_best_n(self.config.max_retained_captures)
+            self._refresh_gallery_display()
+
+    def _on_max_retained_changed(self, val: int):
+        n = max(1, min(200, int(val)))
+        self.config.max_retained_captures = n
+        if self.processor:
+            self.processor.config.max_retained_captures = n
+            if self.config.single_winner_mode:
+                self.processor.prune_to_best_n(n)
             self._refresh_gallery_display()
 
     def _on_toggle_prop_moments(self, checked: bool):
@@ -1076,14 +1111,21 @@ class MainWindow(QMainWindow):
             # Sort captures by score descending
             captures = sorted(self.processor.saved_captures, key=lambda c: c.overall_score, reverse=True)
             if self.config.single_winner_mode:
-                captures = captures[:self.config.max_retained_captures]
+                pinned_or_scan = [c for c in captures if getattr(c, "is_pinned", False) or getattr(c, "from_video_scan", False)]
+                unpinned_live = [c for c in captures if not getattr(c, "is_pinned", False) and not getattr(c, "from_video_scan", False)]
+                captures = sorted(
+                    pinned_or_scan + unpinned_live[:self.config.max_retained_captures],
+                    key=lambda c: c.overall_score,
+                    reverse=True,
+                )
                 
             for idx, cap in enumerate(captures):
                 card = ThumbnailCard(
                     cap, rank=idx+1, 
                     on_click_callback=self._on_thumbnail_clicked,
                     on_favorite_callback=self._on_card_favorite,
-                    on_reject_callback=self._on_card_reject
+                    on_reject_callback=self._on_card_reject,
+                    on_pin_callback=self._on_card_pin
                 )
                 self.gallery_layout.insertWidget(idx, card)
                 
@@ -1156,15 +1198,26 @@ class MainWindow(QMainWindow):
             else:
                 self.processor.analyzer.selected_person_ids.discard(person_id)
 
+    def _on_card_pin(self, capture: CapturedScreenshot):
+        """User clicked 📌 Keep / 📌 Saved on a thumbnail card -> toggle deletion protection."""
+        if self.processor:
+            self.processor.set_capture_pinned(capture.filepath, None)
+        else:
+            capture.is_pinned = not getattr(capture, "is_pinned", False)
+        self._refresh_gallery_display()
+
     def _on_card_favorite(self, capture: CapturedScreenshot):
-        """User clicked ⭐ Best on a thumbnail card -> train Scikit-Learn preference model."""
+        """User clicked ⭐ Best on a thumbnail card -> train Scikit-Learn preference model and pin."""
+        capture.is_pinned = True
         if self.processor and self.processor.analyzer:
             self.processor.analyzer.preference_model.add_sample(capture.analysis, is_favorite=True)
             pm = self.processor.analyzer.preference_model
+            self._refresh_gallery_display()
             QMessageBox.information(
                 self, "AI Model Trained ⭐",
-                f"Trained AI Preference Model!\n\n"
+                f"Trained AI Preference Model & Pinned Shot!\n\n"
                 f"• Learned that this shot is a Favorite Winner.\n"
+                f"• Flagged (📌 Saved) so it will not be auto-deleted.\n"
                 f"• Total Training Samples: {len(pm.samples)}\n"
                 f"• Scikit-Learn Model Fit: {pm.confidence * 100:.0f}%\n\n"
                 f"The AI will now prioritize shots with similar features!"

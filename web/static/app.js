@@ -141,6 +141,9 @@ function render(d) {
   if (!holding.has("sldBurst")) { $("sldBurst").value = Math.round(s.burst_window * 10); $("outBurst").textContent = s.burst_window.toFixed(1) + "s"; }
   if (document.activeElement !== $("numPeople")) $("numPeople").value = s.people_target;
   $("outPeople").textContent = s.people_target === 1 ? "person" : "people";
+  if ($("numRetained") && document.activeElement !== $("numRetained") && s.max_retained != null) {
+    $("numRetained").value = s.max_retained;
+  }
 
   renderPeople(d.selected_people || [], s.people_target || 1);
 
@@ -228,7 +231,7 @@ function renderGallery(caps) {
   g.innerHTML = "";
   caps.forEach((c) => {
     const card = document.createElement("div");
-    card.className = "thumb" + (c.rank === 1 ? " rank1" : "");
+    card.className = "thumb" + (c.rank === 1 ? " rank1" : "") + (c.is_pinned ? " pinned" : "");
 
     const img = document.createElement("img");
     img.src = c.url;
@@ -238,20 +241,33 @@ function renderGallery(caps) {
     const info = document.createElement("div");
     info.className = "thumb-info";
     const propBadge = c.is_prop_moment ? ` · <span title="Candid stage prop moment">🎭 Prop</span>` : "";
-    info.innerHTML = `<span class="rank-badge">🏆 #${c.rank}</span> | <b>${Math.round(c.score * 100)}%</b>${propBadge}`;
+    const pinBadge = c.is_pinned ? ` · <span class="pin-badge" title="Protected from auto-deletion">📌 Saved</span>` : "";
+    info.innerHTML = `<span class="rank-badge">🏆 #${c.rank}</span> | <b>${Math.round(c.score * 100)}%</b>${propBadge}${pinBadge}`;
 
     const btns = document.createElement("div");
     btns.className = "thumb-btns";
+
+    const pin = document.createElement("button");
+    pin.className = "btn-pin" + (c.is_pinned ? " on" : "");
+    pin.textContent = c.is_pinned ? "📌 Saved" : "📌 Keep";
+    pin.title = c.is_pinned
+      ? "Protected from auto-deletion (click to unpin)"
+      : "Flag this shot so it is never deleted when new Top-5 shots arrive";
+    pin.onclick = () => pinCapture(c.filename);
+
     const fav = document.createElement("button");
     fav.className = "btn-fav";
     fav.textContent = "⭐ Best";
+    fav.title = "Train AI as a winner and protect from deletion";
     fav.onclick = () => feedback(c.filename, true);
+
     const rej = document.createElement("button");
     rej.className = "btn-rej";
     rej.textContent = "👎 Bad…";
     rej.title = "Explain why this photo is bad so the AI learns to reject shots like it";
     rej.onclick = () => openLightbox(c, true);
-    btns.append(fav, rej);
+
+    btns.append(pin, fav, rej);
 
     card.append(img, info, btns);
     g.appendChild(card);
@@ -259,6 +275,32 @@ function renderGallery(caps) {
 }
 
 let currentLightboxCapture = null;
+
+async function pinCapture(filename, desired = null) {
+  try {
+    const body = desired === null ? {} : { pinned: !!desired };
+    const r = await post(`/api/captures/${encodeURIComponent(filename)}/pin`, body);
+    if (r.captures) {
+      renderGallery(r.captures);
+    }
+    if (currentLightboxCapture && currentLightboxCapture.filename === filename) {
+      currentLightboxCapture.is_pinned = r.is_pinned;
+      syncLightboxPinButton(r.is_pinned);
+    }
+    toast(r.is_pinned
+      ? "📌 Flagged & protected — this photo will never be auto-deleted"
+      : "📌 Unpinned — returned to normal Top-5 rotation");
+  } catch (e) {
+    toast("Pin failed: " + e.message);
+  }
+}
+
+function syncLightboxPinButton(pinned) {
+  const btn = $("lbBtnPin");
+  if (!btn) return;
+  btn.textContent = pinned ? "📌 Saved (Protected)" : "📌 Keep (Protect)";
+  btn.classList.toggle("on", !!pinned);
+}
 
 async function feedback(filename, favorite, opts = {}) {
   try {
@@ -275,7 +317,7 @@ async function feedback(filename, favorite, opts = {}) {
     const rulesPart = r.notes_count ? ` · ${r.notes_count} comment rule${r.notes_count === 1 ? "" : "s"} active` : "";
     const accPart = r.confidence ? `, ${Math.round(r.confidence * 100)}% accuracy` : "";
     toast(
-      `${favorite ? "⭐ Learned as a winner" : (r.removed ? "👎 Learned & deleted bad shot" : "👎 Learned to penalize")}`
+      `${favorite ? "⭐ Learned as winner & pinned safe" : (r.removed ? "👎 Learned & deleted bad shot" : "👎 Learned to penalize")}`
       + ` — ${r.samples} ratings${accPart}${rulesPart}`
     );
   } catch (e) {
@@ -292,8 +334,9 @@ function openLightbox(c, focusBad = false) {
   currentLightboxCapture = c;
   $("lbImg").src = c.url;
   const shoulder = c.shoulder_detected ? `${c.shoulder_tilt}°` : "headshot / out of frame";
+  const pinLine = c.is_pinned ? " · <b>📌 Protected from auto-deletion</b>" : "";
   $("lbInfo").innerHTML = `
-    <b>Score:</b> ${Math.round(c.score * 100)}%${c.is_prop_moment ? " (🎭 Candid Stage Prop Moment)" : ""}<br>
+    <b>Score:</b> ${Math.round(c.score * 100)}%${c.is_prop_moment ? " (🎭 Candid Stage Prop Moment)" : ""}${pinLine}<br>
     <b>Head yaw:</b> ${c.yaw}°<br>
     <b>Shoulder tilt:</b> ${shoulder}<br>
     <b>Eye aspect ratio:</b> ${c.avg_ear}<br>
@@ -307,6 +350,8 @@ function openLightbox(c, focusBad = false) {
       : "") + `
     <b>File:</b> ${c.filename}` +
     (c.crop_url ? `<br><a href="${c.crop_url}" target="_blank" rel="noopener">Open subject crop ↗</a>` : "");
+
+  syncLightboxPinButton(!!c.is_pinned);
 
   // Reset and pre-highlight any reason chips that match AI judge issues
   const issueBlob = ((c.judge_issues || []).join(" ") + " " + (c.judge_summary || "")).toLowerCase();
@@ -403,6 +448,15 @@ $("chkAuto").onchange = (e) => post("/api/capture/toggle", { enabled: e.target.c
 $("chkMesh").onchange = (e) => post("/api/view", { show_mesh: e.target.checked }).catch(() => {});
 $("chkHud").onchange = (e) => post("/api/view", { show_hud: e.target.checked }).catch(() => {});
 $("chkWinner").onchange = (e) => post("/api/view", { single_winner: e.target.checked }).catch(() => {});
+if ($("numRetained")) {
+  $("numRetained").onchange = (e) => {
+    const val = Math.max(1, Math.min(200, parseInt(e.target.value, 10) || 5));
+    e.target.value = val;
+    post("/api/settings", { max_retained: val })
+      .then(() => toast(`🏆 Keeping top ${val} rolling shot${val === 1 ? "" : "s"} (plus any 📌 Saved shots)`))
+      .catch((err) => toast(err.message));
+  };
+}
 if ($("chkProps")) {
   $("chkProps").onchange = (e) => post("/api/view", { capture_prop_moments: e.target.checked }).catch((err) => toast(err.message));
 }
@@ -716,6 +770,12 @@ async function submitLightboxFeedback(favorite) {
   await feedback(filename, favorite, { comment, reasons, remove });
 }
 
+if ($("lbBtnPin")) {
+  $("lbBtnPin").onclick = () => {
+    if (!currentLightboxCapture) return;
+    pinCapture(currentLightboxCapture.filename);
+  };
+}
 if ($("lbBtnFav")) {
   $("lbBtnFav").onclick = () => submitLightboxFeedback(true);
 }

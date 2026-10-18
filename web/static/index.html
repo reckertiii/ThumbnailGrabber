@@ -31,7 +31,11 @@
       <label class="chk"><input type="checkbox" id="chkMesh" checked> Show Face Mesh</label>
       <label class="chk"><input type="checkbox" id="chkHud" checked> Show Quality HUD</label>
       <label class="chk"><input type="checkbox" id="chkAuto"> Enable Auto-Capture</label>
-      <label class="chk"><input type="checkbox" id="chkWinner" checked> 🏆 Keep Top 5 Only</label>
+      <label class="chk"><input type="checkbox" id="chkWinner" checked> 🏆 Keep Top</label>
+      <input type="number" id="numRetained" min="1" max="200" value="5"
+             title="Number of best rolling shots to keep (📌 Saved shots are kept in addition to this)"
+             style="width:54px;padding:3px 6px">
+      <span class="chk" style="margin-left:-6px">Shots</span>
       <label class="chk"><input type="checkbox" id="chkProps" checked> 🎭 Capture Stage Props</label>
       <span class="spacer"></span>
       <span id="fps" class="muted">— fps</span>
@@ -261,6 +265,7 @@
       <div class="lb-feedback-actions">
         <label class="chk lb-remove-chk"><input type="checkbox" id="lbRemoveBad" checked> Delete photo when marking 👎 Bad</label>
         <span class="spacer"></span>
+        <button type="button" id="lbBtnPin" class="btn btn-pin-lg">📌 Keep</button>
         <button type="button" id="lbBtnFav" class="btn btn-fav-lg">⭐ Best Shot</button>
         <button type="button" id="lbBtnBad" class="btn btn-rej-lg">👎 Bad Shot — Teach AI</button>
         <button type="button" id="lbClose" class="btn">Close</button>

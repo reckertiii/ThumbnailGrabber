@@ -193,6 +193,7 @@ def _telemetry() -> Dict[str, Any]:
             "burst_window": round(cfg.burst_window_seconds, 1),
             "cooldown": round(cfg.cooldown_seconds, 1),
             "people_target": cfg.max_people_target,
+            "max_retained": int(cfg.max_retained_captures),
         },
         "selected_people": sorted(proc.analyzer.selected_person_ids) if proc else [],
         "face_detected": False,
@@ -263,15 +264,26 @@ def _captures_payload() -> List[Dict[str, Any]]:
     if not proc:
         return []
     with getattr(proc, "captures_lock", threading.RLock()):
-        caps = sorted(proc.saved_captures, key=lambda c: c.overall_score, reverse=True)
+        all_caps = sorted(proc.saved_captures, key=lambda c: c.overall_score, reverse=True)
     if state.config.single_winner_mode:
-        caps = caps[:state.config.max_retained_captures]
+        unpinned_count = 0
+        limit = state.config.max_retained_captures
+        caps = []
+        for c in all_caps:
+            if getattr(c, "is_pinned", False) or getattr(c, "from_video_scan", False):
+                caps.append(c)
+            elif unpinned_count < limit:
+                caps.append(c)
+                unpinned_count += 1
+    else:
+        caps = all_caps
     out = []
     for idx, c in enumerate(caps):
         name = os.path.basename(c.filepath)
         rel = _rel_capture_path(c.filepath)
         a = c.analysis
         is_prop = bool(getattr(c, "is_prop_moment", False) or getattr(a, "is_prop_moment", False))
+        is_pinned = bool(getattr(c, "is_pinned", False))
         out.append({
             "rank": idx + 1,
             "filename": name,
@@ -285,6 +297,7 @@ def _captures_payload() -> List[Dict[str, Any]]:
             "judge_summary": getattr(c, "judge_summary", "") or "",
             "judge_issues": list(getattr(c, "judge_issues", []) or []),
             "is_prop_moment": is_prop,
+            "is_pinned": is_pinned,
             "yaw": round(float(a.yaw_deg), 1),
             "shoulder_tilt": round(float(a.shoulder_tilt_deg), 1),
             "shoulder_detected": bool(a.shoulder_detected),
@@ -372,7 +385,13 @@ async def telemetry_socket(ws: WebSocket):
             if proc:
                 with getattr(proc, "captures_lock", threading.RLock()):
                     sig = tuple(
-                        (c.filepath, round(float(c.overall_score), 3), c.judge_score, getattr(c, "is_prop_moment", False))
+                        (
+                            c.filepath,
+                            round(float(c.overall_score), 3),
+                            c.judge_score,
+                            getattr(c, "is_prop_moment", False),
+                            getattr(c, "is_pinned", False),
+                        )
                         for c in proc.saved_captures
                     )
             else:
@@ -619,6 +638,13 @@ def update_settings(payload: Dict[str, Any] = Body(...)):
         cfg.max_people_target = val
         if state.processor:
             state.processor.analyzer.max_people_target = val
+    if "max_retained" in payload:
+        val = max(1, min(200, int(payload["max_retained"])))
+        cfg.max_retained_captures = val
+        if state.processor:
+            state.processor.config.max_retained_captures = val
+            if cfg.single_winner_mode:
+                state.processor.prune_to_best_n(val)
     return {"ok": True}
 
 
@@ -632,6 +658,13 @@ def update_view(payload: Dict[str, Any] = Body(...)):
         state.config.single_winner_mode = bool(payload["single_winner"])
         if state.config.single_winner_mode and state.processor:
             state.processor.prune_to_best_n(state.config.max_retained_captures)
+    if "max_retained" in payload:
+        val = max(1, min(200, int(payload["max_retained"])))
+        state.config.max_retained_captures = val
+        if state.processor:
+            state.processor.config.max_retained_captures = val
+            if state.config.single_winner_mode:
+                state.processor.prune_to_best_n(val)
     if "capture_prop_moments" in payload:
         val = bool(payload["capture_prop_moments"])
         state.config.capture_prop_moments = val
@@ -744,6 +777,9 @@ def capture_feedback(filename: str, payload: Dict[str, Any] = Body(...)):
     pm = proc.analyzer.preference_model
     pm.add_sample(cap.analysis, is_favorite=is_favorite, comment=comment, reasons=reasons)
 
+    if is_favorite:
+        cap.is_pinned = True
+
     removed = False
     if remove:
         removed = proc.remove_capture(cap.filepath)
@@ -753,6 +789,7 @@ def capture_feedback(filename: str, payload: Dict[str, Any] = Body(...)):
     return {
         "ok": True,
         "favorite": is_favorite,
+        "is_pinned": bool(getattr(cap, "is_pinned", False)) if not removed else False,
         "comment": comment,
         "reasons": reasons,
         "removed": removed,
@@ -760,6 +797,25 @@ def capture_feedback(filename: str, payload: Dict[str, Any] = Body(...)):
         "notes_count": len(getattr(pm, "feedback_notes", []) or []),
         "learned_penalties": dict(getattr(pm, "learned_penalties", {}) or {}),
         "confidence": round(float(pm.confidence), 3),
+        "captures": _captures_payload(),
+    }
+
+
+@app.post("/api/captures/{filename}/pin")
+def pin_capture(filename: str, payload: Dict[str, Any] = Body(default={})):
+    """Flags or unflags a capture so it is protected from auto-deletion when pruning to Top N."""
+    proc = state.processor
+    if not proc:
+        raise HTTPException(status_code=409, detail="Stream not running")
+    cap = _find_capture(filename)
+    desired = payload.get("pinned", None) if isinstance(payload, dict) else None
+    pinned = proc.set_capture_pinned(cap.filepath, None if desired is None else bool(desired))
+    if pinned is None:
+        raise HTTPException(status_code=404, detail="Capture not found")
+    return {
+        "ok": True,
+        "filename": os.path.basename(cap.filepath),
+        "is_pinned": pinned,
         "captures": _captures_payload(),
     }
 
