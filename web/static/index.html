@@ -128,7 +128,13 @@
 </main>
 
 <section class="gallery-wrap">
-  <h2>Captured Best Screenshots</h2>
+  <div class="gallery-header">
+    <h2>Captured Best Screenshots</h2>
+    <div class="gallery-actions">
+      <button id="btnClearUnpinned" class="btn btn-clear-service" title="Delete all unpinned shots from the gallery and output folder so you are ready for the next service (📌 Saved shots are kept)">🧹 Clear Top Shots (Keep Pinned)</button>
+      <button id="btnClearPinned" class="btn btn-clear-pinned" title="Delete all 📌 Saved (pinned) shots from the gallery and output folder">🗑️ Delete Pinned Shots</button>
+    </div>
+  </div>
   <div id="gallery" class="gallery"><p class="muted">No captures yet — press Start Capture.</p></div>
 </section>
 

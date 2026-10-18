@@ -820,6 +820,27 @@ def pin_capture(filename: str, payload: Dict[str, Any] = Body(default={})):
     }
 
 
+@app.post("/api/captures/clear")
+def clear_captures_endpoint(payload: Dict[str, Any] = Body(default={})):
+    """Clears unpinned top shots (to reset between services while keeping 📌 Saved shots) or deletes pinned shots."""
+    proc = state.processor
+    if not proc:
+        raise HTTPException(status_code=409, detail="Stream not running")
+    mode = str((payload or {}).get("mode", "unpinned") or "unpinned").strip().lower()
+    if mode not in ("unpinned", "pinned", "all"):
+        raise HTTPException(status_code=400, detail="mode must be 'unpinned', 'pinned', or 'all'")
+    summary = proc.clear_captures(mode=mode)
+    if state.scan_results:
+        kept_paths = {c.filepath for c in proc.saved_captures}
+        state.scan_results = [r for r in state.scan_results if r.filepath in kept_paths]
+    return {
+        "ok": True,
+        "mode": mode,
+        **summary,
+        "captures": _captures_payload(),
+    }
+
+
 @app.get("/captures/{filename:path}")
 def get_capture_image(filename: str):
     # Resolve against the output dir and refuse anything that escapes it

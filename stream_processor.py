@@ -833,6 +833,96 @@ class StreamProcessor:
                 self.prune_to_best_n(self.config.max_retained_captures)
         return new_state
 
+    def clear_captures(self, mode: str = "unpinned") -> Dict[str, int]:
+        """Clears captures from memory and deletes their files from the output folder.
+
+        Modes:
+        - "unpinned": Deletes all unpinned captures (plus any leftover unpinned best_shot_* files
+                      in output_dir) so the system is clean and ready for the next service while
+                      preserving all 📌 Saved (pinned) shots.
+        - "pinned":   Deletes all 📌 Saved (pinned) captures from memory and disk.
+        - "all":      Deletes all captures (both pinned and unpinned) from memory and disk.
+        """
+        mode = (mode or "unpinned").strip().lower()
+        deleted_count = 0
+        with getattr(self, "captures_lock", contextlib.nullcontext()):
+            keep: List[CapturedScreenshot] = []
+            to_delete: List[CapturedScreenshot] = []
+            for c in self.saved_captures:
+                pinned = bool(getattr(c, "is_pinned", False))
+                if mode == "unpinned":
+                    if pinned:
+                        keep.append(c)
+                    else:
+                        to_delete.append(c)
+                elif mode == "pinned":
+                    if pinned:
+                        to_delete.append(c)
+                    else:
+                        keep.append(c)
+                else:  # "all"
+                    to_delete.append(c)
+
+            for c in to_delete:
+                deleted_any = False
+                stem, ext = os.path.splitext(c.filepath)
+                legacy_crop = f"{stem}_subject{ext}" if stem and ext else None
+                for path in (c.filepath, c.crop_filepath, legacy_crop):
+                    if path and os.path.exists(path):
+                        try:
+                            os.remove(path)
+                            deleted_any = True
+                        except Exception as e:
+                            print(f"[StreamProcessor] Error deleting capture {path}: {e}")
+                if deleted_any or c.filepath:
+                    deleted_count += 1
+
+            # Also clean up any leftover unpinned best_shot_* files in output_dir when resetting
+            # for the next service ("unpinned" or "all"), while strictly protecting kept files.
+            if mode in ("unpinned", "all") and getattr(self, "config", None) and self.config.output_dir:
+                out_dir = self.config.output_dir
+                if os.path.isdir(out_dir):
+                    protected_names = set()
+                    for c in keep:
+                        if c.filepath:
+                            protected_names.add(os.path.basename(c.filepath))
+                            s, e = os.path.splitext(os.path.basename(c.filepath))
+                            protected_names.add(f"{s}_subject{e}")
+                        if c.crop_filepath:
+                            protected_names.add(os.path.basename(c.crop_filepath))
+                    try:
+                        for fname in os.listdir(out_dir):
+                            low = fname.lower()
+                            if fname in protected_names:
+                                continue
+                            if low.startswith("best_shot_") and low.endswith((".png", ".jpg", ".jpeg")):
+                                fpath = os.path.join(out_dir, fname)
+                                if os.path.isfile(fpath):
+                                    try:
+                                        os.remove(fpath)
+                                    except Exception:
+                                        pass
+                    except Exception:
+                        pass
+
+            self.saved_captures = keep
+            self.captures_count = len([c for c in keep if not getattr(c, "from_video_scan", False)])
+
+        if mode in ("unpinned", "all"):
+            if hasattr(self, "candidate_buffer") and self.candidate_buffer is not None:
+                self.candidate_buffer.clear()
+            if hasattr(self, "_review_lock") and hasattr(self, "_review_queue"):
+                with self._review_lock:
+                    self._review_queue.clear()
+            self.last_capture_time = 0.0
+
+        pinned_remaining = len([c for c in self.saved_captures if getattr(c, "is_pinned", False)])
+        return {
+            "deleted_count": deleted_count,
+            "remaining_count": len(self.saved_captures),
+            "pinned_remaining": pinned_remaining,
+        }
+
     def save_screenshot(self, frame: np.ndarray, analysis: AnalysisResult,
                         review: Optional[JudgeResult] = None,
                         captured_at: Optional[float] = None) -> CapturedScreenshot:

@@ -947,9 +947,27 @@ class MainWindow(QMainWindow):
 
         # 3. Bottom Captured Thumbnails Bar
         grp_gallery = QGroupBox("Captured Best Screenshots Gallery")
-        gallery_layout = QHBoxLayout(grp_gallery)
-        gallery_layout.setContentsMargins(8, 8, 8, 8)
-        
+        gallery_outer = QVBoxLayout(grp_gallery)
+        gallery_outer.setContentsMargins(8, 8, 8, 8)
+        gallery_outer.setSpacing(6)
+
+        gallery_toolbar = QHBoxLayout()
+        gallery_toolbar.addStretch()
+
+        self.btn_clear_unpinned = QPushButton("🧹 Clear Top Shots (Keep Pinned)")
+        self.btn_clear_unpinned.setToolTip("Delete all unpinned shots from the gallery and output folder so you are ready for the next service (📌 Saved shots are kept)")
+        self.btn_clear_unpinned.setStyleSheet("background-color: #0284c7; color: #ffffff; border: 1px solid #38bdf8; border-radius: 4px; padding: 4px 10px; font-size: 11px; font-weight: bold;")
+        self.btn_clear_unpinned.clicked.connect(self._on_clear_unpinned)
+        gallery_toolbar.addWidget(self.btn_clear_unpinned)
+
+        self.btn_clear_pinned = QPushButton("🗑️ Delete Pinned Shots")
+        self.btn_clear_pinned.setToolTip("Delete all 📌 Saved (pinned) shots from the gallery and output folder")
+        self.btn_clear_pinned.setStyleSheet("background-color: #7f1d1d; color: #fecaca; border: 1px solid #dc2626; border-radius: 4px; padding: 4px 10px; font-size: 11px; font-weight: bold;")
+        self.btn_clear_pinned.clicked.connect(self._on_clear_pinned)
+        gallery_toolbar.addWidget(self.btn_clear_pinned)
+
+        gallery_outer.addLayout(gallery_toolbar)
+
         self.scroll_gallery = QScrollArea()
         self.scroll_gallery.setWidgetResizable(True)
         self.scroll_gallery.setFixedHeight(140)
@@ -961,7 +979,7 @@ class MainWindow(QMainWindow):
         self.gallery_layout.addStretch()
         
         self.scroll_gallery.setWidget(self.gallery_widget)
-        gallery_layout.addWidget(self.scroll_gallery)
+        gallery_outer.addWidget(self.scroll_gallery)
         
         main_layout.addWidget(grp_gallery)
 
@@ -1205,6 +1223,37 @@ class MainWindow(QMainWindow):
         else:
             capture.is_pinned = not getattr(capture, "is_pinned", False)
         self._refresh_gallery_display()
+
+    def _on_clear_unpinned(self):
+        """Clear all unpinned captures from the gallery and output folder so we are ready for the next service."""
+        if not self.processor:
+            return
+        reply = QMessageBox.question(
+            self,
+            "🧹 Clear Top Shots (Next Service)",
+            "Delete all unpinned top shots from the gallery and output folder to get ready for the next service?\n\n"
+            "(Any 📌 Saved shots will be kept safe in the gallery and folder.)",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.processor.clear_captures(mode="unpinned")
+            self._refresh_gallery_display()
+
+    def _on_clear_pinned(self):
+        """Delete all 📌 Saved (pinned) captures from the gallery and output folder."""
+        if not self.processor:
+            return
+        reply = QMessageBox.question(
+            self,
+            "🗑️ Delete Pinned Shots",
+            "Delete all 📌 Saved (pinned) shots from the gallery and output folder?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.processor.clear_captures(mode="pinned")
+            self._refresh_gallery_display()
 
     def _on_card_favorite(self, capture: CapturedScreenshot):
         """User clicked ⭐ Best on a thumbnail card -> train Scikit-Learn preference model and pin."""

@@ -302,6 +302,35 @@ function syncLightboxPinButton(pinned) {
   btn.classList.toggle("on", !!pinned);
 }
 
+async function clearCaptures(mode) {
+  const isPinnedMode = mode === "pinned";
+  const promptMsg = isPinnedMode
+    ? "Delete all 📌 Saved (pinned) shots from the gallery and output folder?"
+    : "Clear all unpinned top shots from the gallery and output folder to get ready for the next service?\n\n(Any 📌 Saved shots will be kept safe.)";
+  if (!window.confirm(promptMsg)) return;
+  try {
+    const r = await post("/api/captures/clear", { mode });
+    if (r.captures) {
+      renderGallery(r.captures);
+    }
+    if (isPinnedMode) {
+      toast(`🗑️ Deleted ${r.deleted_count} pinned shot${r.deleted_count === 1 ? "" : "s"} from folder`);
+    } else {
+      const keptNote = r.pinned_remaining ? ` (${r.pinned_remaining} 📌 Saved kept)` : "";
+      toast(`🧹 Cleared ${r.deleted_count} unpinned shot${r.deleted_count === 1 ? "" : "s"} — ready for next service!${keptNote}`);
+    }
+  } catch (e) {
+    toast("Clear failed: " + e.message);
+  }
+}
+
+if ($("btnClearUnpinned")) {
+  $("btnClearUnpinned").onclick = () => clearCaptures("unpinned");
+}
+if ($("btnClearPinned")) {
+  $("btnClearPinned").onclick = () => clearCaptures("pinned");
+}
+
 async function feedback(filename, favorite, opts = {}) {
   try {
     const payload = {

@@ -166,6 +166,41 @@ class TestRetention(unittest.TestCase):
         self.proc.prune_to_best_n(self.cfg.max_retained_captures)
         self.assertEqual(len(self.proc.saved_captures), 8)
 
+    def test_clear_unpinned_vs_pinned_and_no_zoomed_subject_crop(self):
+        """Verify zoomed-in _subject crop is disabled by default, and clearing unpinned vs pinned works."""
+        import numpy as np
+        from stream_processor import write_capture
+
+        # 1. Default config should not write zoomed-in _subject crop
+        self.assertFalse(self.cfg.save_subject_crop)
+        frame = np.zeros((200, 300, 3), dtype=np.uint8)
+        a = AnalysisResult(face_detected=True, face_bbox=(80, 40, 60, 60))
+        full_path, crop_path = write_capture(frame, a, self.cfg.output_dir, "best_shot_test", self.cfg)
+        self.assertTrue(os.path.exists(full_path))
+        self.assertIsNone(crop_path, "Zoomed-in _subject crop must not be created by default")
+
+        # 2. Clear unpinned keeps pinned shots in memory and on disk, deleting unpinned ones
+        c_unpinned1 = _capture(self.cfg, 0.85, 100.0)
+        c_unpinned2 = _capture(self.cfg, 0.80, 200.0)
+        c_pinned = _capture(self.cfg, 0.78, 300.0)
+        c_pinned.is_pinned = True
+        self.proc.saved_captures = [c_unpinned1, c_unpinned2, c_pinned]
+
+        summary1 = self.proc.clear_captures(mode="unpinned")
+        self.assertEqual(summary1["deleted_count"], 2)
+        self.assertEqual(summary1["remaining_count"], 1)
+        self.assertEqual(summary1["pinned_remaining"], 1)
+        self.assertFalse(os.path.exists(c_unpinned1.filepath))
+        self.assertFalse(os.path.exists(c_unpinned2.filepath))
+        self.assertFalse(os.path.exists(full_path), "Leftover unpinned best_shot_* file in folder should also be cleaned")
+        self.assertTrue(os.path.exists(c_pinned.filepath), "Pinned file must be preserved on disk")
+
+        # 3. Separate 'pinned' clear deletes the pinned shots from memory and disk
+        summary2 = self.proc.clear_captures(mode="pinned")
+        self.assertEqual(summary2["deleted_count"], 1)
+        self.assertEqual(summary2["remaining_count"], 0)
+        self.assertFalse(os.path.exists(c_pinned.filepath), "Pinned file must be deleted when mode='pinned'")
+
 
 class TestJudgeBlending(unittest.TestCase):
     """The judge must refine, never block: any failure leaves the heuristic score."""

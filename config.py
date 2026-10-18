@@ -205,7 +205,7 @@ class AppConfig:
     # to cut — so PNG is the default despite the larger files.
     capture_format: str = "png"            # "png" (lossless) or "jpg"
     jpeg_quality: int = 95                 # Only used when capture_format is "jpg"
-    save_subject_crop: bool = True         # Also write a tight crop around the subject
+    save_subject_crop: bool = False        # Disabled: only save the full frame screenshot (no zoomed-in _subject crop)
     subject_crop_padding: float = 0.08     # Crop margin, as a fraction of subject size
     
     # Multi-Person Settings
