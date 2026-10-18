@@ -180,9 +180,13 @@ function render(d) {
       ? "✅ capturing"
       : (blockers.length ? `⏸ holding: ${blockers.slice(0, 2).join(" · ")}` : "⏸ holding");
     $("mStability").textContent = `Score: ${d.is_stable ? "🟢 Stable" : "🟡 Unstable"} · People detected: ${d.people_detected} · ${holdText}`;
+    const notesCount = d.ml_notes_count || 0;
+    const notesBadge = notesCount > 0 ? ` · ${notesCount} comment rule${notesCount === 1 ? "" : "s"} active` : "";
     $("mModel").textContent = d.ml_trained
-      ? `AI Model: Trained (${Math.round(d.ml_confidence * 100)}% balanced accuracy · ${d.ml_samples} ratings · ML score ${Math.round(d.ml_score * 100)}%)`
-      : "AI Model: Untrained — click ⭐ Best on a shot to train it";
+      ? `AI Model: Trained (${Math.round(d.ml_confidence * 100)}% balanced accuracy · ${d.ml_samples} ratings${notesBadge} · ML score ${Math.round(d.ml_score * 100)}%)`
+      : (notesCount > 0
+          ? `AI Model: Learning (${notesCount} comment rule${notesCount === 1 ? "" : "s"} active · ${d.ml_samples} ratings)`
+          : "AI Model: Untrained — click ⭐ Best or 👎 Bad on a shot to teach it");
   } else {
     ["mHead", "mEyes", "mExpr", "mShoulder", "mSharp", "mExposure", "mCentering", "mHand", "mStability"]
       .forEach((id) => { $(id).textContent = $(id).textContent.split(":")[0] + ": —"; });
@@ -229,7 +233,7 @@ function renderGallery(caps) {
     const img = document.createElement("img");
     img.src = c.url;
     img.alt = `Capture scoring ${Math.round(c.score * 100)} percent`;
-    img.onclick = () => openLightbox(c);
+    img.onclick = () => openLightbox(c, false);
 
     const info = document.createElement("div");
     info.className = "thumb-info";
@@ -244,8 +248,9 @@ function renderGallery(caps) {
     fav.onclick = () => feedback(c.filename, true);
     const rej = document.createElement("button");
     rej.className = "btn-rej";
-    rej.textContent = "👎 Bad";
-    rej.onclick = () => feedback(c.filename, false);
+    rej.textContent = "👎 Bad…";
+    rej.title = "Explain why this photo is bad so the AI learns to reject shots like it";
+    rej.onclick = () => openLightbox(c, true);
     btns.append(fav, rej);
 
     card.append(img, info, btns);
@@ -253,16 +258,38 @@ function renderGallery(caps) {
   });
 }
 
-async function feedback(filename, favorite) {
+let currentLightboxCapture = null;
+
+async function feedback(filename, favorite, opts = {}) {
   try {
-    const r = await post(`/api/captures/${encodeURIComponent(filename)}/feedback`, { favorite });
-    toast(`${favorite ? "⭐ Learned as a winner" : "👎 Learned to penalize"} — ${r.samples} ratings` + (r.confidence ? `, ${Math.round(r.confidence * 100)}% balanced accuracy` : ", not enough ratings to train yet"));
+    const payload = {
+      favorite,
+      comment: opts.comment || "",
+      reasons: opts.reasons || [],
+      remove: !!opts.remove,
+    };
+    const r = await post(`/api/captures/${encodeURIComponent(filename)}/feedback`, payload);
+    if (r.captures) {
+      renderGallery(r.captures);
+    }
+    const rulesPart = r.notes_count ? ` · ${r.notes_count} comment rule${r.notes_count === 1 ? "" : "s"} active` : "";
+    const accPart = r.confidence ? `, ${Math.round(r.confidence * 100)}% accuracy` : "";
+    toast(
+      `${favorite ? "⭐ Learned as a winner" : (r.removed ? "👎 Learned & deleted bad shot" : "👎 Learned to penalize")}`
+      + ` — ${r.samples} ratings${accPart}${rulesPart}`
+    );
   } catch (e) {
     toast("Training failed: " + e.message);
   }
 }
 
-function openLightbox(c) {
+function getSelectedLightboxReasons() {
+  const chips = document.querySelectorAll("#lbReasonChips .reason-chip.selected");
+  return [...chips].map((el) => el.getAttribute("data-reason") || el.textContent.trim());
+}
+
+function openLightbox(c, focusBad = false) {
+  currentLightboxCapture = c;
   $("lbImg").src = c.url;
   const shoulder = c.shoulder_detected ? `${c.shoulder_tilt}°` : "headshot / out of frame";
   $("lbInfo").innerHTML = `
@@ -280,7 +307,30 @@ function openLightbox(c) {
       : "") + `
     <b>File:</b> ${c.filename}` +
     (c.crop_url ? `<br><a href="${c.crop_url}" target="_blank" rel="noopener">Open subject crop ↗</a>` : "");
+
+  // Reset and pre-highlight any reason chips that match AI judge issues
+  const issueBlob = ((c.judge_issues || []).join(" ") + " " + (c.judge_summary || "")).toLowerCase();
+  document.querySelectorAll("#lbReasonChips .reason-chip").forEach((chip) => {
+    const r = (chip.getAttribute("data-reason") || "").toLowerCase();
+    let autoSelect = false;
+    if (focusBad) {
+      if (r.includes("head bowed") && (issueBlob.includes("bowed") || issueBlob.includes("looking down") || issueBlob.includes("gaze"))) autoSelect = true;
+      if (r.includes("eyes") && (issueBlob.includes("eye") || issueBlob.includes("blink"))) autoSelect = true;
+      if (r.includes("mouth") && (issueBlob.includes("mouth") || issueBlob.includes("mid-word"))) autoSelect = true;
+      if (r.includes("mic") && (issueBlob.includes("microphone") || issueBlob.includes("hand"))) autoSelect = true;
+      if (r.includes("prop") && c.is_prop_moment) autoSelect = true;
+      if (r.includes("blur") && issueBlob.includes("blur")) autoSelect = true;
+    }
+    chip.classList.toggle("selected", autoSelect);
+  });
+
+  if ($("lbComment")) {
+    $("lbComment").value = "";
+  }
   $("lightbox").classList.remove("hidden");
+  if (focusBad && $("lbComment")) {
+    setTimeout(() => $("lbComment").focus(), 40);
+  }
 }
 
 // ---------------------------------------------------------------- websocket
@@ -651,6 +701,35 @@ $("btnJudgeSleep").onclick = async () => {
   try { const r = await post("/api/judge/sleep", {}); toast(r.status); }
   catch (e) { toast(e.message); }
 };
+
+document.querySelectorAll("#lbReasonChips .reason-chip").forEach((chip) => {
+  chip.onclick = () => chip.classList.toggle("selected");
+});
+
+async function submitLightboxFeedback(favorite) {
+  if (!currentLightboxCapture) return;
+  const comment = $("lbComment") ? $("lbComment").value.trim() : "";
+  const reasons = getSelectedLightboxReasons();
+  const remove = !favorite && $("lbRemoveBad") && $("lbRemoveBad").checked;
+  const filename = currentLightboxCapture.filename;
+  $("lightbox").classList.add("hidden");
+  await feedback(filename, favorite, { comment, reasons, remove });
+}
+
+if ($("lbBtnFav")) {
+  $("lbBtnFav").onclick = () => submitLightboxFeedback(true);
+}
+if ($("lbBtnBad")) {
+  $("lbBtnBad").onclick = () => submitLightboxFeedback(false);
+}
+if ($("lbComment")) {
+  $("lbComment").onkeydown = (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      submitLightboxFeedback(false);
+    }
+  };
+}
 
 $("lbClose").onclick = () => $("lightbox").classList.add("hidden");
 $("lightbox").onclick = (e) => { if (e.target.id === "lightbox") $("lightbox").classList.add("hidden"); };

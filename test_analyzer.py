@@ -446,12 +446,12 @@ class TestPersonQualityAnalyzer(unittest.TestCase):
         self.assertIsNotNone(self.analyzer.face_landmarker, "FaceLandmarker should be initialized")
 
     def test_stage_prop_detection_and_candid_relaxation(self):
-        """Test that holding a prop on stage triggers is_prop_moment, expands subject_bbox, and relaxes yaw/gaze/torso rules."""
+        """Test that holding a prop on stage triggers is_prop_moment only when head/eyes are engaged, and rejects bowed heads."""
         from analyzer import SingleFaceAnalysis
 
         # Synthetic 480x640 frame with a structured non-skin object held at chest/stage level
         frame = np.full((480, 640, 3), 30, dtype=np.uint8)
-        # Draw a bright, textured blue/white stage prop (e.g., book/object) around (360..460, 220..320)
+        # Draw a bright, textured blue/white stage prop (e.g., book/object) around (365..455, 225..315)
         cv2.rectangle(frame, (365, 225), (455, 315), (240, 180, 40), -1)
         for y in range(230, 310, 8):
             cv2.line(frame, (370, y), (450, y), (20, 20, 220), 2)
@@ -475,16 +475,17 @@ class TestPersonQualityAnalyzer(unittest.TestCase):
             expression_score=0.90,
             sharpness_score=0.90,
             exposure_score=0.95,
-            yaw_deg=35.0,       # Normally > 30° max_yaw_deg, but valid for candid prop moment (<= 40.5°)
-            pitch_deg=-22.0,    # Glancing down at prop
-            eye_look_down_score=0.35,
+            avg_ear=0.34,
+            yaw_deg=35.0,       # Normally > 30° max_yaw_deg, but valid for candid prop moment (<= 36.0°)
+            pitch_deg=-6.0,     # Head up and engaged
+            eye_look_down_score=0.20,
             is_looking_down=False,
         )
 
-        # 21-point hand skeleton positioned right next to the prop at chest height
+        # 21-point hand skeleton positioned right next to the prop at chest height (away from mic zone)
         hand_pts = [(360 + (i % 5) * 6, 250 + (i // 5) * 8) for i in range(21)]
         is_prop, prop_box = self.analyzer._detect_held_prop(frame, f_res, [hand_pts])
-        self.assertTrue(is_prop, "Should detect held stage prop near raised hand")
+        self.assertTrue(is_prop, "Should detect held stage prop near raised hand when head is up and engaged")
         self.assertIsNotNone(prop_box, "Should return a bounding box for the held prop")
 
         f_res.is_prop_moment = is_prop
@@ -498,10 +499,88 @@ class TestPersonQualityAnalyzer(unittest.TestCase):
         self.assertFalse(f_res.hands_on_torso,
                          "Holding a prop in front of the torso must not be flagged as hands_on_torso")
 
-        # Finalize score and verify yaw (35°) and gaze toward prop are accepted
+        # Finalize score and verify yaw (35°) is accepted when head is up
         self.analyzer._finalize_face_score(f_res)
         self.assertTrue(f_res.is_qualified,
-                        f"Prop moment with 35° yaw and gaze on prop should qualify, got: {f_res.disqualified_reasons}")
+                        f"Engaged prop moment with 35° yaw should qualify, got: {f_res.disqualified_reasons}")
+
+        # Verify that a bowed head (pitch=-22°) is strictly rejected even if a prop is present
+        f_bowed = SingleFaceAnalysis(
+            person_id=1,
+            bbox=(240, 80, 100, 120),
+            head_pose_score=0.60,
+            eye_openness_score=0.75,
+            expression_score=0.80,
+            sharpness_score=0.90,
+            exposure_score=0.90,
+            avg_ear=0.26,
+            pitch_deg=-22.0,
+            eye_look_down_score=0.58,
+            is_looking_down=True,
+        )
+        is_prop_bowed, _ = self.analyzer._detect_held_prop(frame, f_bowed, [hand_pts])
+        self.assertFalse(is_prop_bowed, "Must NOT trigger prop moment when speaker's head is bowed down")
+        f_bowed.is_prop_moment = True  # Even if forced true, _finalize_face_score must reject head down
+        self.analyzer._finalize_face_score(f_bowed)
+        self.assertFalse(f_bowed.is_qualified, "Bowed head must be disqualified even during a prop moment")
+        self.assertIn("head down", f_bowed.disqualified_reasons)
+
+    def test_comment_and_reason_driven_learning(self):
+        """Test that operator comments/reasons tighten learned penalties, feed AIJudge prompt, and clamp judge scores."""
+        import tempfile
+        from preference_model import UserPreferenceModel
+        from ai_judge import JudgeVerdict, _enforce_rubric_score
+
+        bad_shot = AnalysisResult(
+            yaw_deg=12.0, pitch_deg=-18.0, avg_ear=0.26, smile_ratio=0.19,
+            exposure_score=0.95, shoulder_tilt_deg=7.1, is_shoulders_level=True,
+            cutout_score=0.96, is_prop_moment=True,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            original_path = UserPreferenceModel.JSON_DATA_PATH
+            UserPreferenceModel.JSON_DATA_PATH = os.path.join(tmp, "prefs_comments.json")
+            try:
+                pm = UserPreferenceModel()
+                pm.add_sample(
+                    bad_shot,
+                    is_favorite=False,
+                    comment="Looking down into red box at bottom, holding microphone in front of mouth",
+                    reasons=["Head bowed / looking down", "Mic / hand blocking face", "Not a real prop / cut off"],
+                )
+
+                # Penalties should tighten immediately on the very first comment (no need to wait for 12 samples)
+                self.assertGreater(pm.learned_penalties["head_down"], 1.0)
+                self.assertGreater(pm.learned_penalties["mouth_open"], 1.0)
+                self.assertGreater(pm.learned_penalties["hand_obstruction"], 1.0)
+                self.assertGreater(pm.learned_penalties["prop_strictness"], 1.0)
+                self.assertEqual(len(pm.feedback_notes), 1)
+                self.assertGreater(len(pm.samples), 1, "Reason learning should synthesize targeted negative samples")
+
+                prompt_block = pm.get_judge_feedback_prompt()
+                self.assertIn("Looking down into red box", prompt_block)
+                self.assertIn("Head bowed / looking down", prompt_block)
+            finally:
+                UserPreferenceModel.JSON_DATA_PATH = original_path
+
+        # Verify _enforce_rubric_score clamps the exact failure mode from the user's screenshot:
+        # 2 moderate + 1 small flaw where the LLM hallucinated score=0.70 and holding_prop=True
+        v = JudgeVerdict(
+            issues=[
+                "Mouth open mid-word (moderate)",
+                "Head slightly bowed, gaze not engaged (moderate)",
+                "Hand holding microphone is slightly blurred (small)",
+            ],
+            strengths=["Sharp focus on face"],
+            score=0.70,
+            usable=True,
+            summary="Speaker is caught mid-word with a slightly bowed head.",
+            holding_prop=True,
+        )
+        enforced = _enforce_rubric_score(v)
+        self.assertLessEqual(enforced.score, 0.45, "Bowed head + 2 moderates + 1 small must be clamped <= 0.45")
+        self.assertFalse(enforced.holding_prop, "Bowed head / unengaged gaze must strip holding_prop")
 
 if __name__ == "__main__":
     unittest.main()
+

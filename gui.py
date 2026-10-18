@@ -1171,17 +1171,78 @@ class MainWindow(QMainWindow):
             )
             
     def _on_card_reject(self, capture: CapturedScreenshot):
-        """User clicked 👎 Bad on a thumbnail card -> train Scikit-Learn preference model."""
-        if self.processor and self.processor.analyzer:
-            self.processor.analyzer.preference_model.add_sample(capture.analysis, is_favorite=False)
-            pm = self.processor.analyzer.preference_model
-            QMessageBox.information(
-                self, "AI Model Trained 👎",
-                f"Trained AI Preference Model!\n\n"
-                f"• Learned to penalize shots with these features.\n"
-                f"• Total Training Samples: {len(pm.samples)}\n"
-                f"• Scikit-Learn Model Fit: {pm.confidence * 100:.0f}%\n"
-            )
+        """User clicked 👎 Bad on a thumbnail card -> prompt for reason/comment and train AI."""
+        if not (self.processor and self.processor.analyzer):
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("👎 Teach AI: Why is this photo bad?")
+        dlg.setMinimumWidth(460)
+        dlg.setStyleSheet(DARK_STYLE)
+        v_lay = QVBoxLayout(dlg)
+
+        lbl_intro = QLabel("Select any issues and/or add a comment so the heuristic scorer, ML model, and AI Judge learn to reject shots like this:")
+        lbl_intro.setWordWrap(True)
+        lbl_intro.setStyleSheet("color: #cbd5e1; font-size: 12px;")
+        v_lay.addWidget(lbl_intro)
+
+        reason_options = [
+            "Head bowed / looking down",
+            "Eyes closed / hidden",
+            "Mouth open / mid-word",
+            "Mic / hand blocking face",
+            "Not a real prop / cut off",
+            "Blurry / motion blur",
+        ]
+        reason_checks = []
+        for text in reason_options:
+            cb = QCheckBox(text)
+            if "prop" in text.lower() and getattr(capture, "is_prop_moment", False):
+                cb.setChecked(True)
+            v_lay.addWidget(cb)
+            reason_checks.append(cb)
+
+        txt_comment = QLineEdit()
+        txt_comment.setPlaceholderText("Optional comment (e.g. 'Looking down into box, mic covering mouth')...")
+        v_lay.addWidget(txt_comment)
+
+        chk_remove = QCheckBox("Delete this photo from gallery")
+        chk_remove.setChecked(True)
+        chk_remove.setStyleSheet("color: #f87171;")
+        v_lay.addWidget(chk_remove)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.clicked.connect(dlg.reject)
+        btn_submit = QPushButton("👎 Teach AI && Reject")
+        btn_submit.setStyleSheet("background-color: #991b1b; color: #fecaca; font-weight: bold;")
+        btn_submit.clicked.connect(dlg.accept)
+        btn_row.addWidget(btn_cancel)
+        btn_row.addWidget(btn_submit)
+        v_lay.addLayout(btn_row)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        selected_reasons = [cb.text() for cb in reason_checks if cb.isChecked()]
+        comment = txt_comment.text().strip()
+        pm = self.processor.analyzer.preference_model
+        pm.add_sample(capture.analysis, is_favorite=False, comment=comment, reasons=selected_reasons)
+
+        if chk_remove.isChecked():
+            self.processor.remove_capture(capture.filepath)
+            self._refresh_gallery_display()
+
+        QMessageBox.information(
+            self, "AI Model Trained 👎",
+            f"Trained AI Preference Model & Updated Rules!\n\n"
+            f"• Reasons recorded: {', '.join(selected_reasons) if selected_reasons else 'General rejection'}\n"
+            + (f"• Comment rule saved: \"{comment}\"\n" if comment else "")
+            + f"• Active comment rules: {len(pm.feedback_notes)}\n"
+            f"• Total Training Samples: {len(pm.samples)}\n"
+            f"• Scikit-Learn Model Fit: {pm.confidence * 100:.0f}%\n"
+        )
 
     def _on_min_score_changed(self, val: int):
         pct = val / 100.0

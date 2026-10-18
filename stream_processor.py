@@ -747,11 +747,27 @@ class StreamProcessor:
             if analysis.is_subject_clipped:
                 notes.append("subject runs off the frame edge")
 
-            result = self.judge.judge(crop, analysis.overall_score, notes)
+            pm = getattr(getattr(self, "analyzer", None), "preference_model", None)
+            fb_prompt = pm.get_judge_feedback_prompt() if pm is not None and hasattr(pm, "get_judge_feedback_prompt") else ""
+            if fb_prompt:
+                try:
+                    result = self.judge.judge(crop, analysis.overall_score, notes, user_feedback_prompt=fb_prompt)
+                except TypeError:
+                    result = self.judge.judge(crop, analysis.overall_score, notes)
+            else:
+                result = self.judge.judge(crop, analysis.overall_score, notes)
 
-            if result.verdict is not None and getattr(result.verdict, "holding_prop", False):
-                if getattr(self.config, "capture_prop_moments", True):
-                    analysis.is_prop_moment = True
+            if result.verdict is not None:
+                if getattr(result.verdict, "holding_prop", False):
+                    if getattr(self.config, "capture_prop_moments", True):
+                        analysis.is_prop_moment = True
+                else:
+                    issue_text = " ".join(result.verdict.issues or []).lower()
+                    if any(kw in issue_text for kw in (
+                        "head bowed", "head slightly bowed", "bowed down", "looking down",
+                        "gaze not engaged", "not engaged", "eyes closed", "microphone",
+                    )):
+                        analysis.is_prop_moment = False
 
             # "Unusable" is a hard no only once there is something better to keep. Early
             # in a service it is a heavy penalty instead, so a strict judge can never
@@ -776,6 +792,28 @@ class StreamProcessor:
             self.save_screenshot(frame, analysis, review=result, captured_at=actual_time)
         except Exception as e:  # noqa: BLE001 - a review failure must not kill the worker
             print(f"[AIJudge] Review failed for one candidate: {e}")
+
+    def remove_capture(self, filepath: str) -> bool:
+        """Removes a capture from `saved_captures` and deletes its files from disk."""
+        target_name = os.path.basename(filepath)
+        removed = False
+        with getattr(self, "captures_lock", contextlib.nullcontext()):
+            keep: List[CapturedScreenshot] = []
+            for c in self.saved_captures:
+                if c.filepath == filepath or os.path.basename(c.filepath) == target_name:
+                    removed = True
+                    for path in (c.filepath, c.crop_filepath):
+                        if path and os.path.exists(path):
+                            try:
+                                os.remove(path)
+                            except Exception as e:
+                                print(f"[StreamProcessor] Error deleting rejected capture {path}: {e}")
+                else:
+                    keep.append(c)
+            if removed:
+                self.saved_captures = keep
+                self.captures_count = len([c for c in keep if not getattr(c, "from_video_scan", False)])
+        return removed
 
     def save_screenshot(self, frame: np.ndarray, analysis: AnalysisResult,
                         review: Optional[JudgeResult] = None,

@@ -527,3 +527,92 @@ button:disabled {
   margin-top: 5px;
   font-size: 11px;
 }
+
+/* Lightbox AI Feedback & Comment Training */
+.lightbox-inner {
+  max-width: 720px;
+  width: 92vw;
+  max-height: 92vh;
+}
+.lightbox-inner img {
+  max-height: 46vh;
+}
+.lb-feedback {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px;
+  margin-top: 10px;
+  text-align: left;
+}
+.lb-feedback-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: #38bdf8;
+  margin-bottom: 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.reason-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.reason-chip {
+  background: #0f172a;
+  border: 1px solid #334155;
+  color: #cbd5e1;
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 11.5px;
+  cursor: pointer;
+  transition: all 0.12s ease;
+}
+.reason-chip:hover {
+  border-color: #64748b;
+  color: #fff;
+}
+.reason-chip.selected {
+  background: #7f1d1d;
+  border-color: #ef4444;
+  color: #fecaca;
+  font-weight: 600;
+}
+.lb-comment-input {
+  width: 100%;
+  background: #0f172a;
+  border: 1px solid #475569;
+  border-radius: 6px;
+  padding: 8px 10px;
+  color: var(--text);
+  font-size: 12.5px;
+  margin-bottom: 10px;
+}
+.lb-comment-input:focus {
+  outline: none;
+  border-color: #38bdf8;
+}
+.lb-feedback-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.lb-remove-chk {
+  font-size: 12px;
+  color: #94a3b8;
+}
+.btn-fav-lg {
+  background: #854d0e;
+  border-color: #ca8a04;
+  color: #fef08a;
+}
+.btn-fav-lg:hover { background: #a16207; }
+.btn-rej-lg {
+  background: #991b1b;
+  border-color: #dc2626;
+  color: #fecaca;
+}
+.btn-rej-lg:hover { background: #b91c1c; }
+

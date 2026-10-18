@@ -246,7 +246,26 @@
   <div class="lightbox-inner">
     <img id="lbImg" alt="Full size capture">
     <div id="lbInfo" class="lb-info"></div>
-    <button id="lbClose" class="btn">Close</button>
+    <div id="lbFeedbackPanel" class="lb-feedback">
+      <div class="lb-feedback-title">🧠 Teach AI: Why is this photo bad (or good)?</div>
+      <div id="lbReasonChips" class="reason-chips">
+        <button type="button" class="reason-chip" data-reason="Head bowed / looking down">Head bowed / looking down</button>
+        <button type="button" class="reason-chip" data-reason="Eyes closed / hidden">Eyes closed / hidden</button>
+        <button type="button" class="reason-chip" data-reason="Mouth open / mid-word">Mouth open / mid-word</button>
+        <button type="button" class="reason-chip" data-reason="Mic / hand blocking face">Mic / hand blocking face</button>
+        <button type="button" class="reason-chip" data-reason="Not a real prop / cut off">Not a real prop / cut off</button>
+        <button type="button" class="reason-chip" data-reason="Blurry / motion blur">Blurry / motion blur</button>
+      </div>
+      <input type="text" id="lbComment" class="lb-comment-input"
+             placeholder="Add a comment for the AI (e.g. 'Looking down into box, mic in front of mouth, not engaged')…">
+      <div class="lb-feedback-actions">
+        <label class="chk lb-remove-chk"><input type="checkbox" id="lbRemoveBad" checked> Delete photo when marking 👎 Bad</label>
+        <span class="spacer"></span>
+        <button type="button" id="lbBtnFav" class="btn btn-fav-lg">⭐ Best Shot</button>
+        <button type="button" id="lbBtnBad" class="btn btn-rej-lg">👎 Bad Shot — Teach AI</button>
+        <button type="button" id="lbClose" class="btn">Close</button>
+      </div>
+    </div>
   </div>
 </div>
 

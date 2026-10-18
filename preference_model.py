@@ -70,6 +70,15 @@ class UserPreferenceModel:
         "subject_height",       # 12: Subject height as a fraction of the frame
     ]
 
+    DEFAULT_PENALTIES: Dict[str, float] = {
+        "head_down": 1.0,
+        "eyes_closed": 1.0,
+        "mouth_open": 1.0,
+        "hand_obstruction": 1.0,
+        "prop_strictness": 1.0,
+        "blur": 1.0,
+    }
+
     def __init__(self):
         self.feature_count = len(self.FEATURE_NAMES)
         self.scaler = StandardScaler()
@@ -77,6 +86,8 @@ class UserPreferenceModel:
         
         # Training dataset: list of (feature_vector, label)
         self.samples: List[Tuple[List[float], int]] = []
+        self.feedback_notes: List[Dict[str, Any]] = []
+        self.learned_penalties: Dict[str, float] = dict(self.DEFAULT_PENALTIES)
         self.is_trained: bool = False
         self.confidence: float = 0.0
         
@@ -125,14 +136,126 @@ class UserPreferenceModel:
         except Exception:
             return 0.5
 
-    def add_sample(self, analysis, is_favorite: bool):
-        """Adds a human feedback sample (1 for Favorite, 0 for Reject) and retrains scikit-learn model."""
+    def add_sample(self, analysis, is_favorite: bool, comment: str = "",
+                   reasons: Optional[List[str]] = None):
+        """Adds a human feedback sample (1 for Favorite, 0 for Reject), optionally with
+        structured reason tags and a free-text comment explaining why, and retrains."""
         features = self.extract_features(analysis).tolist()
         label = 1 if is_favorite else 0
-        
         self.samples.append((features, label))
+
+        clean_comment = (comment or "").strip()
+        clean_reasons = [str(r).strip() for r in (reasons or []) if str(r).strip()]
+        if clean_comment or clean_reasons:
+            import time as _time
+            self.feedback_notes.append({
+                "timestamp": round(_time.time(), 1),
+                "favorite": bool(is_favorite),
+                "reasons": clean_reasons,
+                "comment": clean_comment,
+                "metrics": {
+                    "yaw_deg": round(float(getattr(analysis, "yaw_deg", 0.0)), 1),
+                    "pitch_deg": round(float(getattr(analysis, "pitch_deg", 0.0)), 1),
+                    "avg_ear": round(float(getattr(analysis, "avg_ear", 0.35)), 2),
+                    "mar": round(float(getattr(analysis, "mar", 0.2)), 2),
+                    "is_prop_moment": bool(getattr(analysis, "is_prop_moment", False)),
+                },
+            })
+            self.feedback_notes = self.feedback_notes[-50:]
+            self._apply_reason_learning(features, is_favorite, clean_comment, clean_reasons)
+
         self.fit()
         self.save()
+
+    def _apply_reason_learning(self, base_features: List[float], is_favorite: bool,
+                               comment: str, reasons: List[str]) -> None:
+        """Translates human feedback comments/tags into immediate penalty adjustments
+        and targeted feature-axis training examples so the model learns *why* a shot
+        failed without needing dozens of blind binary clicks."""
+        combined = (" ".join(reasons) + " " + comment).lower()
+        if not is_favorite:
+            synth = list(base_features)
+            matched_any = False
+
+            # 1. Bowed head / looking down / chin down / reading notes or box
+            if any(k in combined for k in ("head", "bow", "down", "chin", "gaze", "looking", "floor", "notes")):
+                self.learned_penalties["head_down"] = min(2.5, round(self.learned_penalties.get("head_down", 1.0) + 0.25, 2))
+                synth[1] = max(synth[1], 0.85)   # high head_pitch_norm
+                synth[2] = min(synth[2], 0.60)   # lower eye_openness
+                matched_any = True
+
+            # 2. Eyes closed / blinking / hidden behind glasses
+            if any(k in combined for k in ("eye", "blink", "closed", "squint", "glasses")):
+                self.learned_penalties["eyes_closed"] = min(2.5, round(self.learned_penalties.get("eyes_closed", 1.0) + 0.25, 2))
+                synth[2] = min(synth[2], 0.50)   # low eye_openness
+                matched_any = True
+
+            # 3. Mouth open mid-word / talking / awkward expression
+            if any(k in combined for k in ("mouth", "talk", "word", "open", "grimace", "awkward", "expression")):
+                self.learned_penalties["mouth_open"] = min(2.5, round(self.learned_penalties.get("mouth_open", 1.0) + 0.25, 2))
+                synth[4] = max(synth[4], 0.65)   # high mouth_openness_mar
+                synth[3] = min(synth[3], 0.35)   # low smile_ratio
+                matched_any = True
+
+            # 4. Microphone / hand blocking face or chest / obstruction
+            if any(k in combined for k in ("mic", "hand", "block", "cover", "obstruct", "chest", "stand", "ipad")):
+                self.learned_penalties["hand_obstruction"] = min(2.5, round(self.learned_penalties.get("hand_obstruction", 1.0) + 0.25, 2))
+                synth[9] = min(synth[9], 0.35)   # low torso_clear
+                synth[10] = 0.0                  # hands_clear = 0
+                matched_any = True
+
+            # 5. False prop / box at bottom / not presenting prop
+            if any(k in combined for k in ("prop", "box", "holding", "cut off", "clipped")):
+                self.learned_penalties["prop_strictness"] = min(2.5, round(self.learned_penalties.get("prop_strictness", 1.0) + 0.30, 2))
+                synth[8] = min(synth[8], 0.45)   # lower cutout_score
+                matched_any = True
+
+            # 6. Motion blur / soft focus
+            if any(k in combined for k in ("blur", "soft", "focus", "smear", "motion")):
+                self.learned_penalties["blur"] = min(2.5, round(self.learned_penalties.get("blur", 1.0) + 0.25, 2))
+                synth[6] = min(synth[6], 0.25)   # low sharpness_norm
+                matched_any = True
+
+            if matched_any:
+                # Reinforce the targeted negative pattern in the classifier dataset
+                self.samples.append((synth, 0))
+
+    def get_judge_feedback_prompt(self, max_notes: int = 8) -> str:
+        """Formats the operator's recent rejection/approval comments into a directive
+        block for the Vision LLM (AIJudge) so it learns from human explanations."""
+        if not self.feedback_notes:
+            return ""
+        bad_lines: List[str] = []
+        good_lines: List[str] = []
+        for entry in reversed(self.feedback_notes):
+            parts = []
+            if entry.get("reasons"):
+                parts.append(", ".join(entry["reasons"]))
+            if entry.get("comment"):
+                parts.append(entry["comment"])
+            text = " — ".join(parts).strip()
+            if not text:
+                continue
+            if entry.get("favorite"):
+                if text not in good_lines and len(good_lines) < 3:
+                    good_lines.append(text)
+            else:
+                if text not in bad_lines and len(bad_lines) < max_notes:
+                    bad_lines.append(text)
+
+        if not bad_lines and not good_lines:
+            return ""
+
+        out = ["\nOPERATOR FEEDBACK FROM PREVIOUS CAPTURES (follow these strictly):"]
+        if bad_lines:
+            out.append("The operator explicitly REJECTED photos for these reasons — penalize heavily (score <= 0.35, or usable=false if severe) if you see any of these:")
+            for b in bad_lines:
+                out.append(f"  - REJECT IF: {b}")
+        if good_lines:
+            out.append("The operator praised photos with these qualities:")
+            for g in good_lines:
+                out.append(f"  - PREFER: {g}")
+        return "\n".join(out)
 
     def fit(self):
         """Fits the scaler + classifier and estimates how well it actually generalises."""
@@ -212,7 +335,9 @@ class UserPreferenceModel:
                 "confidence_metric": "cross_val_balanced_accuracy",
                 "trust": self.trust,
                 "sample_count": len(self.samples),
-                "samples": self.samples[-100:]
+                "samples": self.samples[-100:],
+                "feedback_notes": self.feedback_notes[-50:],
+                "learned_penalties": self.learned_penalties,
             }
             with open(json_path, "w") as f:
                 json.dump(data, f, indent=2)
@@ -231,6 +356,17 @@ class UserPreferenceModel:
         except Exception as e:
             print(f"[UserPreferenceModel] JSON data load error: {e}")
             return
+
+        # Always preserve textual feedback notes and learned penalty multipliers
+        if isinstance(data.get("feedback_notes"), list):
+            self.feedback_notes = data["feedback_notes"][-50:]
+        if isinstance(data.get("learned_penalties"), dict):
+            for k in self.DEFAULT_PENALTIES:
+                if k in data["learned_penalties"]:
+                    try:
+                        self.learned_penalties[k] = float(data["learned_penalties"][k])
+                    except (TypeError, ValueError):
+                        pass
 
         stored_version = int(data.get("feature_version", 1))
         raw_samples = data.get("samples", [])

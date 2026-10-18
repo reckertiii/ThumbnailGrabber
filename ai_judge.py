@@ -79,36 +79,93 @@ choosing the best available frame from a live recording, not judging a studio po
 most frames have some flaw, and your job is to rank them, not to reject them.
 
 What makes a frame better:
-- Eyes open and engaged, toward the camera, audience, or a stage prop they are actively presenting. \
-Glancing at notes is a small flaw; eyes closed or mid-blink is a serious one.
-- Mouth closed, or a natural pleasant expression. A slight smile is best. Caught mid-word is \
-a moderate flaw; a grimace or half-formed expression is worse.
+- Eyes open, visible, and engaged toward the camera or audience. If the speaker's head is \
+bowed down looking into a box/floor/notes, or if their eyes are hidden, closed, or barely \
+open, that is a (serious) flaw — never excuse a bowed head or unengaged gaze.
+- Mouth closed, or a natural pleasant expression. A slight smile is best. Caught mid-word with \
+mouth open is a (moderate) flaw; a grimace or wide-open mouth is (serious).
 - Open posture. Hands gesturing outward or resting naturally are good. Arms folded or \
-hands clasped tight against the chest read as closed-off. Hands simply being somewhere in \
-front of the body is normal for someone speaking and is measured separately - only raise \
-it when they genuinely merge into the torso as a single shape.
-- Candid Stage Props: If the speaker is intentionally holding up, showing, or demonstrating \
-a physical prop or object on stage (e.g. a book, Bible, tool, sign, vessel, or sermon illustration \
-object), set `holding_prop` to true and treat it as a strong candid moment! Do NOT penalize \
-an intentionally held prop or the hands holding it as a torso obstruction, and allow natural \
-gaze toward the prop.
+hands clasped tight against the chest read as closed-off.
+- Handheld Microphones vs. Candid Stage Props: A handheld microphone held near the mouth or \
+chest is NOT a stage prop (`holding_prop` must be false), and if the microphone or hand \
+partially covers the mouth, chin, or beard, flag it as at least (moderate). Only set \
+`holding_prop` to true when the speaker is intentionally holding up and presenting a real \
+sermon illustration object (e.g. a book, Bible, tool, sign, vessel) clearly inside the frame \
+(not cut off at the bottom edge) while their head is up and eyes are clearly visible.
 - Expression and gaze are what you are most useful for, because they are the hardest to \
 measure and the easiest for a person to notice. Weigh them above everything else: is he \
-engaged and present, or caught between two expressions, glancing away, or blank?
-- Nothing accidentally blocking the body. A stationary microphone stand, iPad stand, or lectern \
-edge in front of the torso is a serious flaw because it breaks the cutout. Anything covering \
-the face is fatal.
-- Sharp. Look specifically for motion blur - a smeared hand or arm caught mid-gesture, or a smeared face. Blur on a raised or gesturing hand is a real flaw, because that hand is part of the cutout and will look wrong frozen on a slide. Call it out when you see it: moderate when a hand or arm is smeared, serious when the face is.
+engaged and present, or caught between two expressions, bowed down, or blank?
+- Nothing accidentally blocking the body or face. A stationary microphone stand, iPad stand, \
+or lectern edge in front of the torso is a (serious) flaw because it breaks the cutout. \
+Anything covering the face is fatal.
+- Sharp. Look specifically for motion blur - a smeared hand or arm caught mid-gesture, or a \
+smeared face. Call it out when you see it: (moderate) when a hand or arm is smeared, (serious) \
+when the face is.
 - Whole head in frame with a little room above it.
 
 First list every flaw you actually see, tagging each (small), (moderate) or (serious), \
 then the strengths. Then compute the score: start at 1.0 and subtract 0.1 for each small \
 flaw, 0.2 for each moderate flaw, 0.4 for each serious flaw, not going below 0. A frame \
 with no flaws is 1.0; one mid-word and one hand across the torso is 0.6. Do not round \
-toward the middle - the score must follow from the list.
+toward the middle and NEVER add a score bonus that overrides your listed flaws - the score \
+must strictly follow from the list.
 
-Set usable to false only for a fatal flaw: eyes closed, face blurred or covered, head cut \
-off, or an object across the face. Everything else is usable with its flaws listed."""
+Set usable to false for any fatal flaw: eyes closed/hidden, head bowed down away from the \
+audience, face blurred or covered, head cut off, or an object across the face."""
+
+
+def _enforce_rubric_score(verdict: JudgeVerdict) -> JudgeVerdict:
+    """Deterministically enforces the rubric math on `verdict.score` and `holding_prop`.
+
+    Small vision models frequently enumerate two `(moderate)` flaws and one `(small)` flaw
+    (which by the rubric is `1.0 - 0.2 - 0.2 - 0.1 = 0.50`) and still output `score: 0.70`
+    out of sycophancy or because they spotted an object in the frame. This clamps the score
+    to the maximum allowed by the listed issues and strips `holding_prop` when the speaker's
+    head is bowed or gaze is unengaged.
+    """
+    if verdict is None:
+        return verdict
+
+    deduction = 0.0
+    kill_prop = False
+    severe_gaze_or_face = False
+
+    for raw_issue in (verdict.issues or []):
+        low = raw_issue.lower()
+        if "(serious)" in low or "(severe)" in low or "(fatal)" in low:
+            deduction += 0.40
+        elif "(moderate)" in low or "(medium)" in low:
+            deduction += 0.20
+        elif "(small)" in low or "(minor)" in low:
+            deduction += 0.10
+        else:
+            deduction += 0.15
+
+        if any(kw in low for kw in (
+            "head bowed", "head slightly bowed", "bowed down", "looking down",
+            "gaze not engaged", "not engaged", "eyes closed", "eyes shut",
+            "eyes hidden", "mid-blink", "face covered", "face blurred",
+        )):
+            kill_prop = True
+            severe_gaze_or_face = True
+
+        if "microphone" in low and ("cover" in low or "block" in low or "front of face" in low):
+            kill_prop = True
+
+    if verdict.issues:
+        rubric_cap = round(max(0.0, 1.0 - deduction), 2)
+        if verdict.score > rubric_cap:
+            verdict.score = rubric_cap
+
+    if kill_prop:
+        verdict.holding_prop = False
+    if severe_gaze_or_face:
+        verdict.score = min(verdict.score, 0.45)
+    if not verdict.usable:
+        verdict.holding_prop = False
+        verdict.score = min(verdict.score, 0.30)
+
+    return verdict
 
 
 def _normalise_verdict_json(text: str) -> str:
@@ -455,7 +512,8 @@ class AIJudge:
 
     # ------------------------------------------------------------------
     def judge(self, subject_crop_bgr: np.ndarray, heuristic_score: float,
-              heuristic_notes: Optional[List[str]] = None) -> JudgeResult:
+              heuristic_notes: Optional[List[str]] = None,
+              user_feedback_prompt: str = "") -> JudgeResult:
         """Reviews one subject crop. Never raises; failures come back in `error`.
 
         `heuristic_score` is blended with the verdict. On any failure the heuristic
@@ -486,10 +544,12 @@ class AIJudge:
             if observations:
                 notes = "\nThe automated checks flagged: " + "; ".join(observations) + "."
 
+        feedback_block = f"\n{user_feedback_prompt.strip()}" if user_feedback_prompt and user_feedback_prompt.strip() else ""
+
         # The heuristic score is deliberately NOT mentioned: given "65%", the model
         # tends to answer 65. The judge is meant to be an independent second opinion,
         # so it only sees the flags — those are observations, not a verdict.
-        user_text = f"Review this frame for use as a slide cutout.{notes}"
+        user_text = f"Review this frame for use as a slide cutout.{notes}{feedback_block}"
 
         started = time.time()
         try:
@@ -516,6 +576,7 @@ class AIJudge:
                                input_tokens=in_tok, output_tokens=out_tok,
                                error=err or "no structured verdict in response")
 
+        verdict = _enforce_rubric_score(verdict)
         blended = (1.0 - self.weight) * heuristic_score + self.weight * float(verdict.score)
         return JudgeResult(verdict=verdict, blended_score=round(max(0.0, min(1.0, blended)), 3),
                            latency_sec=latency, input_tokens=in_tok, output_tokens=out_tok)

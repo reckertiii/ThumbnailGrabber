@@ -475,7 +475,14 @@ class PersonQualityAnalyzer:
             w.cutout * f_res.cutout_score
         )
 
-        # --- Graded penalties -------------------------------------------------
+        # --- Graded penalties + learned operator comment multipliers ----------
+        penalties = getattr(self.preference_model, "learned_penalties", {}) or {}
+        p_head_down = float(penalties.get("head_down", 1.0))
+        p_eyes = float(penalties.get("eyes_closed", 1.0))
+        p_mouth = float(penalties.get("mouth_open", 1.0))
+        p_hand = float(penalties.get("hand_obstruction", 1.0))
+        p_blur = float(penalties.get("blur", 1.0))
+
         # Mouth openness tapers rather than falling off a cliff. A slightly parted mouth
         # is normal in a good shot; a jaw dropped mid-word is not, but is still worth
         # keeping if the alternative is nothing.
@@ -486,36 +493,52 @@ class PersonQualityAnalyzer:
             mouth_mult = 0.45
         else:
             mouth_mult = 1.0 - 0.55 * ((jaw - 0.30) / 0.35)
+        if mouth_mult < 1.0 and p_mouth > 1.0:
+            mouth_mult = max(0.15, mouth_mult ** p_mouth)
         raw_score *= mouth_mult
 
         if f_res.is_licking_lips:
             raw_score *= 0.15
         elif f_res.is_weird_mouth:
-            raw_score *= 0.55
+            raw_score *= max(0.20, 0.55 / p_mouth)
 
-        # Gaze dropped: mild. Head dropped: severe.
-        # When holding/showing a stage prop, glancing at the object is natural candid behaviour.
-        effective_looking_down = f_res.is_looking_down and not (prop_active and f_res.pitch_deg >= -28.0)
-        if f_res.eye_look_down_score > 0.45 and not prop_active:
-            raw_score *= 1.0 - 0.25 * min(1.0, (f_res.eye_look_down_score - 0.45) / 0.40)
+        # Gaze dropped & head bowed: NEVER waive a bowed head or hidden eyes, even if
+        # holding a prop! A usable thumbnail requires visible eyes and an engaged head.
+        effective_looking_down = (
+            f_res.is_looking_down
+            or f_res.pitch_deg < -14.0
+            or f_res.eye_look_down_score > 0.52
+        )
+        if f_res.eye_look_down_score > 0.35:
+            gaze_pen = 0.30 * min(1.0, (f_res.eye_look_down_score - 0.35) / 0.35) * p_head_down
+            raw_score *= max(0.30, 1.0 - gaze_pen)
         if effective_looking_down:
-            raw_score *= 0.50
+            raw_score *= max(0.15, 0.45 / p_head_down)
+        if f_res.avg_ear < 0.28 and not f_res.is_blinking:
+            # Squinting or eyes partially obscured by glasses frames when tilting down
+            raw_score *= max(0.35, 0.75 / p_eyes)
         if f_res.is_blinking:
-            raw_score *= 0.20
+            raw_score *= max(0.05, 0.20 / p_eyes)
         if f_res.is_shoulder_tilted:
             raw_score *= 0.80
+        if f_res.hands_on_torso and not prop_active and p_hand > 1.0:
+            raw_score *= max(0.45, 1.0 / p_hand)
 
         # Something crossing the body - a table, lectern or music stand - is the worst
         # thing for a cutout: the matte either keeps it or punches a hole through the
         # subject. Graded rather than disqualifying, because some speakers never step
         # away from the table, and for them this scales every frame alike and leaves the
         # ranking untouched.
-        raw_score *= 0.55 + 0.45 * f_res.torso_clear_score
+        torso_factor = 0.55 + 0.45 * f_res.torso_clear_score
+        if torso_factor < 0.95 and p_hand > 1.0:
+            torso_factor = max(0.30, torso_factor ** p_hand)
+        raw_score *= torso_factor
 
         # Heavy penalty for motion blur / low sharpness
-        is_blurry = f_res.laplacian_variance < min_sharp
+        effective_min_sharp = min_sharp * (1.0 + 0.25 * (p_blur - 1.0))
+        is_blurry = f_res.laplacian_variance < effective_min_sharp
         if is_blurry:
-            sharp_ratio = max(0.05, f_res.laplacian_variance / max(1.0, min_sharp))
+            sharp_ratio = max(0.05, f_res.laplacian_variance / max(1.0, effective_min_sharp))
             raw_score *= (sharp_ratio ** 1.5)
 
         f_res.score = round(max(0.0, min(1.0, raw_score)), 3)
@@ -534,7 +557,7 @@ class PersonQualityAnalyzer:
         if f_res.is_licking_lips:
             reasons.append("tongue/lip")
         if is_blurry:
-            reasons.append(f"blurry ({f_res.laplacian_variance:.0f} < {min_sharp:.0f})")
+            reasons.append(f"blurry ({f_res.laplacian_variance:.0f} < {effective_min_sharp:.0f})")
 
         f_res.disqualified_reasons = reasons
         f_res.is_qualified = not reasons
@@ -1450,6 +1473,13 @@ class PersonQualityAnalyzer:
         if fw <= 0 or fh <= 0 or h < 32 or w < 32:
             return False, None
 
+        # A candid prop moment still requires an engaged speaker: never trigger prop mode
+        # when the speaker's head is bowed down, eyes are closed/hidden, or mouth is open mid-word.
+        if (f_res.is_looking_down or f_res.is_blinking or f_res.pitch_deg < -13.0
+                or f_res.eye_look_down_score > 0.45 or f_res.avg_ear < 0.28
+                or f_res.is_talking_or_open):
+            return False, None
+
         pose = f_res.pose_points or {}
         ls, rs = pose.get('left_shoulder'), pose.get('right_shoulder')
         lh, rh = pose.get('left_hip'), pose.get('right_hip')
@@ -1458,10 +1488,20 @@ class PersonQualityAnalyzer:
             sh_y = min(ls[1], rs[1])
             hip_y = max(lh[1], rh[1]) if (lh and rh) else sh_y + int(abs(ls[0] - rs[0]) * 1.4)
             t_span = max(1, hip_y - sh_y)
-            max_active_y = sh_y + int(t_span * 0.80)
+            max_active_y = sh_y + int(t_span * 0.72)
         else:
-            max_active_y = fy + int(fh * 3.8)
+            max_active_y = fy + int(fh * 3.4)
         min_active_y = fy - int(fh * 0.8)
+
+        # Handheld microphone exclusion box directly under the mouth/chin: a hand centred
+        # right below the face holding a mic is normal speaking posture, not a stage prop.
+        mic_x0 = fx + int(fw * 0.05)
+        mic_x1 = fx + int(fw * 0.95)
+        mic_y0 = fy + int(fh * 0.75)
+        mic_y1 = fy + int(fh * 2.05)
+
+        def _is_mic_hand(hcx: float, hcy: float) -> bool:
+            return (mic_x0 <= hcx <= mic_x1) and (mic_y0 <= hcy <= mic_y1)
 
         # Collect active (raised/presenting) hand bounding boxes: (hx0, hy0, hx1, hy1, hcx, hcy)
         active_hands: List[Tuple[int, int, int, int, float, float]] = []
@@ -1473,8 +1513,10 @@ class PersonQualityAnalyzer:
             hx0, hy0, hx1, hy1 = min(xs), min(ys), max(xs), max(ys)
             hcx = sum(xs) / float(len(xs))
             hcy = sum(ys) / float(len(ys))
-            # Ignore hands directly covering the face
+            # Ignore hands directly covering the face or holding a mic under the chin
             if fx <= hcx <= fx + fw and fy <= hcy <= fy + fh:
+                continue
+            if _is_mic_hand(hcx, hcy):
                 continue
             if min_active_y <= hcy <= max_active_y:
                 active_hands.append((hx0, hy0, hx1, hy1, hcx, hcy))
@@ -1488,6 +1530,8 @@ class PersonQualityAnalyzer:
                     continue
                 wx, wy = wrist
                 if fx <= wx <= fx + fw and fy <= wy <= fy + fh:
+                    continue
+                if _is_mic_hand(float(wx), float(wy)):
                     continue
                 if min_active_y <= wy <= max_active_y:
                     active_hands.append((wx - half_w, wy - half_w, wx + half_w, wy + half_w, float(wx), float(wy)))
@@ -1532,6 +1576,8 @@ class PersonQualityAnalyzer:
         fx0, fy0 = max(0, fx - face_pad_x), max(0, fy - face_pad_y)
         fx1, fy1 = min(w, fx + fw + face_pad_x), min(h, fy + fh + face_pad_y)
 
+        prop_strictness = float((getattr(self.preference_model, "learned_penalties", {}) or {}).get("prop_strictness", 1.0))
+
         for raw_px0, raw_py0, raw_px1, raw_py1, is_two_hand, (ux0, uy0, ux1, uy1) in candidates:
             px0, py0 = max(0, raw_px0), max(0, raw_py0)
             px1, py1 = min(w, raw_px1), min(h, raw_py1)
@@ -1571,9 +1617,9 @@ class PersonQualityAnalyzer:
             # Require structured non-skin edges AND luminance/colour contrast
             valid_pixels = gray_crop[valid_mask]
             intensity_std = float(np.std(valid_pixels)) if valid_pixels.size > 0 else 0.0
-            min_edge_density = 0.022 if is_two_hand else 0.032
+            min_edge_density = (0.022 if is_two_hand else 0.032) * prop_strictness
 
-            if edge_density >= min_edge_density and intensity_std >= max(16.0, bg_sample_std * 0.45):
+            if edge_density >= min_edge_density and intensity_std >= max(16.0 * prop_strictness, bg_sample_std * 0.45):
                 ys_e, xs_e = np.where(obj_edges)
                 if xs_e.size >= 12:
                     # Trim 5% outliers to bound the held object cleanly
@@ -1581,6 +1627,10 @@ class PersonQualityAnalyzer:
                     oy0 = py0 + int(np.percentile(ys_e, 5))
                     ox1 = px0 + int(np.percentile(xs_e, 95))
                     oy1 = py0 + int(np.percentile(ys_e, 95))
+                    # Reject objects clipped at the very bottom of the frame (e.g. a box or
+                    # notes sitting on a table at the bottom edge of the camera view).
+                    if oy1 >= h - 10 or uy1 >= h - 8:
+                        continue
                     obj_w, obj_h = ox1 - ox0, oy1 - oy0
                     if obj_w >= max(12, int(fw * 0.20)) and obj_h >= max(12, int(fh * 0.20)):
                         # Union of the object bounds and the holding hand(s)

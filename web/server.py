@@ -183,6 +183,8 @@ def _telemetry() -> Dict[str, Any]:
         "ml_confidence": round(float(pm.confidence), 3) if pm else 0.0,
         "ml_trust": round(float(pm.trust), 3) if pm else 0.0,
         "ml_samples": len(pm.samples) if pm else 0,
+        "ml_notes_count": len(getattr(pm, "feedback_notes", []) or []) if pm else 0,
+        "ml_penalties": dict(getattr(pm, "learned_penalties", {}) or {}) if pm else {},
         "frame_size": [int(frame.shape[1]), int(frame.shape[0])] if frame is not None else None,
         "settings": {
             "min_score": int(cfg.thresholds.min_overall_score * 100),
@@ -728,19 +730,37 @@ def list_captures():
 
 @app.post("/api/captures/{filename}/feedback")
 def capture_feedback(filename: str, payload: Dict[str, Any] = Body(...)):
-    """Train the preference model from a thumbnail's star / thumbs-down."""
+    """Train the preference model from a thumbnail's star / thumbs-down and optional comment/reasons."""
     proc = state.processor
     if not proc:
         raise HTTPException(status_code=409, detail="Stream not running")
     cap = _find_capture(filename)
     is_favorite = bool(payload.get("favorite", True))
+    comment = str(payload.get("comment", "") or "").strip()
+    raw_reasons = payload.get("reasons") or []
+    reasons = [str(r).strip() for r in raw_reasons if str(r).strip()] if isinstance(raw_reasons, list) else []
+    remove = bool(payload.get("remove", False))
+
     pm = proc.analyzer.preference_model
-    pm.add_sample(cap.analysis, is_favorite=is_favorite)
+    pm.add_sample(cap.analysis, is_favorite=is_favorite, comment=comment, reasons=reasons)
+
+    removed = False
+    if remove:
+        removed = proc.remove_capture(cap.filepath)
+        if state.scan_results:
+            state.scan_results = [r for r in state.scan_results if r.filepath != cap.filepath]
+
     return {
         "ok": True,
         "favorite": is_favorite,
+        "comment": comment,
+        "reasons": reasons,
+        "removed": removed,
         "samples": len(pm.samples),
+        "notes_count": len(getattr(pm, "feedback_notes", []) or []),
+        "learned_penalties": dict(getattr(pm, "learned_penalties", {}) or {}),
         "confidence": round(float(pm.confidence), 3),
+        "captures": _captures_payload(),
     }
 
 
