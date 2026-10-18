@@ -95,6 +95,40 @@ class TestRetention(unittest.TestCase):
             self.proc.saved_captures.append(_capture(self.cfg, 0.9 - i * 0.01, i * 1.0))
         self.assertTrue(self.proc._would_improve_retained(0.10, 100.0))
 
+    def test_reserved_prop_slots_and_video_scan_protection(self):
+        """Candid prop moments get reserved gallery slots, and video scan imports are not pruned."""
+        self.cfg.max_retained_captures = 5
+        self.cfg.max_prop_captures = 2
+
+        # Add 5 high-scoring regular headshots (0.85 .. 0.89)
+        for i, s in enumerate([0.89, 0.88, 0.87, 0.86, 0.85]):
+            self.proc.saved_captures.append(_capture(self.cfg, s, i * 100.0))
+
+        # A 0.72 regular shot won't improve the gallery (weakest is 0.85),
+        # but a 0.72 prop moment SHOULD be accepted because prop slots (0/2) are open!
+        self.assertFalse(self.proc._would_improve_retained(0.72, 600.0, is_prop_moment=False))
+        self.assertTrue(self.proc._would_improve_retained(0.72, 600.0, is_prop_moment=True))
+
+        prop_cap = _capture(self.cfg, 0.72, 600.0)
+        prop_cap.is_prop_moment = True
+        self.proc.saved_captures.append(prop_cap)
+
+        # Also add a video-scan capture
+        scan_cap = _capture(self.cfg, 0.65, 700.0)
+        scan_cap.from_video_scan = True
+        self.proc.saved_captures.append(scan_cap)
+
+        self.proc.prune_to_best_n(5)
+
+        live_kept = [c for c in self.proc.saved_captures if not c.from_video_scan]
+        scan_kept = [c for c in self.proc.saved_captures if c.from_video_scan]
+        self.assertEqual(len(live_kept), 5, "Should retain 5 live captures")
+        self.assertTrue(any(c.is_prop_moment for c in live_kept),
+                        "Prop moment capture should be preserved in its reserved slot")
+        self.assertEqual(len(scan_kept), 1,
+                         "Video scan captures must not be deleted by live pruning")
+        self.assertTrue(os.path.exists(scan_cap.filepath))
+
 
 class TestJudgeBlending(unittest.TestCase):
     """The judge must refine, never block: any failure leaves the heuristic score."""

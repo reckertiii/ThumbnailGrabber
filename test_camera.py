@@ -304,7 +304,21 @@ class TestSourceSwitching(unittest.TestCase):
         # reach the configured Ollama host.
         cfg.ai_judge_backend = "off"
         cfg.dvr_buffer_seconds = 0.0
-        return StreamProcessor(config=cfg)
+        proc = StreamProcessor(config=cfg)
+        # Stub _open_capture so _grabber_loop does not block 30s in FFmpeg
+        # trying to dial unroutable RTSP addresses or hardware webcams.
+        class _DummyCap:
+            def isOpened(self):
+                return True
+            def set(self, *args):
+                pass
+            def read(self):
+                time.sleep(0.02)
+                return False, None
+            def release(self):
+                pass
+        proc._open_capture = lambda: _DummyCap()
+        return proc
 
     def test_update_source_restarts_a_processor_that_died(self):
         proc = self._processor("0")

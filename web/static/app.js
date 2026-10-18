@@ -126,9 +126,12 @@ function render(d) {
     ? ""
     : "Confirm where captures should go before starting — pick this folder or another.";
   $("chkAuto").checked = !!d.auto_capture;
+  $("chkAuto").disabled = needsFolder;
+  $("chkAuto").title = needsFolder ? "Confirm the output folder first" : "";
   $("chkWinner").checked = !!d.single_winner;
   $("chkMesh").checked = !!d.show_mesh;
   $("chkHud").checked = !!d.show_hud;
+  if ($("chkProps")) $("chkProps").checked = d.capture_prop_moments !== false;
 
   // Sliders (skip any the user is dragging)
   const s = d.settings || {};
@@ -169,7 +172,7 @@ function render(d) {
                       d.hands_on_torso ? "hands on body" : null].filter(Boolean).join(" · ");
     $("mCentering").textContent = `Cutout: ${Math.round(d.cutout_score * 100)}% · subject ${Math.round(d.subject_height_ratio * 100)}% of frame`
       + ` · bg ${Math.round(d.background_score * 100)}%` + (cutFlags ? ` · ${cutFlags}` : "");
-    $("mHand").textContent = `Hand: ${d.hands_covering_face ? "OBSTRUCTING ⚠️" : d.is_hand_blurry ? "BLURRY 🔄" : "CLEAR ✅"}`;
+    $("mHand").textContent = `Hand: ${d.hands_covering_face ? "OBSTRUCTING ⚠️" : d.is_hand_blurry ? "BLURRY 🔄" : d.is_prop_moment ? "🎭 STAGE PROP / CANDID" : "CLEAR ✅"}`;
     // Why nothing is saving. A high score with no captures otherwise looks like a
     // broken button rather than the scorer holding out for a better frame.
     const blockers = d.disqualified_reasons || [];
@@ -230,7 +233,8 @@ function renderGallery(caps) {
 
     const info = document.createElement("div");
     info.className = "thumb-info";
-    info.innerHTML = `<span class="rank-badge">🏆 #${c.rank}</span> | <b>${Math.round(c.score * 100)}%</b>`;
+    const propBadge = c.is_prop_moment ? ` · <span title="Candid stage prop moment">🎭 Prop</span>` : "";
+    info.innerHTML = `<span class="rank-badge">🏆 #${c.rank}</span> | <b>${Math.round(c.score * 100)}%</b>${propBadge}`;
 
     const btns = document.createElement("div");
     btns.className = "thumb-btns";
@@ -262,7 +266,7 @@ function openLightbox(c) {
   $("lbImg").src = c.url;
   const shoulder = c.shoulder_detected ? `${c.shoulder_tilt}°` : "headshot / out of frame";
   $("lbInfo").innerHTML = `
-    <b>Score:</b> ${Math.round(c.score * 100)}%<br>
+    <b>Score:</b> ${Math.round(c.score * 100)}%${c.is_prop_moment ? " (🎭 Candid Stage Prop Moment)" : ""}<br>
     <b>Head yaw:</b> ${c.yaw}°<br>
     <b>Shoulder tilt:</b> ${shoulder}<br>
     <b>Eye aspect ratio:</b> ${c.avg_ear}<br>
@@ -342,10 +346,16 @@ $("btnSource").onclick = () => {
 $("src").addEventListener("focus", () => { sourceFocused = true; });
 $("src").addEventListener("blur", () => { sourceFocused = false; });
 
-$("chkAuto").onchange = (e) => post("/api/capture/toggle", { enabled: e.target.checked }).catch(() => {});
+$("chkAuto").onchange = (e) => post("/api/capture/toggle", { enabled: e.target.checked }).catch((err) => {
+  e.target.checked = !e.target.checked;
+  toast(err.message);
+});
 $("chkMesh").onchange = (e) => post("/api/view", { show_mesh: e.target.checked }).catch(() => {});
 $("chkHud").onchange = (e) => post("/api/view", { show_hud: e.target.checked }).catch(() => {});
 $("chkWinner").onchange = (e) => post("/api/view", { single_winner: e.target.checked }).catch(() => {});
+if ($("chkProps")) {
+  $("chkProps").onchange = (e) => post("/api/view", { capture_prop_moments: e.target.checked }).catch((err) => toast(err.message));
+}
 
 // Click a face on the video to include / ignore that person
 $("video").onclick = (ev) => {

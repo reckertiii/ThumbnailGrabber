@@ -1,5 +1,7 @@
 import unittest
 import os
+import shutil
+import tempfile
 import time
 import cv2
 import numpy as np
@@ -10,14 +12,20 @@ from stream_processor import StreamProcessor, CapturedScreenshot
 
 class TestStreamProcessor(unittest.TestCase):
     def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp()
         self.config = AppConfig()
-        self.config.output_dir = os.path.join(os.getcwd(), "test_captures")
+        self.config.output_dir = self.tmp_dir
+        self.config.ai_judge_backend = "off"
+        self.config.dvr_buffer_seconds = 0.0
         self.captured_items = []
         
         self.processor = StreamProcessor(
             config=self.config,
             on_capture_callback=lambda cap: self.captured_items.append(cap)
         )
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
     def test_save_screenshot(self):
         # Create test frame (640x480)
@@ -35,6 +43,7 @@ class TestStreamProcessor(unittest.TestCase):
         cap_item = self.processor.save_screenshot(test_frame, analysis)
         self.assertTrue(os.path.exists(cap_item.filepath), "Saved screenshot file should exist on disk")
         self.assertGreater(os.path.getsize(cap_item.filepath), 1000, "Screenshot file size should be > 1KB")
+
     def test_top_5_pruning(self):
         self.config.single_winner_mode = True
         self.config.max_retained_captures = 5
@@ -52,11 +61,6 @@ class TestStreamProcessor(unittest.TestCase):
         self.assertFalse(os.path.exists(captures[0].filepath), "Lowest scoring 6th shot (0.60) should be pruned")
         self.assertTrue(os.path.exists(captures[-1].filepath), "Highest scoring shot (0.85) should be preserved")
         self.assertEqual(len(self.processor.saved_captures), 5, "Exactly Top 5 screenshots should remain in memory and on disk")
-        
-        # Cleanup
-        for cap in self.processor.saved_captures:
-            if os.path.exists(cap.filepath):
-                os.remove(cap.filepath)
 
 if __name__ == "__main__":
     unittest.main()

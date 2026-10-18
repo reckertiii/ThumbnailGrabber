@@ -146,6 +146,7 @@ def _face_to_dict(f) -> Dict[str, Any]:
         "is_awkward_expression": bool(f.is_awkward_expression),
         "is_looking_down": bool(f.is_looking_down),
         "is_shoulder_tilted": bool(f.is_shoulder_tilted),
+        "is_prop_moment": bool(getattr(f, "is_prop_moment", False)),
     }
 
 
@@ -153,6 +154,7 @@ def _telemetry() -> Dict[str, Any]:
     proc = state.processor
     frame, analysis, _ = state.snapshot()
     cfg = state.config
+    pm = proc.analyzer.preference_model if proc else None
 
     payload: Dict[str, Any] = {
         "status": proc.connection_status if proc else StreamProcessor.STATUS_DISCONNECTED,
@@ -162,12 +164,25 @@ def _telemetry() -> Dict[str, Any]:
         "is_capturing": state.is_capturing,
         "auto_capture": bool(proc.auto_capture_enabled) if proc else False,
         "single_winner": cfg.single_winner_mode,
+        "capture_prop_moments": bool(getattr(cfg, "capture_prop_moments", True)),
         "show_mesh": state.show_mesh,
         "show_hud": state.show_hud,
         # Redacted: this endpoint is unauthenticated, so the camera password
         # must not be in it. /api/source accepts the real URL, never returns it.
         "source": redact_credentials(cfg.stream_source),
         "output_dir": cfg.output_dir,
+        "output_confirmed": bool(state.output_confirmed),
+        "buffer": proc.buffer_stats() if proc and hasattr(proc, "buffer_stats") else None,
+        "ai_judge": proc.judge.status_line() if proc and getattr(proc, "judge", None) else "AI judge off",
+        "ai_judge_active": bool(proc.judge.available) if proc and getattr(proc, "judge", None) else False,
+        "ai_judge_minutes_left": (
+            None if not (proc and getattr(proc, "judge", None))
+            else (None if proc.judge.seconds_remaining == float("inf")
+                  else int(proc.judge.seconds_remaining // 60))),
+        "ml_trained": bool(pm.is_trained) if pm else False,
+        "ml_confidence": round(float(pm.confidence), 3) if pm else 0.0,
+        "ml_trust": round(float(pm.trust), 3) if pm else 0.0,
+        "ml_samples": len(pm.samples) if pm else 0,
         "frame_size": [int(frame.shape[1]), int(frame.shape[0])] if frame is not None else None,
         "settings": {
             "min_score": int(cfg.thresholds.min_overall_score * 100),
@@ -182,7 +197,6 @@ def _telemetry() -> Dict[str, Any]:
     }
 
     if analysis is not None:
-        pm = proc.analyzer.preference_model if proc else None
         payload.update({
             "face_detected": bool(analysis.face_detected),
             "people_detected": int(analysis.people_detected_count),
@@ -210,51 +224,56 @@ def _telemetry() -> Dict[str, Any]:
             "subject_height_ratio": round(float(analysis.subject_height_ratio), 3),
             "is_subject_clipped": bool(analysis.is_subject_clipped),
             "hands_on_torso": bool(analysis.hands_on_torso),
+            "is_prop_moment": bool(getattr(analysis, "is_prop_moment", False)),
             "background_score": round(float(analysis.background_score), 3),
             "disqualified_reasons": list(getattr(analysis, "disqualified_reasons", []) or []),
             "hands_covering_face": bool(analysis.hands_covering_face),
             "is_hand_blurry": bool(analysis.is_hand_blurry),
             "faces": [_face_to_dict(f) for f in (analysis.faces or [])],
-            "ml_trained": bool(pm.is_trained) if pm else False,
-            "ml_confidence": round(float(pm.confidence), 3) if pm else 0.0,
-            "ml_trust": round(float(pm.trust), 3) if pm else 0.0,
             "ml_weight_applied": round(float(getattr(analysis, "ml_weight_applied", 0.0)), 3),
-            "ml_samples": len(pm.samples) if pm else 0,
-            "ai_judge": proc.judge.status_line() if proc and getattr(proc, "judge", None) else "AI judge off",
-            "output_confirmed": bool(state.output_confirmed),
-            "buffer": proc.buffer_stats() if proc and hasattr(proc, "buffer_stats") else None,
-            "ai_judge_active": bool(proc.judge.available) if proc and getattr(proc, "judge", None) else False,
-            "ai_judge_minutes_left": (
-                None if not (proc and getattr(proc, "judge", None))
-                else (None if proc.judge.seconds_remaining == float("inf")
-                      else int(proc.judge.seconds_remaining // 60))),
         })
 
     return payload
+
+
+def _rel_capture_path(path: str) -> str:
+    """Relative POSIX path inside output_dir when possible, else basename."""
+    try:
+        base = Path(state.config.output_dir).resolve()
+        target = Path(path).resolve()
+        if base in target.parents:
+            return target.relative_to(base).as_posix()
+    except Exception:
+        pass
+    return os.path.basename(path)
 
 
 def _capture_url(path: Optional[str]) -> Optional[str]:
     """Cache-busted /captures URL for a written file, or None if it isn't there."""
     if not path or not os.path.exists(path):
         return None
-    return f"/captures/{os.path.basename(path)}?t={int(os.path.getmtime(path))}"
+    rel = _rel_capture_path(path)
+    return f"/captures/{rel}?t={int(os.path.getmtime(path))}"
 
 
 def _captures_payload() -> List[Dict[str, Any]]:
     proc = state.processor
     if not proc:
         return []
-    caps = sorted(proc.saved_captures, key=lambda c: c.overall_score, reverse=True)
+    with getattr(proc, "captures_lock", threading.RLock()):
+        caps = sorted(proc.saved_captures, key=lambda c: c.overall_score, reverse=True)
     if state.config.single_winner_mode:
         caps = caps[:state.config.max_retained_captures]
     out = []
     for idx, c in enumerate(caps):
         name = os.path.basename(c.filepath)
+        rel = _rel_capture_path(c.filepath)
         a = c.analysis
+        is_prop = bool(getattr(c, "is_prop_moment", False) or getattr(a, "is_prop_moment", False))
         out.append({
             "rank": idx + 1,
             "filename": name,
-            "url": f"/captures/{name}?t={int(os.path.getmtime(c.filepath)) if os.path.exists(c.filepath) else 0}",
+            "url": f"/captures/{rel}?t={int(os.path.getmtime(c.filepath)) if os.path.exists(c.filepath) else 0}",
             "crop_url": _capture_url(c.crop_filepath),
             "score": round(float(c.overall_score), 3),
             "timestamp": c.timestamp_str,
@@ -263,6 +282,7 @@ def _captures_payload() -> List[Dict[str, Any]]:
             "judge_score": (round(float(c.judge_score), 3) if getattr(c, "judge_score", None) is not None else None),
             "judge_summary": getattr(c, "judge_summary", "") or "",
             "judge_issues": list(getattr(c, "judge_issues", []) or []),
+            "is_prop_moment": is_prop,
             "yaw": round(float(a.yaw_deg), 1),
             "shoulder_tilt": round(float(a.shoulder_tilt_deg), 1),
             "shoulder_detected": bool(a.shoulder_detected),
@@ -276,9 +296,10 @@ def _captures_payload() -> List[Dict[str, Any]]:
 def _find_capture(filename: str) -> CapturedScreenshot:
     proc = state.processor
     if proc:
-        for c in proc.saved_captures:
-            if os.path.basename(c.filepath) == filename:
-                return c
+        with getattr(proc, "captures_lock", threading.RLock()):
+            for c in proc.saved_captures:
+                if os.path.basename(c.filepath) == filename or _rel_capture_path(c.filepath) == filename:
+                    return c
     raise HTTPException(status_code=404, detail="Capture not found")
 
 
@@ -341,15 +362,22 @@ def video_feed(w: int = 1280, q: int = 80):
 @app.websocket("/ws")
 async def telemetry_socket(ws: WebSocket):
     await ws.accept()
-    last_capture_count = -1
+    last_capture_sig = None
     try:
         while True:
             payload = _telemetry()
             proc = state.processor
-            count = len(proc.saved_captures) if proc else 0
-            # Only ship the gallery when it actually changed
-            if count != last_capture_count:
-                last_capture_count = count
+            if proc:
+                with getattr(proc, "captures_lock", threading.RLock()):
+                    sig = tuple(
+                        (c.filepath, round(float(c.overall_score), 3), c.judge_score, getattr(c, "is_prop_moment", False))
+                        for c in proc.saved_captures
+                    )
+            else:
+                sig = ()
+            # Only ship the gallery when its contents actually changed (including Top-5 replacements)
+            if sig != last_capture_sig:
+                last_capture_sig = sig
                 payload["captures"] = _captures_payload()
             await ws.send_json(payload)
             await asyncio.sleep(0.1)
@@ -602,6 +630,13 @@ def update_view(payload: Dict[str, Any] = Body(...)):
         state.config.single_winner_mode = bool(payload["single_winner"])
         if state.config.single_winner_mode and state.processor:
             state.processor.prune_to_best_n(state.config.max_retained_captures)
+    if "capture_prop_moments" in payload:
+        val = bool(payload["capture_prop_moments"])
+        state.config.capture_prop_moments = val
+        if state.processor:
+            state.processor.analyzer.capture_prop_moments = val
+            if state.processor._refine_analyzer is not None:
+                state.processor._refine_analyzer.capture_prop_moments = val
     return {"ok": True}
 
 
@@ -709,12 +744,12 @@ def capture_feedback(filename: str, payload: Dict[str, Any] = Body(...)):
     }
 
 
-@app.get("/captures/{filename}")
+@app.get("/captures/{filename:path}")
 def get_capture_image(filename: str):
     # Resolve against the output dir and refuse anything that escapes it
     base = Path(state.config.output_dir).resolve()
     target = (base / filename).resolve()
-    if base not in target.parents or not target.exists():
+    if base not in target.parents or not target.is_file():
         raise HTTPException(status_code=404, detail="Not found")
     media = "image/png" if target.suffix.lower() == ".png" else "image/jpeg"
     return FileResponse(str(target), media_type=media)
@@ -766,9 +801,10 @@ def _run_video_scan_worker(video_path: str, top_n: int, min_score: float,
         )
         state.scan_results = results
         if state.processor:
-            for r in results:
-                if not any(c.filepath == r.filepath for c in state.processor.saved_captures):
-                    state.processor.saved_captures.append(r)
+            with getattr(state.processor, "captures_lock", threading.RLock()):
+                for r in results:
+                    if not any(c.filepath == r.filepath for c in state.processor.saved_captures):
+                        state.processor.saved_captures.append(r)
     except Exception as e:
         state.scan_error = str(e)
     finally:
@@ -1195,10 +1231,11 @@ def get_video_scan_status():
             results_payload.append({
                 "rank": idx + 1,
                 "filename": name,
-                "url": f"/captures/{name}?t={int(os.path.getmtime(c.filepath)) if os.path.exists(c.filepath) else 0}",
+                "url": _capture_url(c.filepath),
                 "crop_url": _capture_url(c.crop_filepath),
                 "score": round(float(c.overall_score), 3),
                 "timestamp": c.timestamp_str,
+                "is_prop_moment": bool(getattr(c, "is_prop_moment", False)),
             })
         resp["results"] = results_payload
 

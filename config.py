@@ -22,7 +22,9 @@ def _load_dotenv():
                 continue
             key, _, value = line.partition("=")
             key = key.strip()
-            value = value.strip().strip('"').strip("'")
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+                value = value[1:-1]
             if key and key not in os.environ:
                 os.environ[key] = value
     except Exception as e:
@@ -279,6 +281,14 @@ class AppConfig:
     # a nearby one if it scores higher. 0 disables spacing.
     min_capture_spacing_sec: float = 20.0
 
+    # Candid / Stage Prop Capture
+    # When enabled, detects when the speaker is holding or presenting a prop/object on
+    # stage, relaxes torso-obstruction and gaze penalties for that moment, expands the
+    # subject crop to include the held object, and reserves up to max_prop_captures
+    # slots in the retained gallery so standard headshots don't overwrite them.
+    capture_prop_moments: bool = True
+    max_prop_captures: int = 2
+
     # Weights & Thresholds
     weights: QualityWeights = field(default_factory=QualityWeights)
     thresholds: QualityThresholds = field(default_factory=QualityThresholds)
@@ -293,6 +303,8 @@ class AppConfig:
             "ema_alpha": self.ema_alpha,
             "score_stability_window": self.score_stability_window,
             "score_stability_threshold": self.score_stability_threshold,
+            "capture_prop_moments": self.capture_prop_moments,
+            "max_prop_captures": self.max_prop_captures,
             "weights": self.weights.__dict__,
             "thresholds": self.thresholds.__dict__,
         }

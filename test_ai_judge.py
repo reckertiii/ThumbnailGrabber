@@ -69,6 +69,7 @@ class TestWakeLoadsTheModel(unittest.TestCase):
 
     def tearDown(self):
         self.srv.shutdown()
+        self.srv.server_close()
 
     def _wait(self, timeout=10):
         end = time.time() + timeout
@@ -155,6 +156,7 @@ class TestSuspendResume(unittest.TestCase):
 
     def tearDown(self):
         self.srv.shutdown()
+        self.srv.server_close()
 
     def _settle(self, timeout=10):
         end = time.time() + timeout

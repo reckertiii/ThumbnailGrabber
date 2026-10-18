@@ -6,8 +6,8 @@ import numpy as np
 import threading
 from typing import Optional, List, Callable, Dict, Tuple
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
-from PyQt6.QtGui import QImage, QPixmap, QFont, QColor, QPainter, QPen, QBrush, QIcon
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QUrl
+from PyQt6.QtGui import QImage, QPixmap, QFont, QColor, QPainter, QPen, QBrush, QIcon, QDesktopServices
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QLineEdit,
     QSlider, QCheckBox, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox,
@@ -240,7 +240,8 @@ class ThumbnailCard(QFrame):
         # Rank & Score label
         score_pct = int(capture.overall_score * 100)
         rank_badge = f"<span style='color: #f59e0b; font-weight: bold;'>🏆 Rank #{rank}</span>"
-        info_label = QLabel(f"{rank_badge} | <b>{score_pct}%</b>")
+        prop_tag = " | 🎭" if getattr(capture, "is_prop_moment", False) else ""
+        info_label = QLabel(f"{rank_badge} | <b>{score_pct}%</b>{prop_tag}")
         info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(info_label)
         
@@ -501,7 +502,7 @@ class VideoScanDialog(QDialog):
     def _on_open_output(self):
         folder = os.path.abspath(self.txt_output_dir.text().strip())
         os.makedirs(folder, exist_ok=True)
-        os.startfile(folder)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
 
     def _on_video_path_changed(self, text: str):
         path = text.strip()
@@ -755,12 +756,16 @@ class MainWindow(QMainWindow):
         self.chk_hud.toggled.connect(lambda val: setattr(self.video_widget, 'show_hud', val))
         
         self.chk_auto_capture = QCheckBox("Enable Auto-Capture")
-        self.chk_auto_capture.setChecked(True)
+        self.chk_auto_capture.setChecked(False)
         self.chk_auto_capture.toggled.connect(self._on_toggle_auto_capture)
         
-        self.chk_single_winner = QCheckBox("🏆 Keep 1 Best Shot Only")
-        self.chk_single_winner.setChecked(True)
+        self.chk_single_winner = QCheckBox(f"🏆 Keep Top {self.config.max_retained_captures} Shots Only")
+        self.chk_single_winner.setChecked(self.config.single_winner_mode)
         self.chk_single_winner.toggled.connect(self._on_toggle_single_winner)
+
+        self.chk_prop_moments = QCheckBox("🎭 Capture Stage Props")
+        self.chk_prop_moments.setChecked(getattr(self.config, "capture_prop_moments", True))
+        self.chk_prop_moments.toggled.connect(self._on_toggle_prop_moments)
         
         btn_manual_capture = QPushButton("📸 Manual Screenshot")
         btn_manual_capture.setObjectName("btn_capture")
@@ -770,6 +775,7 @@ class MainWindow(QMainWindow):
         hud_bar.addWidget(self.chk_hud)
         hud_bar.addWidget(self.chk_auto_capture)
         hud_bar.addWidget(self.chk_single_winner)
+        hud_bar.addWidget(self.chk_prop_moments)
         hud_bar.addStretch()
         hud_bar.addWidget(btn_manual_capture)
         left_layout.addLayout(hud_bar)
@@ -980,7 +986,11 @@ class MainWindow(QMainWindow):
             
             self.lbl_sharpness.setText(f"Sharpness: {int(analysis.laplacian_variance)} | EMA: {int(analysis.smoothed_score * 100)}%")
             
-            hand_status = "OBSTRUCTING ⚠️" if analysis.hands_covering_face else ("BLURRY 🔄" if analysis.is_hand_blurry else "CLEAR ✅")
+            hand_status = (
+                "OBSTRUCTING ⚠️" if analysis.hands_covering_face
+                else ("BLURRY 🔄" if analysis.is_hand_blurry
+                      else ("🎭 STAGE PROP / CANDID" if getattr(analysis, "is_prop_moment", False) else "CLEAR ✅"))
+            )
             self.lbl_hand.setText(f"Hand: {hand_status}")
             
             # New metrics
@@ -1043,8 +1053,14 @@ class MainWindow(QMainWindow):
     def _on_toggle_single_winner(self, checked: bool):
         self.config.single_winner_mode = checked
         if checked and self.processor:
-            self.processor.prune_to_best_n(5)
+            self.processor.prune_to_best_n(self.config.max_retained_captures)
             self._refresh_gallery_display()
+
+    def _on_toggle_prop_moments(self, checked: bool):
+        self.config.capture_prop_moments = checked
+        if self.processor:
+            self.processor.config.capture_prop_moments = checked
+            self.processor.analyzer.capture_prop_moments = checked
 
     def _on_capture_received(self, capture: CapturedScreenshot):
         self._refresh_gallery_display()
@@ -1107,8 +1123,8 @@ class MainWindow(QMainWindow):
         self._on_apply_source()
 
     def _on_toggle_auto_capture(self, checked: bool):
-        if self.processor:
-            self.processor.auto_capture_enabled = checked
+        if self._is_capturing != checked:
+            self._on_start_stop()
 
     def _on_manual_capture(self):
         if self.processor and self.video_widget.latest_result:
@@ -1188,7 +1204,7 @@ class MainWindow(QMainWindow):
     def _on_open_folder(self):
         folder = os.path.abspath(self.config.output_dir)
         os.makedirs(folder, exist_ok=True)
-        os.startfile(folder)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
 
     def _on_browse_output(self):
         """Open a folder picker to choose the output directory."""
@@ -1212,10 +1228,11 @@ class MainWindow(QMainWindow):
         if not results:
             return
         if self.processor:
-            for item in results:
-                # Avoid duplicate filepath entries
-                if not any(c.filepath == item.filepath for c in self.processor.saved_captures):
-                    self.processor.saved_captures.append(item)
+            with self.processor.captures_lock:
+                for item in results:
+                    # Avoid duplicate filepath entries
+                    if not any(c.filepath == item.filepath for c in self.processor.saved_captures):
+                        self.processor.saved_captures.append(item)
             self._refresh_gallery_display()
 
     def _on_start_stop(self):
@@ -1225,6 +1242,9 @@ class MainWindow(QMainWindow):
             if self.processor:
                 self.processor.auto_capture_enabled = False
             self._is_capturing = False
+            self.chk_auto_capture.blockSignals(True)
+            self.chk_auto_capture.setChecked(False)
+            self.chk_auto_capture.blockSignals(False)
             self.btn_start_stop.setText("▶  Start Capture")
             self.btn_start_stop.setStyleSheet("""
                 QPushButton {
@@ -1245,6 +1265,9 @@ class MainWindow(QMainWindow):
             if self.processor:
                 self.processor.auto_capture_enabled = True
             self._is_capturing = True
+            self.chk_auto_capture.blockSignals(True)
+            self.chk_auto_capture.setChecked(True)
+            self.chk_auto_capture.blockSignals(False)
             self.btn_start_stop.setText("⏹  Stop Capture")
             self.btn_start_stop.setStyleSheet("""
                 QPushButton {

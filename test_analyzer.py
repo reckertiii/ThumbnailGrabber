@@ -445,5 +445,63 @@ class TestPersonQualityAnalyzer(unittest.TestCase):
         """Test that MediaPipe FaceLandmarker with 52 blendshapes initializes properly."""
         self.assertIsNotNone(self.analyzer.face_landmarker, "FaceLandmarker should be initialized")
 
+    def test_stage_prop_detection_and_candid_relaxation(self):
+        """Test that holding a prop on stage triggers is_prop_moment, expands subject_bbox, and relaxes yaw/gaze/torso rules."""
+        from analyzer import SingleFaceAnalysis
+
+        # Synthetic 480x640 frame with a structured non-skin object held at chest/stage level
+        frame = np.full((480, 640, 3), 30, dtype=np.uint8)
+        # Draw a bright, textured blue/white stage prop (e.g., book/object) around (360..460, 220..320)
+        cv2.rectangle(frame, (365, 225), (455, 315), (240, 180, 40), -1)
+        for y in range(230, 310, 8):
+            cv2.line(frame, (370, y), (450, y), (20, 20, 220), 2)
+
+        f_res = SingleFaceAnalysis(
+            person_id=1,
+            bbox=(240, 80, 100, 120),
+            shoulder_detected=True,
+            shoulder_points=((200, 230), (380, 230)),
+            pose_points={
+                "left_shoulder": (200, 230),
+                "right_shoulder": (380, 230),
+                "left_hip": (210, 420),
+                "right_hip": (370, 420),
+            },
+            shoulder_tilt_deg=2.0,
+            is_shoulders_level=True,
+            shoulder_pose_score=1.0,
+            head_pose_score=0.80,
+            eye_openness_score=0.95,
+            expression_score=0.90,
+            sharpness_score=0.90,
+            exposure_score=0.95,
+            yaw_deg=35.0,       # Normally > 30° max_yaw_deg, but valid for candid prop moment (<= 40.5°)
+            pitch_deg=-22.0,    # Glancing down at prop
+            eye_look_down_score=0.35,
+            is_looking_down=False,
+        )
+
+        # 21-point hand skeleton positioned right next to the prop at chest height
+        hand_pts = [(360 + (i % 5) * 6, 250 + (i // 5) * 8) for i in range(21)]
+        is_prop, prop_box = self.analyzer._detect_held_prop(frame, f_res, [hand_pts])
+        self.assertTrue(is_prop, "Should detect held stage prop near raised hand")
+        self.assertIsNotNone(prop_box, "Should return a bounding box for the held prop")
+
+        f_res.is_prop_moment = is_prop
+        f_res.prop_bbox = prop_box
+
+        # Compute cutout score and verify subject_bbox expands to include hand & prop
+        self.analyzer._compute_cutout_score(frame, f_res, [hand_pts])
+        sx, sy, sw, sh = f_res.subject_bbox
+        self.assertGreaterEqual(sx + sw, prop_box[0] + prop_box[2],
+                                "Subject crop bbox must expand to include the held prop")
+        self.assertFalse(f_res.hands_on_torso,
+                         "Holding a prop in front of the torso must not be flagged as hands_on_torso")
+
+        # Finalize score and verify yaw (35°) and gaze toward prop are accepted
+        self.analyzer._finalize_face_score(f_res)
+        self.assertTrue(f_res.is_qualified,
+                        f"Prop moment with 35° yaw and gaze on prop should qualify, got: {f_res.disqualified_reasons}")
+
 if __name__ == "__main__":
     unittest.main()

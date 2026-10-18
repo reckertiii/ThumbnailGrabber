@@ -2,6 +2,7 @@ import cv2
 import time
 import os
 import threading
+import contextlib
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional, Callable, Dict, Any, List, Tuple
@@ -23,6 +24,8 @@ class CapturedScreenshot:
     judge_score: Optional[float] = None   # Vision-model score, if the judge ran
     judge_summary: str = ""
     judge_issues: List[str] = field(default_factory=list)
+    is_prop_moment: bool = False          # True when speaker is holding/presenting a stage prop
+    from_video_scan: bool = False         # True when produced by the offline video scanner
 
 
 def subject_crop_rect(analysis: AnalysisResult, frame_w: int, frame_h: int,
@@ -102,7 +105,12 @@ class StreamProcessor:
             stability_threshold=config.score_stability_threshold,
             blink_suppression_ms=config.blink_suppression_ms,
             max_people_target=config.max_people_target,
-            pose_hand_interval=getattr(config, "pose_hand_interval", 1)
+            pose_hand_interval=getattr(config, "pose_hand_interval", 1),
+            use_ml_preference=getattr(config, "use_ml_preference", True),
+            ml_weight=getattr(config, "ml_weight", 0.35),
+            min_consecutive_qualified=getattr(config, "min_consecutive_qualified", 2),
+            require_exact_people_count=getattr(config, "require_exact_people_count", False),
+            capture_prop_moments=getattr(config, "capture_prop_moments", True),
         )
         self.on_frame_callback = on_frame_callback
         self.on_capture_callback = on_capture_callback
@@ -117,6 +125,7 @@ class StreamProcessor:
         self.latest_frame: Optional[np.ndarray] = None
         self.latest_analysis: Optional[AnalysisResult] = None
         self.frame_lock = threading.Lock()
+        self.captures_lock = threading.RLock()
         
         # Rolling raw-frame buffer. The grabber fills it at camera rate; a chosen moment
         # is then re-examined across it at full frame rate, rather than being stuck with
@@ -545,21 +554,28 @@ class StreamProcessor:
             self._refine_analyzer = PersonQualityAnalyzer(
                 self.config.weights, self.config.thresholds,
                 max_people_target=self.config.max_people_target,
-                pose_hand_interval=getattr(self.config, "pose_hand_interval", 1),
+                pose_hand_interval=1,
                 require_temporal_stability=False,
+                use_ml_preference=getattr(self.config, "use_ml_preference", True),
+                ml_weight=getattr(self.config, "ml_weight", 0.35),
+                require_exact_people_count=getattr(self.config, "require_exact_people_count", False),
+                capture_prop_moments=getattr(self.config, "capture_prop_moments", True),
             )
+        else:
+            self._refine_analyzer.capture_prop_moments = getattr(self.analyzer, "capture_prop_moments", True)
 
         started_qualified = chosen_analysis.is_qualified
         best_frame, best_analysis = chosen_frame, chosen_analysis
         best_score = chosen_analysis.overall_score if started_qualified else -1.0
+        best_time = chosen_at
 
-        for _sharp, _t, f in scored[:top_n]:
+        for _sharp, cand_t, f in scored[:top_n]:
             try:
                 a = self._refine_analyzer.analyze_frame(f)
             except Exception:
                 continue
             if a.face_detected and a.is_qualified and a.overall_score > best_score:
-                best_score, best_frame, best_analysis = a.overall_score, f, a
+                best_score, best_frame, best_analysis, best_time = a.overall_score, f, a, cand_t
 
         if best_analysis is not chosen_analysis:
             print(f"[Refine] {chosen_analysis.overall_score:.0%} -> {best_score:.0%} "
@@ -567,7 +583,7 @@ class StreamProcessor:
                   f"{best_analysis.laplacian_variance:.0f}) from {len(nearby)} buffered frames")
         return best_frame, best_analysis
 
-    def _would_improve_retained(self, score: float, now: float) -> bool:
+    def _would_improve_retained(self, score: float, now: float, is_prop_moment: bool = False) -> bool:
         """Is this capture worth writing, given what is already kept?
 
         This replaced a check that compared each candidate against the *last saved*
@@ -581,9 +597,15 @@ class StreamProcessor:
         if not self.config.single_winner_mode:
             return True
         n = max(1, self.config.max_retained_captures)
-        kept = self.saved_captures
+        with getattr(self, "captures_lock", contextlib.nullcontext()):
+            kept = [c for c in self.saved_captures if not getattr(c, "from_video_scan", False)]
         if len(kept) < n:
             return True
+
+        prop_enabled = bool(getattr(self.config, "capture_prop_moments", True)) and n > 1
+        prop_cap = min(max(0, int(getattr(self.config, "max_prop_captures", 2))), max(0, n - 1)) if prop_enabled else 0
+        kept_props = [c for c in kept if getattr(c, "is_prop_moment", False)]
+        non_props = [c for c in kept if not getattr(c, "is_prop_moment", False)]
 
         spacing = max(0.0, float(getattr(self.config, "min_capture_spacing_sec", 0.0)))
         if spacing > 0:
@@ -591,7 +613,22 @@ class StreamProcessor:
             # one is not worth a second copy of the same few seconds.
             nearby = [c for c in kept if abs(now - c.captured_at) < spacing]
             if nearby:
+                if is_prop_moment and prop_enabled:
+                    nearby_props = [c for c in nearby if getattr(c, "is_prop_moment", False)]
+                    if nearby_props:
+                        return score > max(c.overall_score for c in nearby_props)
+                    if len(kept_props) < prop_cap:
+                        return True
                 return score > max(c.overall_score for c in nearby)
+
+        if is_prop_moment and prop_enabled:
+            if len(kept_props) < prop_cap:
+                return True
+            if kept_props:
+                return score > min(c.overall_score for c in kept_props) or score > min(c.overall_score for c in kept)
+
+        if not is_prop_moment and prop_enabled and kept_props and len(kept_props) <= prop_cap and non_props:
+            return score > min(c.overall_score for c in non_props)
 
         return score > min(c.overall_score for c in kept)
 
@@ -622,19 +659,23 @@ class StreamProcessor:
         if not best_analysis.is_qualified:
             return
 
+        is_prop = bool(getattr(best_analysis, "is_prop_moment", False))
+
         # === Would this actually improve what we're keeping? ===
-        if not self._would_improve_retained(best_analysis.overall_score, now):
+        if not self._would_improve_retained(best_analysis.overall_score, cand_time, is_prop_moment=is_prop):
             return
 
         # All checks passed — either save now, or send it for review first.
         if self.judge.available:
-            if not self._start_review(best_frame, best_analysis, now):
+            if not self._start_review(best_frame, best_analysis, now, cand_time=cand_time):
                 return   # a review is already running; the next candidate will come along
         else:
-            self.save_screenshot(best_frame, best_analysis)
+            self.save_screenshot(best_frame, best_analysis, captured_at=cand_time)
         # Reports the terms that actually drive the pick. Plain "deg" rather than the
         # degree sign, which mojibakes on a default Windows console codepage.
         flags = []
+        if is_prop:
+            flags.append("prop-moment")
         if best_analysis.is_smiling:
             flags.append("smile")
         if best_analysis.hands_on_torso:
@@ -653,11 +694,13 @@ class StreamProcessor:
         self.last_capture_time = now
         self.candidate_buffer.clear()
 
-    def _start_review(self, frame: np.ndarray, analysis: AnalysisResult, now: float) -> bool:
+    def _start_review(self, frame: np.ndarray, analysis: AnalysisResult, now: float,
+                      cand_time: Optional[float] = None) -> bool:
         """Queues a candidate for judge review and makes sure the worker is running."""
+        actual_time = cand_time if cand_time is not None else now
         with self._review_lock:
             dropped = len(self._review_queue) == self._review_queue.maxlen
-            self._review_queue.append((frame.copy(), analysis))
+            self._review_queue.append((frame.copy(), analysis, actual_time))
             if dropped:
                 print(f"[AIJudge] Review queue full ({self._review_queue.maxlen}); "
                       f"dropped the oldest pending candidate.")
@@ -677,48 +720,66 @@ class StreamProcessor:
                 if not self._review_queue:
                     self._review_in_flight = False
                     return
-                frame, analysis = self._review_queue.popleft()
+                item = self._review_queue.popleft()
+                if len(item) == 3:
+                    frame, analysis, cand_time = item
+                else:
+                    frame, analysis = item
+                    cand_time = time.time()
                 self._review_in_flight = True
             try:
-                self._review_and_save(frame, analysis)
+                self._review_and_save(frame, analysis, cand_time=cand_time)
             except Exception as e:  # noqa: BLE001 - one bad candidate must not end the worker
                 print(f"[AIJudge] Review worker error: {e}")
 
-    def _review_and_save(self, frame: np.ndarray, analysis: AnalysisResult) -> None:
+    def _review_and_save(self, frame: np.ndarray, analysis: AnalysisResult,
+                         cand_time: Optional[float] = None) -> None:
         try:
+            actual_time = cand_time if cand_time is not None else time.time()
             h, w = frame.shape[:2]
             rect = subject_crop_rect(analysis, w, h, self.config.subject_crop_padding)
             crop = frame if rect is None else frame[rect[1]:rect[1] + rect[3], rect[0]:rect[0] + rect[2]]
             notes = list(getattr(analysis, "disqualified_reasons", []) or [])
-            if analysis.hands_on_torso:
+            if getattr(analysis, "is_prop_moment", False):
+                notes.append("speaker appears to be holding or presenting a stage prop")
+            elif analysis.hands_on_torso:
                 notes.append("hands over the torso")
             if analysis.is_subject_clipped:
                 notes.append("subject runs off the frame edge")
 
             result = self.judge.judge(crop, analysis.overall_score, notes)
 
+            if result.verdict is not None and getattr(result.verdict, "holding_prop", False):
+                if getattr(self.config, "capture_prop_moments", True):
+                    analysis.is_prop_moment = True
+
             # "Unusable" is a hard no only once there is something better to keep. Early
             # in a service it is a heavy penalty instead, so a strict judge can never
             # leave the gallery empty - the same reason the heuristics don't hard-gate.
             if result.verdict is not None and not result.verdict.usable:
                 n = max(1, self.config.max_retained_captures)
-                if not self.config.single_winner_mode or len(self.saved_captures) >= n:
+                with getattr(self, "captures_lock", contextlib.nullcontext()):
+                    live_kept = [c for c in self.saved_captures if not getattr(c, "from_video_scan", False)]
+                if not self.config.single_winner_mode or len(live_kept) >= n:
                     print(f"[AIJudge] Rejected ({analysis.overall_score:.0%} -> judge "
                           f"{result.verdict.score:.0%}): {result.verdict.summary}")
                     return
                 result.blended_score = round(min(result.blended_score, analysis.overall_score * 0.5), 3)
 
+            is_prop = bool(getattr(analysis, "is_prop_moment", False))
+
             # Re-check against the kept set with the blended score: the review took a
             # few seconds, and a better capture may have landed meanwhile.
-            if not self._would_improve_retained(result.blended_score, time.time()):
+            if not self._would_improve_retained(result.blended_score, actual_time, is_prop_moment=is_prop):
                 return
 
-            self.save_screenshot(frame, analysis, review=result)
+            self.save_screenshot(frame, analysis, review=result, captured_at=actual_time)
         except Exception as e:  # noqa: BLE001 - a review failure must not kill the worker
             print(f"[AIJudge] Review failed for one candidate: {e}")
 
     def save_screenshot(self, frame: np.ndarray, analysis: AnalysisResult,
-                        review: Optional[JudgeResult] = None) -> CapturedScreenshot:
+                        review: Optional[JudgeResult] = None,
+                        captured_at: Optional[float] = None) -> CapturedScreenshot:
         """Saves screenshot frame to disk and prunes inferior shots if Single Winner Mode is enabled."""
         heuristic = analysis.overall_score
         final_score = heuristic
@@ -726,9 +787,17 @@ class StreamProcessor:
         if verdict is not None:
             final_score = review.blended_score
 
-        timestamp_str = time.strftime("%Y%m%d_%H%M%S")
-        ms_str = f"{int((time.time() % 1) * 1000):03d}"
-        base_name = f"best_shot_{timestamp_str}_{ms_str}_score_{int(final_score * 100)}"
+        is_prop = bool(
+            getattr(analysis, "is_prop_moment", False) or
+            (verdict is not None and getattr(verdict, "holding_prop", False) and getattr(self.config, "capture_prop_moments", True))
+        )
+        analysis.is_prop_moment = is_prop
+
+        cap_ts = captured_at if captured_at is not None else time.time()
+        timestamp_str = time.strftime("%Y%m%d_%H%M%S", time.localtime(cap_ts))
+        ms_str = f"{int((cap_ts % 1) * 1000):03d}"
+        prop_tag = "_prop" if is_prop else ""
+        base_name = f"best_shot_{timestamp_str}_{ms_str}{prop_tag}_score_{int(final_score * 100)}"
 
         filepath, crop_path = write_capture(
             frame, analysis, self.config.output_dir, base_name, self.config
@@ -740,67 +809,93 @@ class StreamProcessor:
             overall_score=final_score,
             analysis=analysis,
             crop_filepath=crop_path,
-            captured_at=time.time(),
+            captured_at=cap_ts,
             heuristic_score=heuristic,
             judge_score=(float(verdict.score) if verdict is not None else None),
             judge_summary=(verdict.summary if verdict is not None else ""),
             judge_issues=(list(verdict.issues) if verdict is not None else []),
+            is_prop_moment=is_prop,
         )
         if verdict is not None:
             print(f"[AIJudge] Kept ({heuristic:.0%} -> judge {verdict.score:.0%} = {final_score:.0%}, "
                   f"{review.latency_sec:.1f}s): {verdict.summary}")
         
-        self.saved_captures.append(capture_item)
-        
-        # In Single Winner Mode, compare against existing captures and keep ONLY the top #1 best screenshot on disk
-        if self.config.single_winner_mode:
-            self.prune_to_best_n(self.config.max_retained_captures)
-        else:
-            self.captures_count += 1
-            if self.on_capture_callback:
-                self.on_capture_callback(capture_item)
+        with getattr(self, "captures_lock", contextlib.nullcontext()):
+            self.saved_captures.append(capture_item)
+            
+            # In Single Winner Mode, compare against existing captures and keep ONLY the top N best screenshots on disk
+            if self.config.single_winner_mode:
+                self.prune_to_best_n(self.config.max_retained_captures)
+            else:
+                self.captures_count += 1
+                if self.on_capture_callback:
+                    self.on_capture_callback(capture_item)
             
         return capture_item
 
     def prune_to_best_n(self, n: int = 1):
         """Analyzes all captures, keeps the top N highest-scoring screenshots, and deletes inferior candidate files from disk."""
-        if not self.saved_captures:
-            return
+        with getattr(self, "captures_lock", contextlib.nullcontext()):
+            if not self.saved_captures:
+                return
 
-        # Best first, but five shots from the same ten seconds are one shot with
-        # variations. Spread the keepers out, then relax the spacing only if there
-        # aren't enough well-separated shots to fill the slots.
-        ordered = sorted(self.saved_captures, key=lambda item: item.overall_score, reverse=True)
-        spacing = max(0.0, float(getattr(self.config, "min_capture_spacing_sec", 0.0)))
-        winners: List[CapturedScreenshot] = []
-        for enforce in (True, False):
-            for c in ordered:
-                if len(winners) >= n:
-                    break
-                if c in winners:
-                    continue
-                if enforce and spacing > 0 and any(
-                    abs(c.captured_at - w.captured_at) < spacing for w in winners
-                ):
-                    continue
-                winners.append(c)
-        losers = [c for c in ordered if c not in winners]
-        winners.sort(key=lambda item: item.overall_score, reverse=True)
-        
-        # Delete inferior screenshot files from disk
-        for loser in losers:
-            # Remove the companion subject crop alongside the full frame, otherwise
-            # pruning leaves orphaned crops of shots that were deleted.
-            for path in (loser.filepath, loser.crop_filepath):
-                if path and os.path.exists(path):
-                    try:
-                        os.remove(path)
-                        print(f"[StreamProcessor] Pruned inferior shot: {path} (Score: {loser.overall_score})")
-                    except Exception as e:
-                        print(f"[StreamProcessor] Error deleting file {path}: {e}")
+            scan_items = [c for c in self.saved_captures if getattr(c, "from_video_scan", False)]
+            live_items = [c for c in self.saved_captures if not getattr(c, "from_video_scan", False)]
+            if not live_items:
+                return
 
-        self.saved_captures = winners
-        self.captures_count = len(winners)
+            # Best first, but five shots from the same ten seconds are one shot with
+            # variations. Spread the keepers out, then relax the spacing only if there
+            # aren't enough well-separated shots to fill the slots.
+            ordered = sorted(live_items, key=lambda item: item.overall_score, reverse=True)
+            spacing = max(0.0, float(getattr(self.config, "min_capture_spacing_sec", 0.0)))
+            winners: List[CapturedScreenshot] = []
+
+            # Reserve up to max_prop_captures slots for candid prop moments when enabled
+            prop_enabled = bool(getattr(self.config, "capture_prop_moments", True)) and n > 1
+            prop_cap = min(max(0, int(getattr(self.config, "max_prop_captures", 2))), max(0, n - 1)) if prop_enabled else 0
+            if prop_cap > 0:
+                prop_candidates = [c for c in ordered if getattr(c, "is_prop_moment", False)]
+                for enforce in (True, False):
+                    for c in prop_candidates:
+                        if len(winners) >= prop_cap:
+                            break
+                        if c in winners:
+                            continue
+                        if enforce and spacing > 0 and any(
+                            abs(c.captured_at - w.captured_at) < spacing for w in winners
+                        ):
+                            continue
+                        winners.append(c)
+
+            for enforce in (True, False):
+                for c in ordered:
+                    if len(winners) >= n:
+                        break
+                    if c in winners:
+                        continue
+                    if enforce and spacing > 0 and any(
+                        abs(c.captured_at - w.captured_at) < spacing for w in winners
+                    ):
+                        continue
+                    winners.append(c)
+            losers = [c for c in ordered if c not in winners]
+            winners.sort(key=lambda item: item.overall_score, reverse=True)
+            
+            # Delete inferior screenshot files from disk
+            for loser in losers:
+                # Remove the companion subject crop alongside the full frame, otherwise
+                # pruning leaves orphaned crops of shots that were deleted.
+                for path in (loser.filepath, loser.crop_filepath):
+                    if path and os.path.exists(path):
+                        try:
+                            os.remove(path)
+                            print(f"[StreamProcessor] Pruned inferior shot: {path} (Score: {loser.overall_score})")
+                        except Exception as e:
+                            print(f"[StreamProcessor] Error deleting file {path}: {e}")
+
+            self.saved_captures = winners + scan_items
+            self.captures_count = len(winners)
 
         # Notify callback with the champion winner
         if winners and self.on_capture_callback:

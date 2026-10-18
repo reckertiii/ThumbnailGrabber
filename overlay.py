@@ -89,6 +89,8 @@ def draw_overlay(frame_bgr: np.ndarray, analysis: Optional[AnalysisResult],
             if is_sel:
                 color = PERSON_COLORS[idx % len(PERSON_COLORS)] if f_item.is_qualified else (0, 165, 255)
                 label = f"P{f_item.person_id}: {int(f_item.score * 100)}%"
+                if getattr(f_item, 'is_prop_moment', False):
+                    label += " [PROP/CANDID]"
                 if getattr(f_item, 'is_licking_lips', False):
                     label += " [LICKING]"
                 elif getattr(f_item, 'is_talking_or_open', False):
@@ -99,7 +101,7 @@ def draw_overlay(frame_bgr: np.ndarray, analysis: Optional[AnalysisResult],
                     label += " [BLINK]"
                 elif f_item.is_smiling:
                     label += " [SMILE]"
-                elif f_item.is_looking_down:
+                elif f_item.is_looking_down and not getattr(f_item, 'is_prop_moment', False):
                     label += " [LOOK DOWN]"
                 elif f_item.is_awkward_expression:
                     label += " [SPEECH]"
@@ -113,6 +115,14 @@ def draw_overlay(frame_bgr: np.ndarray, analysis: Optional[AnalysisResult],
                               (bx + max(140, len(label) * 11), by), color, -1)
                 cv2.putText(display_frame, label, (bx + 6, max(12, by - 8)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2)
+
+                prop_box = getattr(f_item, 'prop_bbox', None)
+                if getattr(f_item, 'is_prop_moment', False) and prop_box:
+                    px, py, pw, ph = prop_box
+                    prop_col = (0, 215, 255)
+                    cv2.rectangle(display_frame, (px, py), (px + pw, py + ph), prop_col, 2)
+                    cv2.putText(display_frame, "STAGE PROP", (px + 4, max(14, py - 6)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, prop_col, 2)
             else:
                 color = (120, 120, 120)
                 label = f"OFF P{f_item.person_id} (Ignored)"

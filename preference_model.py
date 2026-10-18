@@ -14,7 +14,7 @@ class UserPreferenceModel:
     """Scikit-Learn ML Model (Logistic Regression with StandardScaler)
     that learns user visual preference for thumbnail selection.
     
-    Extracts normalized 9-D feature vectors from AnalysisResult objects and
+    Extracts normalized 13-D feature vectors from AnalysisResult objects and
     trains on user feedback (⭐ Favorite = 1, 👎 Rejected = 0).
     Labelled samples persist to models/user_preference_model.json; the estimator is
     refit from them on load.
@@ -22,10 +22,20 @@ class UserPreferenceModel:
     
     # User ratings, unlike the downloaded weights, must persist across container
     # restarts — so this stays on the mounted data directory.
-    JSON_DATA_PATH = os.path.join(
+    _DEFAULT_JSON_DATA_PATH = os.path.join(
         os.environ.get("TG_DATA_DIR", "").strip() or os.path.join(os.getcwd(), "models"),
         "user_preference_model.json"
     )
+    JSON_DATA_PATH = _DEFAULT_JSON_DATA_PATH
+
+    def _get_json_path(self) -> str:
+        # Respect test overrides of JSON_DATA_PATH while still honoring runtime TG_DATA_DIR changes.
+        if self.JSON_DATA_PATH != self._DEFAULT_JSON_DATA_PATH:
+            return self.JSON_DATA_PATH
+        env_dir = os.environ.get("TG_DATA_DIR", "").strip()
+        if env_dir:
+            return os.path.join(env_dir, "user_preference_model.json")
+        return self.JSON_DATA_PATH
 
     # Bump whenever the meaning or scale of any feature changes. Samples recorded under
     # an older version describe different quantities, so mixing them in would train the
@@ -73,17 +83,17 @@ class UserPreferenceModel:
         self.load()
 
     @staticmethod
-    def extract_features(analysis) -> np.ndarray:
-        """Extracts a normalized 9-dimensional feature vector from an AnalysisResult."""
-        yaw_norm = min(1.0, abs(getattr(analysis, 'yaw_deg', 0.0)) / 30.0)
-        pitch_norm = min(1.0, abs(getattr(analysis, 'pitch_deg', 0.0)) / 25.0)
+    def extract_features(analysis, thresholds: Optional[QualityThresholds] = None) -> np.ndarray:
+        """Extracts a normalized 13-dimensional feature vector from an AnalysisResult."""
+        t = thresholds or QualityThresholds()
+        yaw_norm = min(1.0, abs(getattr(analysis, 'yaw_deg', 0.0)) / max(1.0, t.max_yaw_deg))
+        pitch_norm = min(1.0, abs(getattr(analysis, 'pitch_deg', 0.0)) / max(1.0, t.max_pitch_deg))
         eye_open = min(1.0, max(0.0, getattr(analysis, 'avg_ear', 0.35) / 0.40))
         smile = min(1.0, max(0.0, getattr(analysis, 'smile_ratio', 0.5) / 1.0))
         mar = min(1.0, max(0.0, getattr(analysis, 'mar', 0.2)))
         shoulder_tilt_norm = min(1.0, max(0.0, getattr(analysis, 'shoulder_tilt_deg', 0.0) / 15.0))
         # Normalised against the live thresholds rather than a hardcoded span, so a
         # recalibration of the scorer cannot silently flatten this feature.
-        t = QualityThresholds()
         floor, good = t.sharpness_floor, max(t.sharpness_floor + 1.0, t.sharpness_good)
         lap = getattr(analysis, 'laplacian_variance', floor)
         sharp = min(1.0, max(0.0, (lap - floor) / (good - floor)))
@@ -192,29 +202,31 @@ class UserPreferenceModel:
     def save(self):
         """Persists the labelled samples. The estimator itself is refit from these on
         load, so there is no pickled model to fall out of step with the ratings."""
-        os.makedirs(os.path.dirname(self.JSON_DATA_PATH), exist_ok=True)
+        json_path = self._get_json_path()
+        os.makedirs(os.path.dirname(json_path), exist_ok=True)
         try:
             data = {
                 "feature_version": self.FEATURE_VERSION,
                 "is_trained": self.is_trained,
                 "confidence": self.confidence,
                 "confidence_metric": "cross_val_balanced_accuracy",
-            "trust": self.trust,
+                "trust": self.trust,
                 "sample_count": len(self.samples),
                 "samples": self.samples[-100:]
             }
-            with open(self.JSON_DATA_PATH, "w") as f:
+            with open(json_path, "w") as f:
                 json.dump(data, f, indent=2)
         except Exception as e:
             print(f"[UserPreferenceModel] Error saving preference data: {e}")
 
     def load(self):
         """Loads stored feedback, discarding it if it predates the current feature set."""
-        if not os.path.exists(self.JSON_DATA_PATH):
+        json_path = self._get_json_path()
+        if not os.path.exists(json_path):
             return
 
         try:
-            with open(self.JSON_DATA_PATH, "r") as f:
+            with open(json_path, "r") as f:
                 data = json.load(f)
         except Exception as e:
             print(f"[UserPreferenceModel] JSON data load error: {e}")
@@ -233,6 +245,7 @@ class UserPreferenceModel:
             self.samples = []
             self.is_trained = False
             self.confidence = 0.0
+            self.save()
             return
 
         self.samples = [

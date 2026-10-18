@@ -12,8 +12,8 @@ The verdict is blended into the capture's score and can veto a save outright.
 Two backends. The Claude API gives the sharpest judgement; a local Ollama vision model
 (qwen3-vl by default) runs on the same box with no per-call cost and nothing leaving
 the network, at the price of slower and somewhat blunter reviews. Because review runs
-on its own thread and a candidate is skipped rather than queued while one is in flight,
-a slow local model simply reviews fewer frames — it never stalls capture.
+on its own worker thread fed by a bounded queue (where a full queue replaces the weakest
+queued candidate), a slow local model simply reviews fewer frames — it never stalls capture.
 
 Entirely optional. With neither credentials nor a reachable Ollama, the judge stays
 off and says so once.
@@ -53,6 +53,9 @@ class JudgeVerdict(BaseModel):
         description="1.0 minus 0.1 per (small), 0.2 per (moderate), 0.4 per (serious) item in issues; floor 0.")
     usable: bool = Field(description="False only if a fatal flaw is present.")
     summary: str = Field(description="One sentence, under 25 words, as a person would say it.")
+    holding_prop: bool = Field(
+        default=False,
+        description="True when the speaker is intentionally holding up, showing, or presenting a physical stage prop, object, or book.")
 
 
 @dataclass
@@ -76,20 +79,25 @@ choosing the best available frame from a live recording, not judging a studio po
 most frames have some flaw, and your job is to rank them, not to reject them.
 
 What makes a frame better:
-- Eyes open and engaged, toward the camera or audience. Glancing at notes is a small flaw; \
-eyes closed or mid-blink is a serious one.
+- Eyes open and engaged, toward the camera, audience, or a stage prop they are actively presenting. \
+Glancing at notes is a small flaw; eyes closed or mid-blink is a serious one.
 - Mouth closed, or a natural pleasant expression. A slight smile is best. Caught mid-word is \
 a moderate flaw; a grimace or half-formed expression is worse.
 - Open posture. Hands gesturing outward or resting naturally are good. Arms folded or \
 hands clasped tight against the chest read as closed-off. Hands simply being somewhere in \
 front of the body is normal for someone speaking and is measured separately - only raise \
 it when they genuinely merge into the torso as a single shape.
+- Candid Stage Props: If the speaker is intentionally holding up, showing, or demonstrating \
+a physical prop or object on stage (e.g. a book, Bible, tool, sign, vessel, or sermon illustration \
+object), set `holding_prop` to true and treat it as a strong candid moment! Do NOT penalize \
+an intentionally held prop or the hands holding it as a torso obstruction, and allow natural \
+gaze toward the prop.
 - Expression and gaze are what you are most useful for, because they are the hardest to \
 measure and the easiest for a person to notice. Weigh them above everything else: is he \
 engaged and present, or caught between two expressions, glancing away, or blank?
-- Nothing crossing the body. A microphone stand, iPad, or lectern edge in front of the torso \
-is a serious flaw because it breaks the cutout. A hand in front of the torso is a moderate \
-flaw. Anything covering the face is fatal.
+- Nothing accidentally blocking the body. A stationary microphone stand, iPad stand, or lectern \
+edge in front of the torso is a serious flaw because it breaks the cutout. Anything covering \
+the face is fatal.
 - Sharp. Look specifically for motion blur - a smeared hand or arm caught mid-gesture, or a smeared face. Blur on a raised or gesturing hand is a real flaw, because that hand is part of the cutout and will look wrong frozen on a slide. Call it out when you see it: moderate when a hand or arm is smeared, serious when the face is.
 - Whole head in frame with a little room above it.
 
@@ -110,11 +118,15 @@ def _normalise_verdict_json(text: str) -> str:
         obj = json.loads(text)
     except Exception:  # noqa: BLE001 - let the caller's parser report it
         return text
+    changed = False
     score = obj.get("score")
     if isinstance(score, (int, float)) and score > 1.0:
         obj["score"] = max(0.0, min(1.0, float(score) / 100.0))
-        return json.dumps(obj)
-    return text
+        changed = True
+    if "holding_prop" not in obj and isinstance(obj, dict):
+        obj["holding_prop"] = False
+        changed = True
+    return json.dumps(obj) if changed else text
 
 
 def _keep_alive_value(raw: str):

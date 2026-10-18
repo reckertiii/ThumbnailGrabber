@@ -163,6 +163,18 @@ def _header(response: str, name: str) -> str:
     return m.group(1).strip() if m else ""
 
 
+def _best_challenge(response: str) -> Tuple[str, Dict[str, str]]:
+    """Extracts the preferred WWW-Authenticate challenge (preferring Digest over Basic)."""
+    matches = re.findall(r"^WWW-Authenticate\s*:\s*(.+)$", response, re.IGNORECASE | re.MULTILINE)
+    if not matches:
+        return "", {}
+    parsed = [_parse_challenge(m.strip()) for m in matches]
+    for scheme, params in parsed:
+        if scheme == "digest":
+            return scheme, params
+    return parsed[0]
+
+
 def _describe(host: str, port: int, path: str, user: str, password: str,
               timeout: float) -> Tuple[int, str]:
     """One DESCRIBE, retried once with credentials if the camera asks.
@@ -173,32 +185,44 @@ def _describe(host: str, port: int, path: str, user: str, password: str,
         path = "/" + path
     uri = f"rtsp://{host}:{port}{path}"
 
-    with socket.create_connection((host, port), timeout=timeout) as sock:
-        def send(extra_auth: str = "", cseq: int = 1) -> str:
-            lines = [
-                f"{_METHOD} {uri} RTSP/1.0",
-                f"CSeq: {cseq}",
-                "User-Agent: ThumbnailGrabber/1.0",
-                "Accept: application/sdp",
-            ]
-            if extra_auth:
-                lines.append(f"Authorization: {extra_auth}")
-            sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("utf-8"))
-            return _recv_response(sock, timeout)
+    def _send_on(sock: socket.socket, extra_auth: str = "", cseq: int = 1) -> str:
+        lines = [
+            f"{_METHOD} {uri} RTSP/1.0",
+            f"CSeq: {cseq}",
+            "User-Agent: ThumbnailGrabber/1.0",
+            "Accept: application/sdp",
+        ]
+        if extra_auth:
+            lines.append(f"Authorization: {extra_auth}")
+        sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("utf-8"))
+        return _recv_response(sock, timeout)
 
-        resp = send()
+    with socket.create_connection((host, port), timeout=timeout) as sock:
+        resp = _send_on(sock)
         status = _status_of(resp)
 
         if status == 401 and (user or password):
-            challenge = _header(resp, "WWW-Authenticate")
-            scheme, params = _parse_challenge(challenge) if challenge else ("", {})
+            scheme, params = _best_challenge(resp)
             if scheme == "digest":
                 auth = _digest_header(user, password, uri, params)
             else:
                 token = base64.b64encode(f"{user}:{password}".encode("utf-8")).decode()
                 auth = f"Basic {token}"
-            resp = send(auth, cseq=2)
-            status = _status_of(resp)
+            try:
+                resp2 = _send_on(sock, auth, cseq=2)
+                status2 = _status_of(resp2)
+            except (OSError, socket.timeout):
+                resp2, status2 = "", 0
+
+            if status2 == 0:
+                # Some cameras close the TCP socket immediately after sending 401;
+                # retry the authenticated request on a fresh connection.
+                with socket.create_connection((host, port), timeout=timeout) as sock2:
+                    resp2 = _send_on(sock2, auth, cseq=2)
+                    status2 = _status_of(resp2)
+
+            if status2 != 0:
+                resp, status = resp2, status2
 
         return status, resp
 
@@ -307,8 +331,7 @@ def probe(host: str, port: int = DEFAULT_PORT, path: str = "",
         if status == 401:
             # Credentials are wrong, and no other path will change that, so stop
             # rather than walking the whole list collecting the same answer.
-            challenge = _header(resp, "WWW-Authenticate")
-            scheme, _ = _parse_challenge(challenge) if challenge else ("", {})
+            scheme, _ = _best_challenge(resp)
             r.stage, r.code = "rtsp", "unauthorized"
             r.rtsp_status = 401
             r.auth_scheme = scheme

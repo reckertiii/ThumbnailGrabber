@@ -78,6 +78,10 @@ class VideoRecordingScanner:
             max_people_target=self.config.max_people_target,
             # Offline scanning judges each sampled frame independently.
             require_temporal_stability=False,
+            use_ml_preference=getattr(self.config, "use_ml_preference", True),
+            ml_weight=getattr(self.config, "ml_weight", 0.35),
+            require_exact_people_count=getattr(self.config, "require_exact_people_count", False),
+            capture_prop_moments=getattr(self.config, "capture_prop_moments", True),
         )
 
     @staticmethod
@@ -358,7 +362,12 @@ class VideoRecordingScanner:
 
         for rank_idx, cand in enumerate(selected_candidates, 1):
             score_int = int(round(cand.overall_score * 100))
-            base_name = f"{video_base_name}_ts_{cand.timestamp_str}_rank{rank_idx}_score{score_int}"
+            is_prop = bool(
+                getattr(cand.analysis, "is_prop_moment", False) or
+                (cand.verdict is not None and getattr(cand.verdict, "holding_prop", False) and getattr(self.config, "capture_prop_moments", True))
+            )
+            prop_tag = "_prop" if is_prop else ""
+            base_name = f"{video_base_name}_ts_{cand.timestamp_str}_rank{rank_idx}{prop_tag}_score{score_int}"
 
             out_filepath, crop_path = write_capture(
                 cand.frame, cand.analysis, out_dir, base_name, self.config
@@ -375,6 +384,8 @@ class VideoRecordingScanner:
                 judge_score=(float(cand.verdict.score) if cand.verdict else None),
                 judge_summary=(cand.verdict.summary if cand.verdict else ""),
                 judge_issues=(list(cand.verdict.issues) if cand.verdict else []),
+                is_prop_moment=is_prop,
+                from_video_scan=True,
             )
             results.append(cap_item)
 
@@ -423,10 +434,14 @@ class VideoRecordingScanner:
             rect = subject_crop_rect(cand.analysis, w, h, self.config.subject_crop_padding)
             crop = cand.frame if rect is None else cand.frame[rect[1]:rect[1] + rect[3], rect[0]:rect[0] + rect[2]]
             notes = list(getattr(cand.analysis, "disqualified_reasons", []) or [])
+            if getattr(cand.analysis, "is_prop_moment", False):
+                notes.append("speaker appears to be holding or presenting a stage prop")
             result = self.judge.judge(crop, cand.heuristic_score, notes)
             if result.verdict is None:
                 continue
             cand.verdict = result.verdict
+            if getattr(result.verdict, "holding_prop", False) and getattr(self.config, "capture_prop_moments", True):
+                cand.analysis.is_prop_moment = True
             if result.verdict.usable:
                 cand.overall_score = result.blended_score
             else:
@@ -475,6 +490,17 @@ class VideoRecordingScanner:
 
         # Spread-out frames that met the bar, then spread-out frames that did not,
         # then relax the spacing rule if there still aren't enough.
+        if getattr(self.config, "capture_prop_moments", True) and top_n > 1:
+            prop_cap = min(max(0, int(getattr(self.config, "max_prop_captures", 2))), max(0, top_n - 1))
+            if prop_cap > 0:
+                prop_pref = [c for c in preferred if getattr(c.analysis, "is_prop_moment", False)]
+                for cand in prop_pref:
+                    if len(selected) >= prop_cap:
+                        break
+                    if any(abs(cand.timestamp_sec - sel.timestamp_sec) < min_interval_sec for sel in selected):
+                        continue
+                    selected.append(cand)
+
         _take(preferred, enforce_gap=True)
         _take(fallback, enforce_gap=True)
         _take(preferred, enforce_gap=False)

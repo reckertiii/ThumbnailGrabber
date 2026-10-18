@@ -131,6 +131,8 @@ class SingleFaceAnalysis:
     torso_crossing: float = 0.0         # Raw measure: widest edge run across the body
     background_score: float = 1.0       # 1.0 = clean/plain behind the subject
     pose_points: Optional[Dict[str, Any]] = None
+    is_prop_moment: bool = False        # True when speaker is holding/presenting a prop on stage
+    prop_bbox: Optional[Tuple[int, int, int, int]] = None
     
     # Score Breakdown
     head_pose_score: float = 0.0
@@ -204,6 +206,8 @@ class AnalysisResult:
     background_score: float = 1.0
     torso_clear_score: float = 1.0
     torso_crossing: float = 0.0
+    is_prop_moment: bool = False
+    prop_bbox: Optional[Tuple[int, int, int, int]] = None
     disqualified_reasons: List[str] = field(default_factory=list)
     hands_covering_face: bool = False
     is_hand_blurry: bool = False
@@ -238,7 +242,12 @@ class PersonQualityAnalyzer:
                  blink_suppression_ms: int = 300, max_people_target: int = 1,
                  selected_person_ids: Optional[List[int]] = None,
                  require_temporal_stability: bool = True,
-                 pose_hand_interval: int = 1):
+                 pose_hand_interval: int = 1,
+                 use_ml_preference: bool = True,
+                 ml_weight: float = 0.35,
+                 min_consecutive_qualified: int = 2,
+                 require_exact_people_count: bool = False,
+                 capture_prop_moments: bool = True):
         self.weights = weights or QualityWeights()
         self.thresholds = thresholds or QualityThresholds()
         self.max_people_target = max(1, min(6, max_people_target))  # Clamp between 1 and 6
@@ -247,9 +256,13 @@ class PersonQualityAnalyzer:
         # available and should judge each frame on its own merits — with these gates on,
         # a single excellent frame surrounded by bad ones is thrown away.
         self.require_temporal_stability = require_temporal_stability
+        self.use_ml_preference = bool(use_ml_preference)
         # Ceiling on how much the learned preference model may contribute once it is
         # fully matured; the effective weight ramps up to this with samples and accuracy.
-        self.weights_ml_cap = 0.35
+        self.weights_ml_cap = max(0.0, min(1.0, float(ml_weight)))
+        self.min_consecutive_qualified = max(1, int(min_consecutive_qualified))
+        self.require_exact_people_count = bool(require_exact_people_count)
+        self.capture_prop_moments = bool(capture_prop_moments)
 
         # Hand/pose re-detection cadence, and the cached results reused in between.
         # The cached landmarks are re-matched against the current faces every frame, so
@@ -443,9 +456,14 @@ class PersonQualityAnalyzer:
             f_res.laplacian_variance = self._score_to_sharpness(f_res.sharpness_score)
 
         w = self.weights
+        prop_active = bool(f_res.is_prop_moment and getattr(self, "capture_prop_moments", True))
         # hand_pose used to be multiplied by a hardcoded 1.0, so its weight was simply
         # dead score. It now reflects whether the hands are clear of the body.
-        hand_pose_score = 0.70 if f_res.hands_on_torso else (1.0 if f_res.arms_clear else 0.90)
+        # When actively presenting a prop, hands in front of the torso are intentional.
+        if prop_active:
+            hand_pose_score = 1.0
+        else:
+            hand_pose_score = 0.70 if f_res.hands_on_torso else (1.0 if f_res.arms_clear else 0.90)
         raw_score = (
             w.head_pose * f_res.head_pose_score +
             w.eye_openness * f_res.eye_openness_score +
@@ -476,9 +494,11 @@ class PersonQualityAnalyzer:
             raw_score *= 0.55
 
         # Gaze dropped: mild. Head dropped: severe.
-        if f_res.eye_look_down_score > 0.45:
+        # When holding/showing a stage prop, glancing at the object is natural candid behaviour.
+        effective_looking_down = f_res.is_looking_down and not (prop_active and f_res.pitch_deg >= -28.0)
+        if f_res.eye_look_down_score > 0.45 and not prop_active:
             raw_score *= 1.0 - 0.25 * min(1.0, (f_res.eye_look_down_score - 0.45) / 0.40)
-        if f_res.is_looking_down:
+        if effective_looking_down:
             raw_score *= 0.50
         if f_res.is_blinking:
             raw_score *= 0.20
@@ -504,11 +524,12 @@ class PersonQualityAnalyzer:
         reasons: List[str] = []
         if f_res.score < self.thresholds.min_overall_score:
             reasons.append(f"score {f_res.score:.0%} below {self.thresholds.min_overall_score:.0%}")
-        if abs(f_res.yaw_deg) > self.thresholds.max_yaw_deg:
+        effective_max_yaw = self.thresholds.max_yaw_deg * (1.35 if prop_active else 1.0)
+        if abs(f_res.yaw_deg) > effective_max_yaw:
             reasons.append(f"head turned {abs(f_res.yaw_deg):.0f}deg")
         if f_res.is_blinking:
             reasons.append("eyes closed")
-        if f_res.is_looking_down:
+        if effective_looking_down:
             reasons.append("head down")
         if f_res.is_licking_lips:
             reasons.append("tongue/lip")
@@ -666,6 +687,21 @@ class PersonQualityAnalyzer:
         if self.face_landmarker is not None:
             for f_item in analyzed_faces:
                 self._landmark_face(frame, f_item)
+
+        # Update blink suppression cooldown after blendshapes have refined blink state
+        any_blinking = any(f.is_selected and f.is_blinking for f in analyzed_faces)
+        if self.require_temporal_stability and self._blink_suppression_ms > 0:
+            now_ts = time.time()
+            if any_blinking:
+                self._last_blink_time = now_ts
+                self._blink_suppressed = False
+            elif self._last_blink_time > 0.0:
+                elapsed_ms = (now_ts - self._last_blink_time) * 1000.0
+                self._blink_suppressed = elapsed_ms < self._blink_suppression_ms
+            else:
+                self._blink_suppressed = False
+        else:
+            self._blink_suppressed = False
 
         # 2. Hand Tracking
         if self.hand_landmarker is not None and mp_image is not None:
@@ -879,7 +915,16 @@ class PersonQualityAnalyzer:
         result.background_score = primary.background_score
         result.torso_clear_score = primary.torso_clear_score
         result.torso_crossing = primary.torso_crossing
-        result.hand_pose_score = 0.70 if primary.hands_on_torso else (1.0 if primary.arms_clear else 0.90)
+        result.is_prop_moment = any(f.is_selected and f.is_prop_moment for f in analyzed_faces) or primary.is_prop_moment
+        result.prop_bbox = primary.prop_bbox
+        if result.is_prop_moment and result.prop_bbox is None:
+            for f_item in analyzed_faces:
+                if f_item.is_selected and f_item.prop_bbox is not None:
+                    result.prop_bbox = f_item.prop_bbox
+                    break
+        result.hand_pose_score = 1.0 if primary.is_prop_moment else (
+            0.70 if primary.hands_on_torso else (1.0 if primary.arms_clear else 0.90)
+        )
         result.mesh_points = primary.mesh_points
 
         # Composite Overall Score Calculation strictly for ACTIVE SELECTED faces
@@ -896,7 +941,7 @@ class PersonQualityAnalyzer:
             raw_score = 0.60 * min_s + 0.40 * avg_s
 
         # Apply global environmental/gesture penalties
-        if result.is_hand_weird:
+        if result.is_hand_weird and not result.is_prop_moment:
             raw_score *= 0.55
         if result.hands_covering_face:
             raw_score *= 0.10
@@ -916,7 +961,7 @@ class PersonQualityAnalyzer:
         
         # Scikit-Learn Machine Learning Preference Prediction
         try:
-            features = UserPreferenceModel.extract_features(primary if primary else result)
+            features = UserPreferenceModel.extract_features(primary if primary else result, self.thresholds)
             ml_pred = self.preference_model.predict(features)
             result.ml_score = ml_pred
             result.ml_trained = self.preference_model.is_trained
@@ -926,7 +971,7 @@ class PersonQualityAnalyzer:
             # a couple of dozen ratings was overriding the heuristics outright - pulling
             # a frame the rules scored 0.87 down to 0.34. Weighting by sample count and
             # cross-validated accuracy lets it grow into that influence as it learns.
-            if self.preference_model.is_trained:
+            if self.use_ml_preference and self.preference_model.is_trained:
                 maturity = min(1.0, len(self.preference_model.samples) / 50.0)
                 # trust is the distance past chance on balanced accuracy, so a model
                 # that has only learned to answer with the majority class gets zero
@@ -974,6 +1019,13 @@ class PersonQualityAnalyzer:
                     frame_reasons.append(tag)
         if not selected_faces:
             frame_reasons.append("no person selected")
+        exact_count_mismatch = (
+            self.require_exact_people_count and
+            result.people_detected_count != self.max_people_target
+        )
+        if exact_count_mismatch:
+            frame_reasons.append(
+                f"people count {result.people_detected_count} != {self.max_people_target}")
         # Only mention the frame score when no individual face already explained it,
         # otherwise a single-person shot reports the same problem twice.
         if (result.overall_score < self.thresholds.min_overall_score
@@ -988,6 +1040,7 @@ class PersonQualityAnalyzer:
         basic_qualified = (
             result.overall_score >= self.thresholds.min_overall_score and
             all_faces_qualified and
+            not exact_count_mismatch and
             not result.hands_covering_face and
             not self._blink_suppressed
         )
@@ -997,15 +1050,16 @@ class PersonQualityAnalyzer:
         else:
             self._consecutive_qualified = 0
 
+        min_consec = max(1, getattr(self, "min_consecutive_qualified", 2))
         if self.require_temporal_stability:
             if basic_qualified and not result.is_stable:
                 frame_reasons.append("score still settling")
-            if basic_qualified and self._consecutive_qualified < 2:
+            if basic_qualified and self._consecutive_qualified < min_consec:
                 frame_reasons.append("waiting for a 2nd good frame")
             result.is_qualified = (
                 basic_qualified and
                 result.is_stable and
-                self._consecutive_qualified >= 2
+                self._consecutive_qualified >= min_consec
             )
         else:
             result.is_qualified = basic_qualified
@@ -1179,7 +1233,6 @@ class PersonQualityAnalyzer:
         f_res.shoulder_pose_score = 1.0
         f_res.shoulder_points = None
 
-        self._finalize_face_score(f_res)
         return f_res
 
     def _compute_cutout_score(self, frame: np.ndarray, f_res: SingleFaceAnalysis,
@@ -1195,7 +1248,21 @@ class PersonQualityAnalyzer:
         pose = f_res.pose_points or {}
         pts = pose.get('visible_points') or []
 
-        fx, fy, fw, fh = f_res.raw_bbox
+        fx, fy, fw, fh = f_res.raw_bbox if (f_res.raw_bbox and f_res.raw_bbox[2] > 0) else f_res.bbox
+
+        # Match hand skeletons that plausibly belong to this person
+        matched_hands: List[List[Tuple[int, int]]] = []
+        if hand_skeletons and fw > 0 and fh > 0:
+            fcx = fx + fw / 2.0
+            for hand in hand_skeletons:
+                if not hand:
+                    continue
+                hcx = sum(pt[0] for pt in hand) / float(len(hand))
+                hcy = sum(pt[1] for pt in hand) / float(len(hand))
+                if abs(hcx - fcx) <= fw * 4.0 and (fy - fh * 1.5) <= hcy <= (fy + fh * 7.5):
+                    matched_hands.append(hand)
+        elif hand_skeletons:
+            matched_hands = [hand for hand in hand_skeletons if hand]
 
         # --- Subject extent -------------------------------------------------
         # Prefer the pose landmark cloud; fall back to a rough body estimate from the
@@ -1215,6 +1282,31 @@ class PersonQualityAnalyzer:
         else:
             f_res.cutout_score = 0.0
             return
+
+        # Include matched hand landmarks so gesturing hands are never sliced off in _subject.png
+        for hand in matched_hands:
+            h_xs = [pt[0] for pt in hand]
+            h_ys = [pt[1] for pt in hand]
+            h_pad = max(8, int(fw * 0.15)) if fw > 0 else 12
+            sx0 = min(sx0, min(h_xs) - h_pad)
+            sx1 = max(sx1, max(h_xs) + h_pad)
+            sy0 = min(sy0, min(h_ys) - h_pad)
+            sy1 = max(sy1, max(h_ys) + h_pad)
+
+        # Detect whether the speaker is holding/presenting a prop on stage
+        if getattr(self, "capture_prop_moments", True):
+            is_prop, prop_bbox = self._detect_held_prop(frame, f_res, matched_hands)
+        else:
+            is_prop, prop_bbox = False, None
+        f_res.is_prop_moment = is_prop
+        f_res.prop_bbox = prop_bbox
+
+        if prop_bbox is not None:
+            px, py, pw, ph = prop_bbox
+            sx0 = min(sx0, px)
+            sy0 = min(sy0, py)
+            sx1 = max(sx1, px + pw)
+            sy1 = max(sy1, py + ph)
 
         sx0, sy0 = max(0, sx0), max(0, sy0)
         sx1, sy1 = min(w, sx1), min(h, sy1)
@@ -1273,7 +1365,7 @@ class PersonQualityAnalyzer:
 
             # Prefer the hand landmarks: the pose model marks the wrist joint, which can
             # sit outboard of the body while the fingers are spread across the chest.
-            for hand in (hand_skeletons or []):
+            for hand in (matched_hands or []):
                 if not hand:
                     continue
                 cx = sum(pt[0] for pt in hand) / float(len(hand))
@@ -1301,17 +1393,21 @@ class PersonQualityAnalyzer:
                     arms_clear = True
                     break
 
-        f_res.hands_on_torso = hands_on_torso
-        f_res.arms_clear = arms_clear
-        # Softened from 0.45: this fires on most frames of a speaker who gestures while
-        # talking, so a heavy penalty was a near-constant subtraction rather than a
-        # discriminator, and it drowned out eyes, expression and framing.
-        if hands_on_torso:
-            hands_score = 0.70
-        elif arms_clear:
+        if is_prop:
+            # Holding/presenting a prop is an intentional candid pose, not an accidental
+            # chest-crossing gesture.
+            hands_on_torso = False
             hands_score = 1.00
         else:
-            hands_score = 0.90
+            if hands_on_torso:
+                hands_score = 0.70
+            elif arms_clear:
+                hands_score = 1.00
+            else:
+                hands_score = 0.90
+
+        f_res.hands_on_torso = hands_on_torso
+        f_res.arms_clear = arms_clear
 
         # --- 4. Background cleanliness --------------------------------------
         f_res.background_score = self._background_cleanliness(frame, (sx0, sy0, sx1, sy1))
@@ -1321,8 +1417,12 @@ class PersonQualityAnalyzer:
         f_res.torso_crossing = round(crossing, 3)
         # Calibrated on real captures: ~0.07 standing clear, ~0.29 with a table across
         # the lower torso, ~0.39 pressed against it with both hands on top.
-        f_res.torso_clear_score = round(
-            max(0.0, min(1.0, 1.0 - (crossing - 0.05) / 0.35)), 3)
+        torso_clear = max(0.0, min(1.0, 1.0 - (crossing - 0.05) / 0.35))
+        if is_prop:
+            # A held prop in front of the speaker creates horizontal edges that should
+            # not be mistaken for a lectern or table cutting the body in half.
+            torso_clear = max(0.90, torso_clear)
+        f_res.torso_clear_score = round(torso_clear, 3)
 
         # Not folded into the cutout composite: at a fifth of an eighteen percent term it
         # moved the final score by about three points, while the frames it flagged were
@@ -1335,6 +1435,162 @@ class PersonQualityAnalyzer:
             0.25 * f_res.background_score
         )
         f_res.cutout_score = round(max(0.0, min(1.0, cutout)), 3)
+
+    def _detect_held_prop(self, frame: np.ndarray, f_res: SingleFaceAnalysis,
+                          matched_hands: Optional[List[List[Tuple[int, int]]]] = None
+                          ) -> Tuple[bool, Optional[Tuple[int, int, int, int]]]:
+        """Detects when a speaker is actively holding or presenting a physical prop on stage.
+
+        Evaluates raised/presenting hands (from 21-point hand skeletons or pose wrists)
+        and checks whether the region around or between the hands contains a structured,
+        non-skin, non-face object with distinct edges and contrast against the backdrop.
+        """
+        h, w = frame.shape[:2]
+        fx, fy, fw, fh = f_res.raw_bbox if (f_res.raw_bbox and f_res.raw_bbox[2] > 0) else f_res.bbox
+        if fw <= 0 or fh <= 0 or h < 32 or w < 32:
+            return False, None
+
+        pose = f_res.pose_points or {}
+        ls, rs = pose.get('left_shoulder'), pose.get('right_shoulder')
+        lh, rh = pose.get('left_hip'), pose.get('right_hip')
+
+        if ls and rs:
+            sh_y = min(ls[1], rs[1])
+            hip_y = max(lh[1], rh[1]) if (lh and rh) else sh_y + int(abs(ls[0] - rs[0]) * 1.4)
+            t_span = max(1, hip_y - sh_y)
+            max_active_y = sh_y + int(t_span * 0.80)
+        else:
+            max_active_y = fy + int(fh * 3.8)
+        min_active_y = fy - int(fh * 0.8)
+
+        # Collect active (raised/presenting) hand bounding boxes: (hx0, hy0, hx1, hy1, hcx, hcy)
+        active_hands: List[Tuple[int, int, int, int, float, float]] = []
+        for hand in (matched_hands or []):
+            if not hand:
+                continue
+            xs = [pt[0] for pt in hand]
+            ys = [pt[1] for pt in hand]
+            hx0, hy0, hx1, hy1 = min(xs), min(ys), max(xs), max(ys)
+            hcx = sum(xs) / float(len(xs))
+            hcy = sum(ys) / float(len(ys))
+            # Ignore hands directly covering the face
+            if fx <= hcx <= fx + fw and fy <= hcy <= fy + fh:
+                continue
+            if min_active_y <= hcy <= max_active_y:
+                active_hands.append((hx0, hy0, hx1, hy1, hcx, hcy))
+
+        # Fall back to raised pose wrists when 21-pt hand landmarks didn't fire
+        if not active_hands and pose:
+            half_w = max(14, int(fw * 0.35))
+            for wrist_key in ('left_wrist', 'right_wrist'):
+                wrist = pose.get(wrist_key)
+                if not wrist:
+                    continue
+                wx, wy = wrist
+                if fx <= wx <= fx + fw and fy <= wy <= fy + fh:
+                    continue
+                if min_active_y <= wy <= max_active_y:
+                    active_hands.append((wx - half_w, wy - half_w, wx + half_w, wy + half_w, float(wx), float(wy)))
+
+        if not active_hands:
+            return False, None
+
+        # Build candidate prop regions: (px0, py0, px1, py1, is_two_hand, hand_union_box)
+        candidates: List[Tuple[int, int, int, int, bool, Tuple[int, int, int, int]]] = []
+        if len(active_hands) >= 2:
+            h1, h2 = active_hands[0], active_hands[1]
+            if abs(h1[4] - h2[4]) <= fw * 3.8 and abs(h1[5] - h2[5]) <= fh * 2.2:
+                ux0, uy0 = min(h1[0], h2[0]), min(h1[1], h2[1])
+                ux1, uy1 = max(h1[2], h2[2]), max(h1[3], h2[3])
+                px0 = ux0 - max(12, int(fw * 0.25))
+                py0 = uy0 - max(16, int(fh * 0.45))
+                px1 = ux1 + max(12, int(fw * 0.25))
+                py1 = uy1 + max(12, int(fh * 0.35))
+                candidates.append((px0, py0, px1, py1, True, (ux0, uy0, ux1, uy1)))
+
+        for hx0, hy0, hx1, hy1, hcx, hcy in active_hands:
+            hw, hh = max(16, hx1 - hx0), max(16, hy1 - hy0)
+            pad_x = max(18, int(max(fw * 0.55, hw * 0.80)))
+            pad_top = max(18, int(max(fh * 0.60, hh * 0.85)))
+            pad_bot = max(14, int(max(fh * 0.40, hh * 0.55)))
+            candidates.append((
+                hx0 - pad_x, hy0 - pad_top, hx1 + pad_x, hy1 + pad_bot,
+                False, (hx0, hy0, hx1, hy1)
+            ))
+
+        # Estimate baseline torso/background brightness & colour to distinguish a held prop
+        # from a plain shirt or plain curtain behind an empty gesturing hand.
+        bg_sample_std = 0.0
+        if ls and rs:
+            tx0, tx1 = max(0, min(ls[0], rs[0])), min(w, max(ls[0], rs[0]))
+            ty0 = max(0, min(ls[1], rs[1]))
+            ty1 = min(h, ty0 + max(16, int((tx1 - tx0) * 0.8)))
+            if tx1 - tx0 > 12 and ty1 - ty0 > 12:
+                bg_sample_std = float(np.std(cv2.cvtColor(frame[ty0:ty1, tx0:tx1], cv2.COLOR_BGR2GRAY)))
+
+        face_pad_x, face_pad_y = int(fw * 0.12), int(fh * 0.15)
+        fx0, fy0 = max(0, fx - face_pad_x), max(0, fy - face_pad_y)
+        fx1, fy1 = min(w, fx + fw + face_pad_x), min(h, fy + fh + face_pad_y)
+
+        for raw_px0, raw_py0, raw_px1, raw_py1, is_two_hand, (ux0, uy0, ux1, uy1) in candidates:
+            px0, py0 = max(0, raw_px0), max(0, raw_py0)
+            px1, py1 = min(w, raw_px1), min(h, raw_py1)
+            cw, ch = px1 - px0, py1 - py0
+            if cw < 24 or ch < 24:
+                continue
+
+            crop = frame[py0:py1, px0:px1]
+            # 1. Build skin mask so bare hands/arms are excluded from the prop check
+            ycrcb = cv2.cvtColor(crop, cv2.COLOR_BGR2YCrCb)
+            cr, cb = ycrcb[:, :, 1], ycrcb[:, :, 2]
+            ycrcb_skin = (cr >= 133) & (cr <= 177) & (cb >= 77) & (cb <= 127)
+            hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+            hue, sat, val = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+            hsv_skin = (hue <= 22) & (sat >= 25) & (sat <= 170) & (val >= 40)
+            skin_mask = (ycrcb_skin & hsv_skin).astype(np.uint8) * 255
+
+            # Mask out the face box as well
+            if fx0 < px1 and fx1 > px0 and fy0 < py1 and fy1 > py0:
+                skin_mask[max(0, fy0 - py0):min(ch, fy1 - py0),
+                          max(0, fx0 - px0):min(cw, fx1 - px0)] = 255
+
+            # Dilate exclusion mask so the hand/finger silhouette edge itself isn't counted
+            kernel = np.ones((7, 7), np.uint8)
+            excl_dilated = cv2.dilate(skin_mask, kernel, iterations=1)
+            valid_mask = excl_dilated == 0
+            valid_count = int(np.count_nonzero(valid_mask))
+            if valid_count < 100:
+                continue
+
+            gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            edges = cv2.Canny(gray_crop, 50, 140)
+            obj_edges = (edges > 0) & valid_mask
+            edge_count = int(np.count_nonzero(obj_edges))
+            edge_density = edge_count / float(valid_count)
+
+            # Require structured non-skin edges AND luminance/colour contrast
+            valid_pixels = gray_crop[valid_mask]
+            intensity_std = float(np.std(valid_pixels)) if valid_pixels.size > 0 else 0.0
+            min_edge_density = 0.022 if is_two_hand else 0.032
+
+            if edge_density >= min_edge_density and intensity_std >= max(16.0, bg_sample_std * 0.45):
+                ys_e, xs_e = np.where(obj_edges)
+                if xs_e.size >= 12:
+                    # Trim 5% outliers to bound the held object cleanly
+                    ox0 = px0 + int(np.percentile(xs_e, 5))
+                    oy0 = py0 + int(np.percentile(ys_e, 5))
+                    ox1 = px0 + int(np.percentile(xs_e, 95))
+                    oy1 = py0 + int(np.percentile(ys_e, 95))
+                    obj_w, obj_h = ox1 - ox0, oy1 - oy0
+                    if obj_w >= max(12, int(fw * 0.20)) and obj_h >= max(12, int(fh * 0.20)):
+                        # Union of the object bounds and the holding hand(s)
+                        bx0 = max(0, min(ox0, ux0) - 6)
+                        by0 = max(0, min(oy0, uy0) - 6)
+                        bx1 = min(w, max(ox1, ux1) + 6)
+                        by1 = min(h, max(oy1, uy1) + 6)
+                        return True, (bx0, by0, bx1 - bx0, by1 - by0)
+
+        return False, None
 
     @staticmethod
     def _torso_crossing(frame: np.ndarray, pose: Dict[str, Any]) -> float:
