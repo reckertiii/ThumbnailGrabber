@@ -590,10 +590,13 @@ class VideoScanDialog(QDialog):
         speed_str = f"{p.fps_speed:.1f} FPS"
         
         best_str = f"Best Score: {int(p.best_score_found * 100)}%" if p.best_score_found > 0 else "No qualified face yet"
-        status_text = (
-            f"Scanning: <b>{curr_time} / {tot_time}</b> ({p.progress_pct:.0f}%) • "
-            f"Speed: <b>{speed_str}</b> • ETA: <b>{eta_str}</b> • {best_str}"
-        )
+        if p.status == "reviewing" and p.error_message:
+            status_text = f"🧠 <b>{p.error_message}</b> • Candidates Analyzed: <b>{p.total_candidates_analyzed}</b> • {best_str}"
+        else:
+            status_text = (
+                f"Scanning: <b>{curr_time} / {tot_time}</b> ({p.progress_pct:.0f}%) • "
+                f"Speed: <b>{speed_str}</b> • ETA: <b>{eta_str}</b> • {best_str}"
+            )
         self.lbl_status.setText(status_text)
 
         # Update preview frames

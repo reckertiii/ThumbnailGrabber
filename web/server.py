@@ -894,7 +894,8 @@ def _run_video_scan_worker(video_path: str, top_n: int, min_score: float,
         state.scan_progress = p
 
     try:
-        scanner = VideoRecordingScanner(state.config)
+        shared_judge = getattr(state.processor, "judge", None) if state.processor else None
+        scanner = VideoRecordingScanner(state.config, judge=shared_judge)
         results = scanner.scan_video(
             video_path=video_path,
             top_n=top_n,

@@ -65,9 +65,9 @@ class VideoRecordingScanner:
     and extracts the highest-quality thumbnails / best screenshots.
     """
 
-    def __init__(self, config: Optional[AppConfig] = None):
+    def __init__(self, config: Optional[AppConfig] = None, judge: Optional[AIJudge] = None):
         self.config = config or AppConfig()
-        self.judge = AIJudge(self.config)
+        self.judge = judge if judge is not None else AIJudge(self.config)
         self.analyzer = PersonQualityAnalyzer(
             self.config.weights,
             self.config.thresholds,
@@ -410,40 +410,59 @@ class VideoRecordingScanner:
         surfaces if literally nothing else is available.
         """
         # Bypass the live-mode pacing: this is a batch of a known, small size.
+        orig_interval = getattr(self.judge, "min_interval", 3.0)
         self.judge.min_interval = 0.0
-        for i, cand in enumerate(finalists, 1):
-            if progress_callback:
-                progress_callback(ScanProgress(
-                    status="reviewing", progress_pct=100.0,
-                    current_frame_idx=current_frame_idx, total_frames=total_frames,
-                    current_time_sec=info.duration_sec, total_duration_sec=info.duration_sec,
-                    fps_speed=0.0, estimated_time_remaining_sec=0.0,
-                    total_candidates_analyzed=frames_analyzed, best_score_found=champion_score,
-                    champion_frame=champion_frame, champion_analysis=champion_analysis,
-                    error_message=f"AI review {i}/{len(finalists)}",
-                ))
-            h, w = cand.frame.shape[:2]
-            rect = subject_crop_rect(cand.analysis, w, h, self.config.subject_crop_padding)
-            crop = cand.frame if rect is None else cand.frame[rect[1]:rect[1] + rect[3], rect[0]:rect[0] + rect[2]]
-            notes = list(getattr(cand.analysis, "disqualified_reasons", []) or [])
-            if getattr(cand.analysis, "is_prop_moment", False):
-                notes.append("speaker appears to be holding or presenting a stage prop")
-            result = self.judge.judge(crop, cand.heuristic_score, notes)
-            if result.verdict is None:
-                continue
-            cand.verdict = result.verdict
-            if getattr(result.verdict, "holding_prop", False) and getattr(self.config, "capture_prop_moments", True):
-                cand.analysis.is_prop_moment = True
-            if result.verdict.usable:
-                cand.overall_score = result.blended_score
-            else:
-                cand.overall_score = min(cand.heuristic_score, 0.25)
-                cand.meets_min_score = False
-            sharp = float(getattr(cand.analysis, "sharpness_score", 0.0) or 0.0)
-            cand.rank_score = cand.overall_score * (0.50 + 0.50 * sharp)
-            print(f"[AIJudge] {cand.timestamp_str}: {cand.heuristic_score:.0%} -> "
-                  f"judge {result.verdict.score:.0%}"
-                  f"{'' if result.verdict.usable else ' (unusable)'} — {result.verdict.summary}")
+        pm = getattr(getattr(self, "analyzer", None), "preference_model", None)
+        fb_prompt = pm.get_judge_feedback_prompt() if pm is not None and hasattr(pm, "get_judge_feedback_prompt") else ""
+        try:
+            for i, cand in enumerate(finalists, 1):
+                if progress_callback:
+                    progress_callback(ScanProgress(
+                        status="reviewing", progress_pct=100.0,
+                        current_frame_idx=current_frame_idx, total_frames=total_frames,
+                        current_time_sec=info.duration_sec, total_duration_sec=info.duration_sec,
+                        fps_speed=0.0, estimated_time_remaining_sec=0.0,
+                        total_candidates_analyzed=frames_analyzed, best_score_found=champion_score,
+                        champion_frame=champion_frame, champion_analysis=champion_analysis,
+                        error_message=f"AI Judge reviewing finalist {i}/{len(finalists)}...",
+                    ))
+                h, w = cand.frame.shape[:2]
+                rect = subject_crop_rect(cand.analysis, w, h, self.config.subject_crop_padding)
+                crop = cand.frame if rect is None else cand.frame[rect[1]:rect[1] + rect[3], rect[0]:rect[0] + rect[2]]
+                notes = list(getattr(cand.analysis, "disqualified_reasons", []) or [])
+                if getattr(cand.analysis, "is_prop_moment", False):
+                    notes.append("speaker appears to be holding or presenting a stage prop")
+                if fb_prompt:
+                    try:
+                        result = self.judge.judge(crop, cand.heuristic_score, notes, user_feedback_prompt=fb_prompt)
+                    except TypeError:
+                        result = self.judge.judge(crop, cand.heuristic_score, notes)
+                else:
+                    result = self.judge.judge(crop, cand.heuristic_score, notes)
+                if result.verdict is None:
+                    continue
+                cand.verdict = result.verdict
+                if getattr(result.verdict, "holding_prop", False) and getattr(self.config, "capture_prop_moments", True):
+                    cand.analysis.is_prop_moment = True
+                elif result.verdict.issues:
+                    issue_text = " ".join(result.verdict.issues or []).lower()
+                    if any(kw in issue_text for kw in (
+                        "head bowed", "head slightly bowed", "bowed down", "looking down",
+                        "gaze not engaged", "not engaged", "eyes closed", "microphone",
+                    )):
+                        cand.analysis.is_prop_moment = False
+                if result.verdict.usable:
+                    cand.overall_score = result.blended_score
+                else:
+                    cand.overall_score = min(cand.heuristic_score, 0.25)
+                    cand.meets_min_score = False
+                sharp = float(getattr(cand.analysis, "sharpness_score", 0.0) or 0.0)
+                cand.rank_score = cand.overall_score * (0.50 + 0.50 * sharp)
+                print(f"[AIJudge] {cand.timestamp_str}: {cand.heuristic_score:.0%} -> "
+                      f"judge {result.verdict.score:.0%}"
+                      f"{'' if result.verdict.usable else ' (unusable)'} — {result.verdict.summary}")
+        finally:
+            self.judge.min_interval = orig_interval
 
     def _select_diverse_top_candidates(
         self,

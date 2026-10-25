@@ -625,7 +625,11 @@ function startScanPolling() {
       const etaFmt = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
       const mult = (data.total_duration_sec > 0 && data.total_frames > 0 && data.fps_speed > 0)
         ? ` (${(data.fps_speed / (data.total_frames / data.total_duration_sec)).toFixed(1)}x)` : "";
-      $("scanStatusText").innerHTML = `Status: <b>${data.status}</b> | Progress: <b>${data.current_time_str} / ${data.total_duration_str}</b> (${data.progress_pct}%) | Speed: <b>${data.fps_speed} FPS${mult}</b> | ETA: <b>${etaFmt}</b> | ${bestText}`;
+      if (data.status === "reviewing" && data.error) {
+        $("scanStatusText").innerHTML = `🧠 <b>${data.error}</b> | Candidates Analyzed: <b>${data.candidates_analyzed}</b> | ${bestText}`;
+      } else {
+        $("scanStatusText").innerHTML = `Status: <b>${data.status}</b> | Progress: <b>${data.current_time_str} / ${data.total_duration_str}</b> (${data.progress_pct}%) | Speed: <b>${data.fps_speed} FPS${mult}</b> | ETA: <b>${etaFmt}</b> | ${bestText}`;
+      }
 
       // Update current frame preview
       if (data.current_frame_preview) {
