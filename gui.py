@@ -395,8 +395,9 @@ class VideoScanDialog(QDialog):
         # Sampling Speed
         grid_settings.addWidget(QLabel("Scanning Speed / Rate:"), 0, 2)
         self.cmb_speed = QComboBox()
-        self.cmb_speed.addItem("Fast (5 FPS sampling — Recommended)", 5.0)
-        self.cmb_speed.addItem("Ultra-Fast (2 FPS sampling)", 2.0)
+        self.cmb_speed.addItem("Fast (2 FPS sampling — Recommended)", 2.0)
+        self.cmb_speed.addItem("Ultra-Fast (1 FPS sampling — Rapid Full Sermon)", 1.0)
+        self.cmb_speed.addItem("Detailed (5 FPS sampling)", 5.0)
         self.cmb_speed.addItem("High Precision (10 FPS sampling)", 10.0)
         self.cmb_speed.addItem("Exhaustive (Every Frame)", 0.0)
         grid_settings.addWidget(self.cmb_speed, 0, 3)
@@ -584,7 +585,8 @@ class VideoScanDialog(QDialog):
 
         curr_time = VideoRecordingScanner.format_time_display(p.current_time_sec)
         tot_time = VideoRecordingScanner.format_time_display(p.total_duration_sec)
-        eta_str = f"{int(p.estimated_time_remaining_sec)}s" if p.estimated_time_remaining_sec > 0 else "0s"
+        eta_s = int(p.estimated_time_remaining_sec) if p.estimated_time_remaining_sec > 0 else 0
+        eta_str = f"{eta_s // 60}m {eta_s % 60}s" if eta_s >= 60 else f"{eta_s}s"
         speed_str = f"{p.fps_speed:.1f} FPS"
         
         best_str = f"Best Score: {int(p.best_score_found * 100)}%" if p.best_score_found > 0 else "No qualified face yet"

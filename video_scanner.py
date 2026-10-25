@@ -78,6 +78,7 @@ class VideoRecordingScanner:
             max_people_target=self.config.max_people_target,
             # Offline scanning judges each sampled frame independently.
             require_temporal_stability=False,
+            pose_hand_interval=2,
             use_ml_preference=getattr(self.config, "use_ml_preference", True),
             ml_weight=getattr(self.config, "ml_weight", 0.35),
             require_exact_people_count=getattr(self.config, "require_exact_people_count", False),
@@ -198,6 +199,9 @@ class VideoRecordingScanner:
         else:
             frame_step = 1
 
+        # Disable missed-face slot persistence when stepping across non-adjacent video frames
+        self.analyzer._face_persistence_frames = 0 if frame_step > 1 else 2
+
         total_frames = info.total_frames
         total_duration = info.duration_sec
 
@@ -267,70 +271,58 @@ class VideoRecordingScanner:
             ))
 
         last_progress_emit = time.time()
-        chunk_frames: List[Tuple[int, float, np.ndarray, float]] = []
 
         while True:
             if cancel_event and cancel_event.is_set():
                 break
 
-            # Read frame
+            # Skip intermediate frames without decoding BGR pixels or running full-frame
+            # Laplacian filters. cap.grab() advances the demuxer/decoder state in <0.1ms,
+            # whereas cap.read() + BGR conversion + 1080p Laplacian on every skipped frame
+            # bottlenecks 60fps 1080p videos to ~0.5x real-time (~1 hour for a 36m video).
+            if current_frame_idx % frame_step != 0:
+                if not cap.grab():
+                    break
+                current_frame_idx += 1
+                continue
+
+            # Decode only the sampled frame
             ret, frame = cap.read()
             if not ret or frame is None:
-                # Process any trailing frames
-                if chunk_frames:
-                    best_chunk = max(chunk_frames, key=lambda item: item[3])
-                    f_idx, f_time, f_img, _ = best_chunk
-                    chunk_frames.clear()
-                    frames_analyzed += 1
-                    _analyze_and_collect(f_idx, f_time, f_img)
                 break
 
             current_time_sec = current_frame_idx / video_fps
 
-            # Fast sharpness pre-filter on center 70% of frame (<0.04ms)
-            h, w = frame.shape[:2]
-            crop = frame[int(h * 0.15):int(h * 0.85), int(w * 0.15):int(w * 0.85)]
-            small_gray = cv2.cvtColor(crop[::2, ::2], cv2.COLOR_BGR2GRAY)
-            lap_v = float(cv2.Laplacian(small_gray, cv2.CV_64F).var())
+            frames_analyzed += 1
+            _analyze_and_collect(current_frame_idx, current_time_sec, frame)
 
-            chunk_frames.append((current_frame_idx, current_time_sec, frame, lap_v))
+            # Progress notification throttled to ~5 updates/sec
+            now = time.time()
+            if now - last_progress_emit >= 0.20 or current_frame_idx >= total_frames - frame_step:
+                last_progress_emit = now
+                elapsed = now - start_time
+                fps_speed = (current_frame_idx + 1) / elapsed if elapsed > 0 else 0.0
+                
+                frames_remaining = max(0, total_frames - current_frame_idx)
+                eta_sec = frames_remaining / fps_speed if fps_speed > 0 else 0.0
+                pct = min(100.0, (current_frame_idx / float(max(1, total_frames))) * 100.0)
 
-            # When chunk buffer is full (or frame_step == 1), pick the sharpest frame in this interval
-            if len(chunk_frames) >= frame_step:
-                best_chunk = max(chunk_frames, key=lambda item: item[3])
-                f_idx, f_time, f_img, _ = best_chunk
-                chunk_frames.clear()
-
-                frames_analyzed += 1
-                _analyze_and_collect(f_idx, f_time, f_img)
-
-                # Progress notification throttled to ~10 updates/sec
-                now = time.time()
-                if now - last_progress_emit >= 0.08 or current_frame_idx >= total_frames - frame_step:
-                    last_progress_emit = now
-                    elapsed = now - start_time
-                    fps_speed = current_frame_idx / elapsed if elapsed > 0 else 0.0
-                    
-                    frames_remaining = max(0, total_frames - current_frame_idx)
-                    eta_sec = frames_remaining / fps_speed if fps_speed > 0 else 0.0
-                    pct = min(100.0, (current_frame_idx / float(max(1, total_frames))) * 100.0)
-
-                    if progress_callback:
-                        progress_callback(ScanProgress(
-                            status="scanning",
-                            progress_pct=pct,
-                            current_frame_idx=current_frame_idx,
-                            total_frames=total_frames,
-                            current_time_sec=current_time_sec,
-                            total_duration_sec=total_duration,
-                            fps_speed=fps_speed,
-                            estimated_time_remaining_sec=eta_sec,
-                            total_candidates_analyzed=frames_analyzed,
-                            best_score_found=champion_score,
-                            current_frame=f_img,
-                            champion_frame=champion_frame,
-                            champion_analysis=champion_analysis,
-                        ))
+                if progress_callback:
+                    progress_callback(ScanProgress(
+                        status="scanning",
+                        progress_pct=pct,
+                        current_frame_idx=current_frame_idx,
+                        total_frames=total_frames,
+                        current_time_sec=current_time_sec,
+                        total_duration_sec=total_duration,
+                        fps_speed=fps_speed,
+                        estimated_time_remaining_sec=eta_sec,
+                        total_candidates_analyzed=frames_analyzed,
+                        best_score_found=champion_score,
+                        current_frame=frame,
+                        champion_frame=champion_frame,
+                        champion_analysis=champion_analysis,
+                    ))
 
             current_frame_idx += 1
 

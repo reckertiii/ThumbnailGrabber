@@ -67,6 +67,8 @@ class AppState:
         self.scan_results: List[CapturedScreenshot] = []
         self.scan_error: Optional[str] = None
         self.scan_video_path: Optional[str] = None
+        self._scan_champ_id: int = 0
+        self._scan_champ_b64: Optional[str] = None
 
         # Latest frame + analysis pushed from the analysis thread
         self._frame: Optional[np.ndarray] = None
@@ -880,6 +882,13 @@ def _run_video_scan_worker(video_path: str, top_n: int, min_score: float,
     state.scan_error = None
     state.scan_results = []
     state.scan_video_path = video_path
+    state._scan_champ_id = 0
+    state._scan_champ_b64 = None
+
+    # Pause live RTSP MediaPipe analysis during offline video scanning so the two
+    # don't fight over the same CPU cores and cut scan speed in half.
+    if state.processor:
+        state.processor.paused = True
 
     def progress_cb(p: ScanProgress):
         state.scan_progress = p
@@ -905,6 +914,8 @@ def _run_video_scan_worker(video_path: str, top_n: int, min_score: float,
     except Exception as e:
         state.scan_error = str(e)
     finally:
+        if state.processor:
+            state.processor.paused = False
         state.is_scanning_video = False
 
 
@@ -1319,7 +1330,12 @@ def get_video_scan_status():
 
     if p:
         resp["current_frame_preview"] = _frame_to_base64(p.current_frame, max_w=400)
-        resp["champion_frame_preview"] = _frame_to_base64(p.champion_frame, max_w=400)
+        if p.champion_frame is not None:
+            cid = id(p.champion_frame)
+            if cid != state._scan_champ_id:
+                state._scan_champ_id = cid
+                state._scan_champ_b64 = _frame_to_base64(p.champion_frame, max_w=400)
+        resp["champion_frame_preview"] = state._scan_champ_b64
 
     if not state.is_scanning_video and state.scan_results:
         results_payload = []

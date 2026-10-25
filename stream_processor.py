@@ -357,6 +357,9 @@ class StreamProcessor:
         frame_counter = 0
 
         while not self._stop_event.is_set():
+            if getattr(self, "paused", False):
+                time.sleep(0.25)
+                continue
             start_time = time.time()
             
             # Fetch latest frame atomically

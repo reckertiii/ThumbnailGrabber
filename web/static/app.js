@@ -620,7 +620,12 @@ function startScanPolling() {
       $("scanProgBar").style.width = Math.min(100, data.progress_pct) + "%";
 
       const bestText = data.best_score > 0 ? `Best Score: ${Math.round(data.best_score * 100)}%` : "No qualified face yet";
-      $("scanStatusText").innerHTML = `Status: <b>${data.status}</b> | Progress: <b>${data.current_time_str} / ${data.total_duration_str}</b> (${data.progress_pct}%) | Speed: <b>${data.fps_speed} FPS</b> | ETA: <b>${data.eta_sec}s</b> | ${bestText}`;
+      const mins = Math.floor((data.eta_sec || 0) / 60);
+      const secs = (data.eta_sec || 0) % 60;
+      const etaFmt = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+      const mult = (data.total_duration_sec > 0 && data.total_frames > 0 && data.fps_speed > 0)
+        ? ` (${(data.fps_speed / (data.total_frames / data.total_duration_sec)).toFixed(1)}x)` : "";
+      $("scanStatusText").innerHTML = `Status: <b>${data.status}</b> | Progress: <b>${data.current_time_str} / ${data.total_duration_str}</b> (${data.progress_pct}%) | Speed: <b>${data.fps_speed} FPS${mult}</b> | ETA: <b>${etaFmt}</b> | ${bestText}`;
 
       // Update current frame preview
       if (data.current_frame_preview) {
