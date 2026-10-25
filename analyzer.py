@@ -504,38 +504,38 @@ class PersonQualityAnalyzer:
 
         # Gaze dropped & head bowed: NEVER waive a bowed head or hidden eyes, even if
         # holding a prop! A usable thumbnail requires visible eyes and an engaged head.
+        # Note: eye_look_down_score alone is NOT used to trigger effective_looking_down
+        # when the head is upright, because eyeglasses frames cause MediaPipe's
+        # eyeLookDown blendshape to read 0.45-0.65 even when looking straight at the lens.
         effective_looking_down = (
             f_res.is_looking_down
             or f_res.pitch_deg < -14.0
-            or f_res.eye_look_down_score > 0.52
+            or (f_res.pitch_deg < -10.0 and f_res.eye_look_down_score > 0.58)
         )
-        if f_res.eye_look_down_score > 0.35:
-            gaze_pen = 0.30 * min(1.0, (f_res.eye_look_down_score - 0.35) / 0.35) * p_head_down
-            raw_score *= max(0.30, 1.0 - gaze_pen)
+        if f_res.pitch_deg < -8.0 and f_res.eye_look_down_score > 0.38:
+            gaze_pen = 0.25 * min(1.0, (f_res.eye_look_down_score - 0.38) / 0.35) * p_head_down
+            raw_score *= max(0.55, 1.0 - gaze_pen)
         if effective_looking_down:
             raw_score *= max(0.15, 0.45 / p_head_down)
-        if f_res.avg_ear < 0.28 and not f_res.is_blinking:
+        if f_res.avg_ear < 0.24 and not f_res.is_blinking:
             # Squinting or eyes partially obscured by glasses frames when tilting down
-            raw_score *= max(0.35, 0.75 / p_eyes)
+            raw_score *= max(0.55, 0.82 / p_eyes)
         if f_res.is_blinking:
             raw_score *= max(0.05, 0.20 / p_eyes)
         if f_res.is_shoulder_tilted:
-            raw_score *= 0.80
-        if f_res.hands_on_torso and not prop_active and p_hand > 1.0:
-            raw_score *= max(0.45, 1.0 / p_hand)
+            raw_score *= 0.85
+        if f_res.hands_on_torso and not prop_active and p_hand > 1.05:
+            raw_score *= max(0.75, 0.92 / (1.0 + 0.25 * (p_hand - 1.0)))
 
-        # Something crossing the body - a table, lectern or music stand - is the worst
-        # thing for a cutout: the matte either keeps it or punches a hole through the
-        # subject. Graded rather than disqualifying, because some speakers never step
-        # away from the table, and for them this scales every frame alike and leaves the
-        # ranking untouched.
-        torso_factor = 0.55 + 0.45 * f_res.torso_clear_score
-        if torso_factor < 0.95 and p_hand > 1.0:
-            torso_factor = max(0.30, torso_factor ** p_hand)
+        # Something crossing the body - a table, lectern or music stand - is a mild
+        # tie-breaker rather than a heavy multiplier: many stage setups have a permanent
+        # pulpit table in front of the speaker, so crushing every frame behind a table
+        # prevents auto-capture from firing for the entire service.
+        torso_factor = 0.88 + 0.12 * f_res.torso_clear_score
         raw_score *= torso_factor
 
         # Heavy penalty for motion blur / low sharpness
-        effective_min_sharp = min_sharp * (1.0 + 0.25 * (p_blur - 1.0))
+        effective_min_sharp = min_sharp * (1.0 + 0.15 * (p_blur - 1.0))
         is_blurry = f_res.laplacian_variance < effective_min_sharp
         if is_blurry:
             sharp_ratio = max(0.05, f_res.laplacian_variance / max(1.0, effective_min_sharp))
@@ -757,29 +757,32 @@ class PersonQualityAnalyzer:
                         hand_crop = frame[min_y:max_y, min_x:max_x]
                         
                         if hand_crop.size > 0:
-                            # Measured the same way as the face - resampled to a fixed
-                            # height first - so the two are comparable. Previously the
-                            # hand was a raw full-resolution Laplacian while the face
-                            # had been normalised, so the relative test compared two
-                            # different scales and never fired: visibly motion-blurred
-                            # hands were reported as sharp.
+                            # Downscale large hand crops to sharpness_face_height so close-up
+                            # hands are comparable to faces, but NEVER upscale tiny hand crops
+                            # (e.g. a 25px hand resting in a pocket), because cubic upscaling
+                            # smooths neighboring pixels and artificially zeroes out the 3x3
+                            # Laplacian variance.
                             hand_gray = cv2.cvtColor(hand_crop, cv2.COLOR_BGR2GRAY)
-                            hand_norm = self._resize_to_height(
-                                hand_gray, self.thresholds.sharpness_face_height)
-                            hand_lap_var = float(cv2.Laplacian(hand_norm, cv2.CV_64F).var())
-                            # Keep the worst hand: with two hands in frame, reporting
-                            # whichever happened to be measured last hid the blurry one.
-                            if (result.hand_laplacian_variance <= 0.0
-                                    or hand_lap_var < result.hand_laplacian_variance):
-                                result.hand_laplacian_variance = round(hand_lap_var, 1)
+                            if hand_gray.shape[0] > self.thresholds.sharpness_face_height:
+                                hand_norm = self._resize_to_height(
+                                    hand_gray, self.thresholds.sharpness_face_height)
+                            else:
+                                hand_norm = hand_gray
+                            if hand_norm.shape[0] >= 36 and hand_norm.shape[1] >= 36:
+                                hand_lap_var = float(cv2.Laplacian(hand_norm, cv2.CV_64F).var())
+                                # Keep the worst hand: with two hands in frame, reporting
+                                # whichever happened to be measured last hid the blurry one.
+                                if (result.hand_laplacian_variance <= 0.0
+                                        or hand_lap_var < result.hand_laplacian_variance):
+                                    result.hand_laplacian_variance = round(hand_lap_var, 1)
 
-                            face_lap = analyzed_faces[0].laplacian_variance
-                            # A gesturing hand smears while the face stays sharp, so the
-                            # giveaway is the ratio, not an absolute floor.
-                            if (hand_lap_var < self.thresholds.min_hand_sharpness or
-                                    (face_lap > 1.0 and
-                                     hand_lap_var < face_lap * self.thresholds.hand_sharpness_ratio)):
-                                result.is_hand_blurry = True
+                                face_lap = analyzed_faces[0].laplacian_variance
+                                # A gesturing hand smears while the face stays sharp, so the
+                                # giveaway is the ratio, not an absolute floor.
+                                if (hand_lap_var < self.thresholds.min_hand_sharpness or
+                                        (face_lap > 1.0 and
+                                         hand_lap_var < face_lap * self.thresholds.hand_sharpness_ratio)):
+                                    result.is_hand_blurry = True
 
                         index_tip = np.array(pts_full_res[8])
                         pinky_tip = np.array(pts_full_res[20])
@@ -788,7 +791,7 @@ class PersonQualityAnalyzer:
                         primary_bbox = analyzed_faces[0].bbox
                         if primary_bbox is not None:
                             bx, by, bw, bh = primary_bbox
-                            if min_y <= by + bh and hand_span > bw * 0.5:
+                            if min_y <= by + int(bh * 0.85) and max_x >= bx - int(bw * 0.5) and min_x <= bx + int(bw * 1.5) and hand_span > bw * 0.65:
                                 result.is_hand_weird = True
             except Exception:
                 pass
@@ -965,20 +968,18 @@ class PersonQualityAnalyzer:
 
         # Apply global environmental/gesture penalties
         if result.is_hand_weird and not result.is_prop_moment:
-            raw_score *= 0.55
+            raw_score *= 0.80
         if result.hands_covering_face:
             raw_score *= 0.10
         if result.is_hand_blurry:
             # Graded by how smeared the hand is relative to the face, not a flat cut.
             # A speaker gesturing while they talk has some hand motion in most frames,
-            # so a fixed 0.45 was a near-constant halving that buried everything else
-            # and left no way for the sharpest-handed frame of a moment to win. Now a
-            # slightly soft hand costs little and a badly smeared one costs real score,
-            # which is what lets buffer refinement pick the crisp version.
+            # so a heavy penalty buries good facial expressions. A gentle 0.88..1.00
+            # range lets buffer refinement pick the crispest hand without failing the shot.
             face_lap = max(1.0, result.laplacian_variance)
             ratio = max(0.0, min(1.0, result.hand_laplacian_variance / face_lap))
             limit = max(0.01, self.thresholds.hand_sharpness_ratio)
-            raw_score *= 0.70 + 0.30 * min(1.0, ratio / limit)
+            raw_score *= 0.88 + 0.12 * min(1.0, ratio / limit)
 
         rule_score = max(0.0, min(1.0, raw_score))
         
@@ -1476,7 +1477,8 @@ class PersonQualityAnalyzer:
         # A candid prop moment still requires an engaged speaker: never trigger prop mode
         # when the speaker's head is bowed down, eyes are closed/hidden, or mouth is open mid-word.
         if (f_res.is_looking_down or f_res.is_blinking or f_res.pitch_deg < -13.0
-                or f_res.eye_look_down_score > 0.45 or f_res.avg_ear < 0.28
+                or (f_res.pitch_deg < -8.0 and f_res.eye_look_down_score > 0.55)
+                or f_res.avg_ear < 0.24
                 or f_res.is_talking_or_open):
             return False, None
 
@@ -1599,6 +1601,20 @@ class PersonQualityAnalyzer:
             if fx0 < px1 and fx1 > px0 and fy0 < py1 and fy1 > py0:
                 skin_mask[max(0, fy0 - py0):min(ch, fy1 - py0),
                           max(0, fx0 - px0):min(cw, fx1 - px0)] = 255
+
+            # For single-hand candidates, mask out the central upper-chest shirt logo zone
+            # so high-contrast printed shirt/hoodie graphics aren't mistaken for held props
+            # when an empty hand gestures near the chest.
+            if not is_two_hand and ls and rs:
+                tx_l, tx_r = min(ls[0], rs[0]), max(ls[0], rs[0])
+                tw = max(1, tx_r - tx_l)
+                logo_x0 = tx_l + int(tw * 0.18)
+                logo_x1 = tx_r - int(tw * 0.18)
+                logo_y0 = sh_y + int(t_span * 0.06)
+                logo_y1 = sh_y + int(t_span * 0.55)
+                if logo_x0 < logo_x1 and logo_x0 < px1 and logo_x1 > px0 and logo_y0 < py1 and logo_y1 > py0:
+                    skin_mask[max(0, logo_y0 - py0):min(ch, logo_y1 - py0),
+                              max(0, logo_x0 - px0):min(cw, logo_x1 - px0)] = 255
 
             # Dilate exclusion mask so the hand/finger silhouette edge itself isn't counted
             kernel = np.ones((7, 7), np.uint8)
@@ -1798,6 +1814,74 @@ class PersonQualityAnalyzer:
             [[int(x0 + lm.x * crop_w), int(y0 + lm.y * crop_h)] for lm in lms], dtype=np.int32
         )
 
+        # Refine 3D/2D head pose (yaw, pitch, roll) directly from the 478-point mesh.
+        # Because these ratios are measured in the face's local coordinate system (and
+        # de-rotated by roll), they are 100% invariant to where the speaker stands in the
+        # 1920x1080 frame and never suffer from cv2.solvePnP off-center perspective flips.
+        if len(lms) >= 455:
+            pts_f = np.array(
+                [[x0 + lm.x * crop_w, y0 + lm.y * crop_h] for lm in lms], dtype=np.float64
+            )
+            re_pt = (pts_f[33] + pts_f[133]) * 0.5    # Right eye center
+            le_pt = (pts_f[263] + pts_f[362]) * 0.5   # Left eye center
+            nose_pt = pts_f[1]                        # Nose tip
+            chin_pt = pts_f[152]                      # Chin bottom
+            mouth_pt = (pts_f[61] + pts_f[291]) * 0.5 # Mouth center
+            r_cheek = pts_f[234]                      # Right outer cheek
+            l_cheek = pts_f[454]                      # Left outer cheek
+
+            eye_dx = le_pt[0] - re_pt[0]
+            eye_dy = le_pt[1] - re_pt[1]
+            eye_dist = math.hypot(eye_dx, eye_dy)
+            if eye_dist > 6.0:
+                roll_rad = math.atan2(eye_dy, eye_dx)
+                roll_deg = round(math.degrees(roll_rad), 1)
+                cos_r = math.cos(-roll_rad)
+                sin_r = math.sin(-roll_rad)
+                eye_mid = (re_pt + le_pt) * 0.5
+
+                def _derot(pt: np.ndarray) -> Tuple[float, float]:
+                    dx = pt[0] - eye_mid[0]
+                    dy = pt[1] - eye_mid[1]
+                    return (dx * cos_r - dy * sin_r, dx * sin_r + dy * cos_r)
+
+                nx, ny = _derot(nose_pt)
+                mx, my = _derot(mouth_pt)
+                cx_p, cy_p = _derot(chin_pt)
+                rcx, _ = _derot(r_cheek)
+                lcx, _ = _derot(l_cheek)
+
+                # Yaw from nose offset relative to eyes + cheek width symmetry
+                yaw_eye = (nx / (eye_dist * 0.5)) * 38.0
+                cheek_span = max(eye_dist, lcx - rcx)
+                cheek_mid = (lcx + rcx) * 0.5
+                yaw_cheek = ((nx - cheek_mid) / (cheek_span * 0.5)) * 45.0
+                yaw_deg = round(max(-75.0, min(75.0, 0.55 * yaw_eye + 0.45 * yaw_cheek)), 1)
+
+                # Pitch from vertical ratios (eye-to-nose vs nose-to-mouth and nose-to-chin)
+                # Upright neutral face: ny / my ≈ 0.57, ny / cy_p ≈ 0.38.
+                # When head bows down, the nose tip moves closer to the mouth/chin (ny/my increases).
+                if my > 4.0 and cy_p > 6.0:
+                    r_nm = ny / my
+                    r_nc = ny / cy_p
+                    pitch_nm = (0.57 - r_nm) * 115.0
+                    pitch_nc = (0.38 - r_nc) * 135.0
+                    pitch_deg = round(max(-60.0, min(60.0, 0.55 * pitch_nm + 0.45 * pitch_nc)), 1)
+                else:
+                    pitch_deg = 0.0
+
+                f_item.yaw_deg = yaw_deg
+                f_item.pitch_deg = pitch_deg
+                f_item.roll_deg = roll_deg
+                f_item.is_looking_down = pitch_deg < -14.0
+
+                yaw_pen = min(1.0, abs(yaw_deg) / self.thresholds.max_yaw_deg)
+                pitch_pen = min(1.0, abs(pitch_deg) / self.thresholds.max_pitch_deg)
+                roll_pen = min(1.0, abs(roll_deg) / self.thresholds.max_roll_deg)
+                f_item.head_pose_score = round(
+                    max(0.0, 1.0 - (0.45 * yaw_pen + 0.35 * pitch_pen + 0.20 * roll_pen)), 2
+                )
+
         bl = {}
         if getattr(res, 'face_blendshapes', None):
             bl = {b.category_name: b.score for b in res.face_blendshapes[0]}
@@ -1853,8 +1937,9 @@ class PersonQualityAnalyzer:
         else:
             eye_open = 1.0 - (blink_max - 0.25) / 0.35
         # Hard squinting still leaves the eyes readable, so it only trims the score.
-        if squint > 0.55:
-            eye_open *= max(0.55, 1.0 - (squint - 0.55))
+        # Eyeglasses rims often push eyeSquint to ~0.55-0.65 even on wide-open eyes.
+        if squint > 0.65:
+            eye_open *= max(0.75, 1.0 - 0.5 * (squint - 0.65))
 
         f_item.is_licking_lips = is_licking
         f_item.is_weird_mouth = is_weird
@@ -2001,32 +2086,58 @@ class PersonQualityAnalyzer:
         return is_blink, avg_ear
 
     def _compute_head_pose(self, landmarks_2d: np.ndarray, frame_w: int, frame_h: int) -> Tuple[float, float, float, float]:
-        focal_length = frame_w
-        center = (frame_w / 2, frame_h / 2)
-        camera_matrix = np.array([[focal_length, 0, center[0]], [0, focal_length, center[1]], [0, 0, 1]], dtype=np.float64)
-        dist_coeffs = np.zeros((4, 1))
+        """Estimates head yaw, pitch, roll, and pose_score from 2D facial landmarks.
 
-        success, rvec, tvec = cv2.solvePnP(
-            self.model_3d_points, landmarks_2d, camera_matrix, dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE
-        )
+        Uses roll-corrected 2D facial geometry rather than cv2.solvePnP on 5 coarse points,
+        because the extrapolated 6th chin point is colinear with nose_tip and mouth_center,
+        causing solvePnP to flip into degenerate +-80 deg yaw / +-145 deg pitch solutions
+        whenever the speaker stands off-center in a wide 1920x1080 camera frame.
+        """
+        if landmarks_2d is None or len(landmarks_2d) < 6:
+            return 0.0, 0.0, 0.0, 1.0
 
-        if not success:
-            return 0.0, 0.0, 0.0, 0.0
+        nose_tip = landmarks_2d[0]
+        right_eye = landmarks_2d[2]
+        left_eye = landmarks_2d[3]
+        right_mouth = landmarks_2d[4]
+        left_mouth = landmarks_2d[5]
 
-        rmat, _ = cv2.Rodrigues(rvec)
-        sy = math.sqrt(rmat[0, 0] * rmat[0, 0] + rmat[1, 0] * rmat[1, 0])
-        if sy >= 1e-6:
-            pitch = math.degrees(math.atan2(rmat[2, 1], rmat[2, 2]))
-            yaw = math.degrees(math.atan2(-rmat[2, 0], sy))
-            roll = math.degrees(math.atan2(rmat[1, 0], rmat[0, 0]))
+        eye_dx = float(left_eye[0] - right_eye[0])
+        eye_dy = float(left_eye[1] - right_eye[1])
+        eye_dist = math.hypot(eye_dx, eye_dy)
+        if eye_dist < 4.0:
+            return 0.0, 0.0, 0.0, 1.0
+
+        roll_rad = math.atan2(eye_dy, eye_dx)
+        roll_deg = self._normalize_angle(round(math.degrees(roll_rad), 1))
+
+        cos_r = math.cos(-roll_rad)
+        sin_r = math.sin(-roll_rad)
+        eye_mid_x = (right_eye[0] + left_eye[0]) * 0.5
+        eye_mid_y = (right_eye[1] + left_eye[1]) * 0.5
+
+        def _derot(pt: np.ndarray) -> Tuple[float, float]:
+            dx = float(pt[0]) - eye_mid_x
+            dy = float(pt[1]) - eye_mid_y
+            return (dx * cos_r - dy * sin_r, dx * sin_r + dy * cos_r)
+
+        nx, ny = _derot(nose_tip)
+        rmx, rmy = _derot(right_mouth)
+        lmx, lmy = _derot(left_mouth)
+        mx = (rmx + lmx) * 0.5
+        my = (rmy + lmy) * 0.5
+
+        # Horizontal asymmetry of nose and mouth relative to inter-ocular midpoint
+        yaw_nose = (nx / (eye_dist * 0.5)) * 40.0
+        yaw_mouth = ((nx - mx) / (eye_dist * 0.5)) * 30.0
+        yaw_deg = self._normalize_angle(round(max(-75.0, min(75.0, 0.65 * yaw_nose + 0.35 * yaw_mouth)), 1))
+
+        # Vertical ratio of eye-line->nose vs eye-line->mouth (neutral upright face ≈ 0.56)
+        if my > 4.0:
+            r_nm = ny / my
+            pitch_deg = self._normalize_angle(round(max(-60.0, min(60.0, (0.56 - r_nm) * 115.0)), 1))
         else:
-            pitch = math.degrees(math.atan2(-rmat[1, 2], rmat[1, 1]))
-            yaw = math.degrees(math.atan2(-rmat[2, 0], sy))
-            roll = 0.0
-
-        yaw_deg = self._normalize_angle(round(yaw, 1))
-        pitch_deg = self._normalize_angle(round(pitch, 1))
-        roll_deg = self._normalize_angle(round(roll, 1))
+            pitch_deg = 0.0
 
         yaw_pen = min(1.0, abs(yaw_deg) / self.thresholds.max_yaw_deg)
         pitch_pen = min(1.0, abs(pitch_deg) / self.thresholds.max_pitch_deg)
@@ -2043,9 +2154,9 @@ class PersonQualityAnalyzer:
         while angle_deg < -180.0:
             angle_deg += 360.0
         
-        if angle_deg > 150.0:
+        if angle_deg > 90.0:
             angle_deg = angle_deg - 180.0
-        elif angle_deg < -150.0:
+        elif angle_deg < -90.0:
             angle_deg = angle_deg + 180.0
         
         return round(angle_deg, 1)

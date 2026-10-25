@@ -47,7 +47,10 @@ class UserPreferenceModel:
     #       captures measure 100-166, so the feature was pinned at 1.0 for most rows),
     #       plus the signals the scorer had gained since: whether anything crosses the
     #       body, hand position, background cleanliness and subject size.
-    FEATURE_VERSION = 3
+    #   v4: 2D/478-point mesh head pose (yaw/pitch) replacing off-center solvePnP flips,
+    #       plus bounded learned_penalties so accumulated negative ratings cannot lock
+    #       out auto-capture.
+    FEATURE_VERSION = 4
 
     # Below this many labelled samples the model isn't worth blending into the score.
     MIN_SAMPLES_TO_TRAIN = 12
@@ -179,46 +182,51 @@ class UserPreferenceModel:
 
             # 1. Bowed head / looking down / chin down / reading notes or box
             if any(k in combined for k in ("head", "bow", "down", "chin", "gaze", "looking", "floor", "notes")):
-                self.learned_penalties["head_down"] = min(2.5, round(self.learned_penalties.get("head_down", 1.0) + 0.25, 2))
+                self.learned_penalties["head_down"] = min(1.35, round(self.learned_penalties.get("head_down", 1.0) + 0.08, 2))
                 synth[1] = max(synth[1], 0.85)   # high head_pitch_norm
                 synth[2] = min(synth[2], 0.60)   # lower eye_openness
                 matched_any = True
 
             # 2. Eyes closed / blinking / hidden behind glasses
             if any(k in combined for k in ("eye", "blink", "closed", "squint", "glasses")):
-                self.learned_penalties["eyes_closed"] = min(2.5, round(self.learned_penalties.get("eyes_closed", 1.0) + 0.25, 2))
+                self.learned_penalties["eyes_closed"] = min(1.35, round(self.learned_penalties.get("eyes_closed", 1.0) + 0.08, 2))
                 synth[2] = min(synth[2], 0.50)   # low eye_openness
                 matched_any = True
 
             # 3. Mouth open mid-word / talking / awkward expression
             if any(k in combined for k in ("mouth", "talk", "word", "open", "grimace", "awkward", "expression")):
-                self.learned_penalties["mouth_open"] = min(2.5, round(self.learned_penalties.get("mouth_open", 1.0) + 0.25, 2))
+                self.learned_penalties["mouth_open"] = min(1.35, round(self.learned_penalties.get("mouth_open", 1.0) + 0.08, 2))
                 synth[4] = max(synth[4], 0.65)   # high mouth_openness_mar
                 synth[3] = min(synth[3], 0.35)   # low smile_ratio
                 matched_any = True
 
             # 4. Microphone / hand blocking face or chest / obstruction
             if any(k in combined for k in ("mic", "hand", "block", "cover", "obstruct", "chest", "stand", "ipad")):
-                self.learned_penalties["hand_obstruction"] = min(2.5, round(self.learned_penalties.get("hand_obstruction", 1.0) + 0.25, 2))
+                self.learned_penalties["hand_obstruction"] = min(1.35, round(self.learned_penalties.get("hand_obstruction", 1.0) + 0.08, 2))
                 synth[9] = min(synth[9], 0.35)   # low torso_clear
                 synth[10] = 0.0                  # hands_clear = 0
                 matched_any = True
 
             # 5. False prop / box at bottom / not presenting prop
             if any(k in combined for k in ("prop", "box", "holding", "cut off", "clipped")):
-                self.learned_penalties["prop_strictness"] = min(2.5, round(self.learned_penalties.get("prop_strictness", 1.0) + 0.30, 2))
+                self.learned_penalties["prop_strictness"] = min(1.35, round(self.learned_penalties.get("prop_strictness", 1.0) + 0.10, 2))
                 synth[8] = min(synth[8], 0.45)   # lower cutout_score
                 matched_any = True
 
             # 6. Motion blur / soft focus
             if any(k in combined for k in ("blur", "soft", "focus", "smear", "motion")):
-                self.learned_penalties["blur"] = min(2.5, round(self.learned_penalties.get("blur", 1.0) + 0.25, 2))
+                self.learned_penalties["blur"] = min(1.35, round(self.learned_penalties.get("blur", 1.0) + 0.08, 2))
                 synth[6] = min(synth[6], 0.25)   # low sharpness_norm
                 matched_any = True
 
             if matched_any:
                 # Reinforce the targeted negative pattern in the classifier dataset
                 self.samples.append((synth, 0))
+        else:
+            # Approving a shot gently relaxes accumulated penalties back toward 1.0
+            for k in list(self.learned_penalties.keys()):
+                if self.learned_penalties[k] > 1.0:
+                    self.learned_penalties[k] = max(1.0, round(self.learned_penalties[k] - 0.05, 2))
 
     def get_judge_feedback_prompt(self, max_notes: int = 8) -> str:
         """Formats the operator's recent rejection/approval comments into a directive
@@ -364,7 +372,8 @@ class UserPreferenceModel:
             for k in self.DEFAULT_PENALTIES:
                 if k in data["learned_penalties"]:
                     try:
-                        self.learned_penalties[k] = float(data["learned_penalties"][k])
+                        val = float(data["learned_penalties"][k])
+                        self.learned_penalties[k] = round(max(0.8, min(1.35, val)), 2)
                     except (TypeError, ValueError):
                         pass
 
@@ -379,6 +388,7 @@ class UserPreferenceModel:
                       f"under feature set v{stored_version}; the scoring metrics have changed "
                       f"(now v{self.FEATURE_VERSION}). Re-rate a few captures to retrain.")
             self.samples = []
+            self.learned_penalties = dict(self.DEFAULT_PENALTIES)
             self.is_trained = False
             self.confidence = 0.0
             self.save()
