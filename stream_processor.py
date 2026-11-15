@@ -6,7 +6,7 @@ import types
 import urllib.parse
 import threading
 import contextlib
-from collections import deque
+from collections import deque, OrderedDict
 from dataclasses import dataclass, field
 from typing import Optional, Callable, Dict, Any, List, Tuple
 import numpy as np
@@ -14,6 +14,8 @@ import numpy as np
 from config import AppConfig, redact_credentials
 from analyzer import PersonQualityAnalyzer, AnalysisResult
 from ai_judge import AIJudge, JudgeResult
+from postprocess import get_postprocess_engine, cutout_path_for, save_cutout_png
+from audio_analyzer import LiveAudioMonitor
 import settings_store
 
 @dataclass
@@ -31,6 +33,9 @@ class CapturedScreenshot:
     is_prop_moment: bool = False          # True when speaker is holding/presenting a stage prop
     from_video_scan: bool = False         # True when produced by the offline video scanner
     is_pinned: bool = False               # True when flagged/locked by operator to protect from auto-deletion
+    cutout_filepath: Optional[str] = None # Transparent RGBA *_cutout.png written alongside, if enabled
+    finals_badge: str = ""                # Tournament Finals badge (e.g. "#1 Overall", "Best Smile")
+    mood_bucket: str = ""                 # Expression mood bucket (warm_smile, passionate, calm_portrait, prop)
 
 
 def subject_crop_rect(analysis: AnalysisResult, frame_w: int, frame_h: int,
@@ -81,19 +86,48 @@ def write_capture(frame: np.ndarray, analysis: AnalysisResult, out_dir: str,
         else [int(cv2.IMWRITE_JPEG_QUALITY), int(config.jpeg_quality)]
     )
 
+    polish_on = bool(getattr(config, "broadcast_polish_enabled", False))
+    upscale_on = bool(getattr(config, "upscale_4k_enabled", False))
+    base_frame = frame
+    if polish_on:
+        base_frame = get_postprocess_engine().polish_broadcast_frame(
+            frame, analysis, deblock=True, neutralize_led=True, upscale_2x=False
+        )
+
+    out_frame = (
+        get_postprocess_engine().polish_broadcast_frame(
+            base_frame, analysis, deblock=False, neutralize_led=False, upscale_2x=True
+        )
+        if upscale_on
+        else base_frame
+    )
+
     filepath = os.path.join(out_dir, base_name + ext)
-    cv2.imwrite(filepath, frame, params)
+    cv2.imwrite(filepath, out_frame, params)
 
     crop_path = None
     if config.save_subject_crop:
-        h, w = frame.shape[:2]
+        h, w = base_frame.shape[:2]
         rect = subject_crop_rect(analysis, w, h, config.subject_crop_padding)
         if rect:
             cx, cy, cw, ch = rect
-            crop = frame[cy:cy + ch, cx:cx + cw]
+            crop = base_frame[cy:cy + ch, cx:cx + cw]
             if crop.size > 0:
+                if upscale_on:
+                    crop = get_postprocess_engine().polish_broadcast_frame(
+                        crop, None, deblock=False, neutralize_led=False, upscale_2x=True
+                    )
                 crop_path = os.path.join(out_dir, base_name + "_subject" + ext)
                 cv2.imwrite(crop_path, crop, params)
+
+    if getattr(config, "auto_save_cutout", False):
+        save_cutout_png(
+            base_frame,
+            analysis,
+            cutout_path_for(filepath),
+            crop_to_subject=False,
+            polish_first=False,
+        )
 
     return filepath, crop_path
 
@@ -182,7 +216,14 @@ class StreamProcessor:
         # freshest.
         self._review_queue: deque = deque(maxlen=max(1, int(getattr(config, "review_queue_size", 10))))
         self._review_worker: Optional[threading.Thread] = None
-        
+
+        # Audio-aware pause/laughter monitor & RAM speech ring buffer (#8)
+        self.audio_monitor = LiveAudioMonitor()
+
+        # Bounded LRU cache of +-15 surrounding high-res frames per saved capture (#7)
+        self._burst_cache: OrderedDict[str, Dict[str, Any]] = OrderedDict()
+        self._burst_lock = threading.Lock()
+        self._last_refined_timestamp: Optional[float] = None
         
         # Connection status tracking
         self.connection_status: str = self.STATUS_DISCONNECTED
@@ -202,6 +243,11 @@ class StreamProcessor:
         self._stop_event.clear()
         self.running = True
         self.connection_status = self.STATUS_CONNECTING
+
+        if getattr(self.config, "audio_gating_enabled", False) and getattr(self, "audio_monitor", None) is not None:
+            src = (self.config.stream_source or "").strip()
+            if src:
+                self.audio_monitor.start(src)
         
         # 1. Grabber Thread (Drains RTSP stream continuously to prevent buffer lag)
         self.grabber_thread = threading.Thread(target=self._grabber_loop, daemon=True)
@@ -218,6 +264,8 @@ class StreamProcessor:
         judge = getattr(self, "judge", None)
         if judge is not None and judge.backend == "ollama" and not judge._expiry_handled:
             judge.sleep_now()
+        if getattr(self, "audio_monitor", None) is not None:
+            self.audio_monitor.stop()
         self.running = False
         self._stop_event.set()  # interrupts an in-progress reconnect backoff
         if self.grabber_thread and self.grabber_thread.is_alive():
@@ -381,6 +429,13 @@ class StreamProcessor:
 
     def _open_capture(self) -> Optional[cv2.VideoCapture]:
         source = self.config.stream_source.strip()
+        if source.lower().startswith("ndi://"):
+            from ndi_source import NDIVideoCapture
+            cap = NDIVideoCapture(source)
+            if not cap.isOpened():
+                print(f"[StreamProcessor] Error: Failed to open NDI source: '{source}'")
+                return None
+            return cap  # type: ignore[return-value]
         
         # Low latency OpenCV FFMPEG environment settings
         os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|max_delay;500000|reorder_queue_size;0"
@@ -400,13 +455,14 @@ class StreamProcessor:
         return cap
 
     def _wait_for_rtsp_standby(self, source: str) -> Optional[cv2.VideoCapture]:
-        """Polls a powered-off RTSP camera lightly until it comes online or stop() is called."""
+        """Polls a powered-off RTSP/NDI camera lightly until it comes online or stop() is called."""
         poll_sec = max(1.0, float(getattr(self.config, "rtsp_standby_poll_sec", 15.0) or 15.0))
         self._set_status(self.STATUS_STANDBY)
         print(f"[StreamProcessor] Camera offline ({redact_credentials(source)}); "
               f"standing by and polling every {poll_sec:.0f}s until powered on.")
-        # Only pre-probe TCP when _open_capture hasn't been replaced by a test stub.
-        use_tcp_probe = isinstance(getattr(self, "_open_capture", None), types.MethodType)
+        # Only pre-probe TCP when _open_capture hasn't been replaced by a test stub and source is RTSP.
+        is_ndi = source.lower().startswith("ndi://")
+        use_tcp_probe = (not is_ndi) and isinstance(getattr(self, "_open_capture", None), types.MethodType)
         while not self._stop_event.is_set():
             if self._stop_event.wait(poll_sec):
                 return None
@@ -414,7 +470,7 @@ class StreamProcessor:
                 continue
             cap = self._open_capture()
             if cap is not None:
-                print("[StreamProcessor] RTSP camera online — connected from standby.")
+                print("[StreamProcessor] Camera online — connected from standby.")
                 return cap
         return None
 
@@ -426,7 +482,7 @@ class StreamProcessor:
             self._stop_event.wait()
             return
 
-        is_rtsp = source.lower().startswith(("rtsp://", "rtsps://"))
+        is_rtsp = source.lower().startswith(("rtsp://", "rtsps://", "ndi://"))
         self.cap = self._open_capture()
         if not self.cap:
             if is_rtsp:
@@ -670,7 +726,8 @@ class StreamProcessor:
         A deque's maxlen is fixed at construction, so this builds a new one. The newest
         frames are the useful ones, so a shrink drops from the front.
         """
-        seconds = max(0.0, min(60.0, float(seconds)))
+        max_sec = max(60.0, float(getattr(self.config, "dvr_max_seconds", 180.0) or 180.0))
+        seconds = max(0.0, min(max_sec, float(seconds)))
         if fps is not None:
             self.config.dvr_buffer_fps = max(1, min(60, int(fps)))
         self.config.dvr_buffer_seconds = seconds
@@ -684,20 +741,41 @@ class StreamProcessor:
               f"({new_max} frames, ~{stats['mb_capacity']:.0f} MB at this resolution)")
         return stats
 
+    def _get_or_create_refine_analyzer(self) -> PersonQualityAnalyzer:
+        """Returns a standalone analyzer synced with live speaker lock, stage zones, and ML model."""
+        if getattr(self, "_refine_analyzer", None) is None:
+            self._refine_analyzer = PersonQualityAnalyzer(
+                self.config.weights, self.config.thresholds,
+                max_people_target=getattr(self.analyzer, "max_people_target", 1),
+                selected_person_ids=list(getattr(self.analyzer, "selected_person_ids", [])),
+                pose_hand_interval=1,
+                require_temporal_stability=False,
+                use_ml_preference=getattr(self.config, "use_ml_preference", True),
+                ml_weight=getattr(self.config, "ml_weight", 0.35),
+                require_exact_people_count=getattr(self.analyzer, "require_exact_people_count", False),
+                capture_prop_moments=getattr(self.analyzer, "capture_prop_moments", True),
+                fast_reject=True,
+                speaker_id=getattr(self.analyzer, "speaker_id", None),
+                stage_zones=getattr(self.analyzer, "stage_zones", None),
+            )
+            self._refine_analyzer.preference_model = getattr(self.analyzer, "preference_model", None)
+        else:
+            self._refine_analyzer.max_people_target = getattr(self.analyzer, "max_people_target", 1)
+            self._refine_analyzer.selected_person_ids = set(getattr(self.analyzer, "selected_person_ids", []))
+            self._refine_analyzer.require_exact_people_count = getattr(self.analyzer, "require_exact_people_count", False)
+            self._refine_analyzer.capture_prop_moments = getattr(self.analyzer, "capture_prop_moments", True)
+            self._refine_analyzer.preference_model = getattr(self.analyzer, "preference_model", None)
+            self._refine_analyzer.speaker_id = getattr(self.analyzer, "speaker_id", None)
+            self._refine_analyzer.stage_zones = getattr(self.analyzer, "stage_zones", None)
+        return self._refine_analyzer
+
     def _refine_from_buffer(self, chosen_at: float, chosen_frame: np.ndarray,
                            chosen_analysis: AnalysisResult):
         """Looks for a crisper version of the chosen moment in the rolling buffer.
 
-        Analysis samples at analysis_fps while the camera sends roughly four times that,
-        so the frame that got scored is rarely the sharpest one available - a gesturing
-        hand smears badly from one frame to the next. This scrubs a short window around
-        the chosen moment, ranks every buffered frame by a cheap sharpness proxy, and
-        then fully re-scores only the best few. Sharpness alone would be the wrong thing
-        to trust: half a second is enough to start a blink, so the winner has to earn it
-        on the whole score, not just on clarity.
-
         Returns (frame, analysis) - the originals if nothing better is found.
         """
+        self._last_refined_timestamp = chosen_at
         window = float(getattr(self.config, "dvr_refine_window_sec", 0.0) or 0.0)
         top_n = int(getattr(self.config, "dvr_refine_candidates", 0) or 0)
         if window <= 0 or top_n <= 0 or not self._dvr.maxlen:
@@ -708,8 +786,6 @@ class StreamProcessor:
         if len(nearby_entries) < 2:
             return chosen_frame, chosen_analysis
 
-        # Cheap proxy first: sharpness over the subject region, normalised the same way
-        # the analyzer does it so the numbers mean the same thing.
         faces = chosen_analysis.faces or []
         primary_face = next((f for f in faces if getattr(f, "is_selected", True)), faces[0]) if faces else None
         rect = getattr(primary_face, "subject_bbox", None) if primary_face else None
@@ -736,27 +812,7 @@ class StreamProcessor:
             return chosen_frame, chosen_analysis
 
         scored.sort(key=lambda item: item[0], reverse=True)
-
-        if self._refine_analyzer is None:
-            self._refine_analyzer = PersonQualityAnalyzer(
-                self.config.weights, self.config.thresholds,
-                max_people_target=self.analyzer.max_people_target,
-                selected_person_ids=list(self.analyzer.selected_person_ids),
-                pose_hand_interval=1,
-                require_temporal_stability=False,
-                use_ml_preference=getattr(self.config, "use_ml_preference", True),
-                ml_weight=getattr(self.config, "ml_weight", 0.35),
-                require_exact_people_count=self.analyzer.require_exact_people_count,
-                capture_prop_moments=getattr(self.analyzer, "capture_prop_moments", True),
-                fast_reject=True,
-            )
-            self._refine_analyzer.preference_model = self.analyzer.preference_model
-        else:
-            self._refine_analyzer.max_people_target = self.analyzer.max_people_target
-            self._refine_analyzer.selected_person_ids = set(self.analyzer.selected_person_ids)
-            self._refine_analyzer.require_exact_people_count = self.analyzer.require_exact_people_count
-            self._refine_analyzer.capture_prop_moments = getattr(self.analyzer, "capture_prop_moments", True)
-            self._refine_analyzer.preference_model = self.analyzer.preference_model
+        ref_analyzer = self._get_or_create_refine_analyzer()
 
         started_qualified = chosen_analysis.is_qualified
         best_frame, best_analysis = chosen_frame, chosen_analysis
@@ -765,31 +821,252 @@ class StreamProcessor:
 
         for _sharp, cand_t, f in scored[:top_n]:
             try:
-                a = self._refine_analyzer.analyze_frame(f)
+                a = ref_analyzer.analyze_frame(f)
             except Exception:
                 continue
             if a.face_detected and a.is_qualified and a.overall_score > best_score:
                 best_score, best_frame, best_analysis, best_time = a.overall_score, f, a, cand_t
 
+        self._last_refined_timestamp = best_time
         if best_analysis is not chosen_analysis:
             print(f"[Refine] {chosen_analysis.overall_score:.0%} -> {best_score:.0%} "
                   f"(sharpness {chosen_analysis.laplacian_variance:.0f} -> "
                   f"{best_analysis.laplacian_variance:.0f}) from {len(nearby_entries)} buffered frames")
         return best_frame, best_analysis
 
+    def mine_dvr_window(
+        self,
+        lookback_seconds: float = 60.0,
+        max_picks: int = 3,
+        min_spacing_sec: float = 3.0,
+        window_seconds: Optional[float] = None,
+    ) -> List[CapturedScreenshot]:
+        """Retroactively mines the RAM Time-Machine buffer for great recent moments (#4b)."""
+        if window_seconds is not None:
+            lookback_seconds = float(window_seconds)
+        if not getattr(self, "_dvr", None):
+            return []
+        with self._dvr_lock:
+            entries = list(self._dvr)
+        if not entries:
+            return []
+
+        newest_ts = entries[-1][0]
+        cutoff = newest_ts - max(1.0, float(lookback_seconds))
+        window_entries = [e for e in entries if e[0] >= cutoff]
+        if not window_entries:
+            return []
+
+        # Sample at ~4 fps across the window so 60s (=1800 frames) runs in <1.5 seconds,
+        # then refine the top winners at full 30fps!
+        step = max(1, len(window_entries) // max(12, int(lookback_seconds * 4)))
+        sampled = window_entries[::step]
+        ref_analyzer = self._get_or_create_refine_analyzer()
+
+        candidates: List[Tuple[float, float, np.ndarray, AnalysisResult]] = []
+        for entry in sampled:
+            ts = entry[0]
+            frame = self._decode_dvr_frame(entry)
+            if frame is None:
+                continue
+            try:
+                analysis = ref_analyzer.analyze_frame(frame)
+            except Exception:
+                continue
+            if analysis.face_detected and analysis.overall_score > 0.20:
+                eff = analysis.overall_score if analysis.is_qualified else (analysis.overall_score * 0.65)
+                candidates.append((eff, ts, frame, analysis))
+
+        if not candidates:
+            return []
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        picked: List[Tuple[float, np.ndarray, AnalysisResult]] = []
+        for _eff, ts, frame, analysis in candidates:
+            if len(picked) >= max(1, int(max_picks)):
+                break
+            if any(abs(ts - p[0]) < min_spacing_sec for p in picked):
+                continue
+            r_frame, r_analysis = self._refine_from_buffer(ts, frame, analysis)
+            r_ts = getattr(self, "_last_refined_timestamp", None) or ts
+            picked.append((r_ts, r_frame, r_analysis))
+
+        saved: List[CapturedScreenshot] = []
+        for r_ts, r_frame, r_analysis in picked:
+            cap_item = self.save_screenshot(r_frame, r_analysis, captured_at=r_ts)
+            saved.append(cap_item)
+        return saved
+
+    # --- +-15 Frame Micro-Scrub Burst Filmstrip (#7) -------------------------
+
+    @staticmethod
+    def _entry_to_jpeg_bytes(entry: tuple) -> Optional[bytes]:
+        payload = entry[1]
+        if isinstance(payload, bytes):
+            return payload
+        if isinstance(payload, bytearray):
+            return bytes(payload)
+        if isinstance(payload, np.ndarray):
+            ok, enc = cv2.imencode(".jpg", payload, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+            return enc.tobytes() if ok else None
+        return None
+
+    def cache_burst_around(
+        self,
+        filename: str,
+        center_ts: float,
+        fallback_frame: Optional[np.ndarray] = None,
+        extra_frames: Optional[List[Tuple[float, bytes]]] = None,
+    ) -> None:
+        """Caches +-N high-res frames around `center_ts` in RAM for instant micro-scrubbing."""
+        lock = getattr(self, "_burst_lock", None)
+        cache = getattr(self, "_burst_cache", None)
+        if lock is None or cache is None or not filename:
+            return
+        half_n = max(3, int(getattr(self.config, "burst_filmstrip_frames", 15) or 15))
+        frames_list: List[Tuple[float, bytes]] = []
+
+        if extra_frames:
+            frames_list = list(extra_frames)
+        elif getattr(self, "_dvr", None):
+            with self._dvr_lock:
+                dvr_snapshot = list(self._dvr)
+            if dvr_snapshot:
+                best_idx = min(range(len(dvr_snapshot)), key=lambda i: abs(dvr_snapshot[i][0] - center_ts))
+                if abs(dvr_snapshot[best_idx][0] - center_ts) <= 2.5:
+                    lo = max(0, best_idx - half_n)
+                    hi = min(len(dvr_snapshot), best_idx + half_n + 1)
+                    for e in dvr_snapshot[lo:hi]:
+                        jb = self._entry_to_jpeg_bytes(e)
+                        if jb:
+                            frames_list.append((float(e[0]), jb))
+
+        if not frames_list and fallback_frame is not None:
+            ok, enc = cv2.imencode(".jpg", fallback_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+            if ok:
+                frames_list.append((float(center_ts), enc.tobytes()))
+
+        if not frames_list:
+            return
+
+        sel_idx = min(range(len(frames_list)), key=lambda i: abs(frames_list[i][0] - center_ts))
+        key = os.path.basename(filename)
+        with lock:
+            cache[key] = {
+                "center_ts": float(center_ts),
+                "selected_idx": int(sel_idx),
+                "frames": frames_list,
+            }
+            cache.move_to_end(key)
+            while len(cache) > 35:
+                cache.popitem(last=False)
+
+    def get_burst_frames(self, filename: str) -> Dict[str, Any]:
+        key = os.path.basename(filename)
+        lock = getattr(self, "_burst_lock", None)
+        cache = getattr(self, "_burst_cache", None)
+        if lock is None or cache is None:
+            return {"available": False, "frames": []}
+        with lock:
+            item = cache.get(key)
+            if not item:
+                return {"available": False, "frames": []}
+            sel = int(item.get("selected_idx", 0))
+            base_ts = item["frames"][sel][0] if item["frames"] else item["center_ts"]
+            meta = [
+                {
+                    "index": idx,
+                    "offset_ms": int(round((ts - base_ts) * 1000.0)),
+                    "is_selected": (idx == sel),
+                }
+                for idx, (ts, _jb) in enumerate(item["frames"])
+            ]
+            return {"available": len(meta) > 0, "selected_idx": sel, "count": len(meta), "frames": meta}
+
+    def get_burst_frame_jpeg(self, filename: str, idx: int) -> Optional[bytes]:
+        key = os.path.basename(filename)
+        lock = getattr(self, "_burst_lock", None)
+        cache = getattr(self, "_burst_cache", None)
+        if lock is None or cache is None:
+            return None
+        with lock:
+            item = cache.get(key)
+            if not item:
+                return None
+            frames = item.get("frames") or []
+            if 0 <= idx < len(frames):
+                return frames[idx][1]
+        return None
+
+    def select_burst_frame(self, filename: str, idx: int) -> Optional[CapturedScreenshot]:
+        """Swaps a saved capture to frame `idx` from its cached burst filmstrip (#7 + ML-2)."""
+        jb = self.get_burst_frame_jpeg(filename, idx)
+        if jb is None:
+            return None
+        arr = np.frombuffer(jb, dtype=np.uint8)
+        new_frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if new_frame is None:
+            return None
+
+        key = os.path.basename(filename)
+        with getattr(self, "captures_lock", contextlib.nullcontext()):
+            target_cap = next(
+                (c for c in self.saved_captures if os.path.basename(c.filepath) == key),
+                None,
+            )
+            if target_cap is None:
+                return None
+
+            ref_analyzer = self._get_or_create_refine_analyzer()
+            new_analysis = ref_analyzer.analyze_frame(new_frame)
+
+            out_dir = os.path.dirname(target_cap.filepath)
+            stem, _ext = os.path.splitext(os.path.basename(target_cap.filepath))
+            new_fp, new_crop = write_capture(new_frame, new_analysis, out_dir, stem, self.config)
+
+            # Update existing cutout PNG if one already existed even when auto_save_cutout is off
+            cpath = cutout_path_for(new_fp)
+            if target_cap.cutout_filepath and not os.path.isfile(cpath):
+                save_cutout_png(new_frame, new_analysis, cpath, crop_to_subject=False)
+
+            target_cap.filepath = new_fp
+            target_cap.crop_filepath = new_crop
+            target_cap.cutout_filepath = cpath if os.path.isfile(cpath) else None
+            target_cap.analysis = new_analysis
+            if new_analysis.face_detected:
+                target_cap.heuristic_score = new_analysis.overall_score
+                target_cap.overall_score = new_analysis.overall_score
+                target_cap.mood_bucket = getattr(new_analysis, "mood_bucket", "") or target_cap.mood_bucket
+                target_cap.is_prop_moment = bool(getattr(new_analysis, "is_prop_moment", False))
+
+            lock = getattr(self, "_burst_lock", None)
+            cache = getattr(self, "_burst_cache", None)
+            if lock is not None and cache is not None:
+                with lock:
+                    if key in cache:
+                        cache[key]["selected_idx"] = int(idx)
+
+            # Implicit positive ML feedback: operator hand-picked this exact sub-second frame!
+            pm = getattr(getattr(self, "analyzer", None), "preference_model", None)
+            if pm is not None and hasattr(pm, "record_implicit_feedback") and new_analysis.face_detected:
+                h, w = new_frame.shape[:2]
+                rect = subject_crop_rect(new_analysis, w, h, self.config.subject_crop_padding)
+                crop = new_frame if rect is None else new_frame[rect[1]:rect[1] + rect[3], rect[0]:rect[0] + rect[2]]
+                pm.record_implicit_feedback(target_cap, peer_captures=list(self.saved_captures), action="burst_swap", crop_bgr=crop)
+
+            self._persist_manifest()
+            return target_cap
+
+    @staticmethod
+    def _item_mood(c: CapturedScreenshot) -> str:
+        mb = getattr(c, "mood_bucket", "") or getattr(getattr(c, "analysis", None), "mood_bucket", "") or ""
+        return str(mb)
+
     def _would_improve_retained(self, score: float, now: float,
                                 is_prop_moment: bool = False,
-                                is_smiling: bool = False) -> bool:
-        """Is this capture worth writing, given what is already kept?
-
-        This replaced a check that compared each candidate against the *last saved*
-        score and demanded a 2% improvement over it unless the frame looked visually
-        different. That was a ratchet: one strong capture pinned the bar high, a seated
-        speaker rarely looks "different" enough at 160x120, and capturing quietly
-        stopped for the rest of the service — even for frames that would have replaced
-        the weakest of the five kept. The question that matters is whether this frame
-        improves the kept set, so that is what is asked.
-        """
+                                is_smiling: bool = False,
+                                mood_bucket: str = "") -> bool:
+        """Is this capture worth writing, given what is already kept?"""
         if not self.config.single_winner_mode:
             return True
         n = max(1, self.config.max_retained_captures)
@@ -806,11 +1083,11 @@ class StreamProcessor:
         kept_props = [c for c in kept if getattr(c, "is_prop_moment", False)]
         non_props = [c for c in kept if not getattr(c, "is_prop_moment", False)]
         has_kept_smile = any(getattr(getattr(c, "analysis", None), "is_smiling", False) for c in kept)
+        mood_enabled = bool(getattr(self.config, "mood_buckets_enabled", True)) and n >= 4
+        kept_moods = {self._item_mood(c) for c in kept if self._item_mood(c)}
 
         spacing = max(0.0, float(getattr(self.config, "min_capture_spacing_sec", 0.0)))
         if spacing > 0:
-            # A better version of a moment already represented replaces it; a weaker
-            # one is not worth a second copy of the same few seconds.
             nearby = [c for c in kept if abs(now - c.captured_at) < spacing]
             if nearby:
                 if is_prop_moment and prop_enabled:
@@ -821,6 +1098,8 @@ class StreamProcessor:
                         return True
                 if is_smiling and n >= 3 and not has_kept_smile and score >= self.config.thresholds.min_overall_score:
                     return True
+                if mood_enabled and mood_bucket and mood_bucket not in kept_moods and score >= self.config.thresholds.min_overall_score:
+                    return True
                 return score > max(c.overall_score for c in nearby)
 
         if is_prop_moment and prop_enabled:
@@ -829,9 +1108,11 @@ class StreamProcessor:
             if kept_props:
                 return score > min(c.overall_score for c in kept_props) or score > min(c.overall_score for c in kept)
 
-        # Expression diversity: when the gallery has 0 smiles across >=3 slots, admit a
-        # qualified smiling shot so a warm smile isn't locked out by 5 neutral shots.
         if is_smiling and n >= 3 and not has_kept_smile and score >= self.config.thresholds.min_overall_score:
+            return True
+
+        # Mood Buckets (#6): admit an unrepresented expression mood (e.g. passionate or calm_portrait)
+        if mood_enabled and mood_bucket and mood_bucket not in kept_moods and score >= self.config.thresholds.min_overall_score:
             return True
 
         if not is_prop_moment and prop_enabled and kept_props and len(kept_props) <= prop_cap and non_props:
@@ -847,40 +1128,41 @@ class StreamProcessor:
         best_candidate = max(self.candidate_buffer, key=lambda item: item[2].overall_score)
         cand_time, best_frame, best_analysis = best_candidate
 
-        # The score threshold is deliberately NOT checked here. Blur pushes a frame under
-        # it, and refinement below may well replace that frame with a sharp version of
-        # the same moment that clears it comfortably. The post-refinement is_qualified
-        # guard enforces the threshold on whatever frame actually wins.
-
         # === Score Trend: require local peak ===
         if not self._is_at_local_peak():
             return
         
         # === Scrub the buffer for a crisper version of this same moment ===
-        # Done before the retention test, since refinement can only raise the score and
-        # a sharper frame may clear a bar the sampled one missed.
         best_frame, best_analysis = self._refine_from_buffer(cand_time, best_frame, best_analysis)
+        refined_ts = getattr(self, "_last_refined_timestamp", None) or cand_time
 
-        # Blur-only candidates were admitted on the chance the buffer held a sharp
-        # version of the same moment. If it didn't, the frame is still blurry - drop it.
         if not best_analysis.is_qualified:
             return
 
+        # Audio-aware pause/laughter tie-breaker (#8)
+        aud_mon = getattr(self, "audio_monitor", None)
+        if getattr(self.config, "audio_gating_enabled", False) and aud_mon is not None:
+            tel = aud_mon.telemetry()
+            if tel.active and tel.capture_bonus > 0 and not best_analysis.is_awkward_expression:
+                best_analysis.overall_score = round(min(1.0, best_analysis.overall_score + tel.capture_bonus * 0.5), 3)
+
         is_prop = bool(getattr(best_analysis, "is_prop_moment", False))
         is_smile = bool(getattr(best_analysis, "is_smiling", False))
+        mood_b = str(getattr(best_analysis, "mood_bucket", "") or "")
 
         # === Would this actually improve what we're keeping? ===
         if not self._would_improve_retained(
-            best_analysis.overall_score, cand_time, is_prop_moment=is_prop, is_smiling=is_smile
+            best_analysis.overall_score, refined_ts,
+            is_prop_moment=is_prop, is_smiling=is_smile, mood_bucket=mood_b
         ):
             return
 
         # All checks passed — either save now, or send it for review first.
         if self.judge.available:
-            if not self._start_review(best_frame, best_analysis, now, cand_time=cand_time):
+            if not self._start_review(best_frame, best_analysis, now, cand_time=refined_ts):
                 return   # a review is already running; the next candidate will come along
         else:
-            self.save_screenshot(best_frame, best_analysis, captured_at=cand_time)
+            self.save_screenshot(best_frame, best_analysis, captured_at=refined_ts)
         # Reports the terms that actually drive the pick. Plain "deg" rather than the
         # degree sign, which mojibakes on a default Windows console codepage.
         flags = []
@@ -968,9 +1250,17 @@ class StreamProcessor:
                 result = self.judge.judge(crop, analysis.overall_score, notes)
 
             if result.verdict is not None:
+                # Teacher -> Student ML Distillation (ML-4)
+                if getattr(self.config, "ai_judge_distill_to_ml", True) and pm is not None and hasattr(pm, "record_judge_distillation"):
+                    try:
+                        pm.record_judge_distillation(analysis, result.verdict, crop_bgr=crop)
+                    except Exception:
+                        pass
+
                 if getattr(result.verdict, "holding_prop", False):
                     if getattr(self.config, "capture_prop_moments", True):
                         analysis.is_prop_moment = True
+                        analysis.mood_bucket = "prop"
                 else:
                     issue_text = " ".join(result.verdict.issues or []).lower()
                     if any(kw in issue_text for kw in (
@@ -994,11 +1284,13 @@ class StreamProcessor:
 
             is_prop = bool(getattr(analysis, "is_prop_moment", False))
             is_smile = bool(getattr(analysis, "is_smiling", False))
+            mood_b = str(getattr(analysis, "mood_bucket", "") or "")
 
             # Re-check against the kept set with the blended score: the review took a
             # few seconds, and a better capture may have landed meanwhile.
             if not self._would_improve_retained(
-                result.blended_score, actual_time, is_prop_moment=is_prop, is_smiling=is_smile
+                result.blended_score, actual_time,
+                is_prop_moment=is_prop, is_smiling=is_smile, mood_bucket=mood_b
             ):
                 return
 
@@ -1015,7 +1307,8 @@ class StreamProcessor:
             for c in self.saved_captures:
                 if c.filepath == filepath or os.path.basename(c.filepath) == target_name:
                     removed = True
-                    for path in (c.filepath, c.crop_filepath):
+                    extra_cutout = cutout_path_for(c.filepath) if c.filepath else None
+                    for path in (c.filepath, c.crop_filepath, getattr(c, "cutout_filepath", None), extra_cutout):
                         if path and os.path.exists(path):
                             try:
                                 os.remove(path)
@@ -1046,15 +1339,7 @@ class StreamProcessor:
         return new_state
 
     def clear_captures(self, mode: str = "unpinned") -> Dict[str, int]:
-        """Clears captures from memory and deletes their files from the output folder.
-
-        Modes:
-        - "unpinned": Deletes all unpinned captures (plus any leftover unpinned best_shot_* files
-                      in output_dir) so the system is clean and ready for the next service while
-                      preserving all 📌 Saved (pinned) shots.
-        - "pinned":   Deletes all 📌 Saved (pinned) captures from memory and disk.
-        - "all":      Deletes all captures (both pinned and unpinned) from memory and disk.
-        """
+        """Clears captures from memory and deletes their files from the output folder."""
         mode = (mode or "unpinned").strip().lower()
         deleted_count = 0
         with getattr(self, "captures_lock", contextlib.nullcontext()):
@@ -1079,7 +1364,8 @@ class StreamProcessor:
                 deleted_any = False
                 stem, ext = os.path.splitext(c.filepath)
                 legacy_crop = f"{stem}_subject{ext}" if stem and ext else None
-                for path in (c.filepath, c.crop_filepath, legacy_crop):
+                legacy_cutout = f"{stem}_cutout.png" if stem else None
+                for path in (c.filepath, c.crop_filepath, legacy_crop, getattr(c, "cutout_filepath", None), legacy_cutout):
                     if path and os.path.exists(path):
                         try:
                             os.remove(path)
@@ -1100,8 +1386,11 @@ class StreamProcessor:
                             protected_names.add(os.path.basename(c.filepath))
                             s, e = os.path.splitext(os.path.basename(c.filepath))
                             protected_names.add(f"{s}_subject{e}")
+                            protected_names.add(f"{s}_cutout.png")
                         if c.crop_filepath:
                             protected_names.add(os.path.basename(c.crop_filepath))
+                        if getattr(c, "cutout_filepath", None):
+                            protected_names.add(os.path.basename(c.cutout_filepath))
                     try:
                         for fname in os.listdir(out_dir):
                             low = fname.lower()
@@ -1151,6 +1440,8 @@ class StreamProcessor:
             (verdict is not None and getattr(verdict, "holding_prop", False) and getattr(self.config, "capture_prop_moments", True))
         )
         analysis.is_prop_moment = is_prop
+        if is_prop and not getattr(analysis, "mood_bucket", ""):
+            analysis.mood_bucket = "prop"
 
         cap_ts = captured_at if captured_at is not None else time.time()
         timestamp_str = time.strftime("%Y%m%d_%H%M%S", time.localtime(cap_ts))
@@ -1161,6 +1452,9 @@ class StreamProcessor:
         filepath, crop_path = write_capture(
             frame, analysis, self.config.output_dir, base_name, self.config
         )
+        cpath = cutout_path_for(filepath)
+        cutout_fp = cpath if os.path.isfile(cpath) else None
+        mood_b = str(getattr(analysis, "mood_bucket", "") or "")
 
         capture_item = CapturedScreenshot(
             filepath=filepath,
@@ -1174,7 +1468,12 @@ class StreamProcessor:
             judge_summary=(verdict.summary if verdict is not None else ""),
             judge_issues=(list(verdict.issues) if verdict is not None else []),
             is_prop_moment=is_prop,
+            cutout_filepath=cutout_fp,
+            mood_bucket=mood_b,
         )
+        # Cache +-15 surrounding frames from RAM DVR for Micro-Scrub UI (#7)
+        self.cache_burst_around(os.path.basename(filepath), cap_ts, fallback_frame=frame)
+
         if verdict is not None:
             print(f"[AIJudge] Kept ({heuristic:.0%} -> judge {verdict.score:.0%} = {final_score:.0%}, "
                   f"{review.latency_sec:.1f}s): {verdict.summary}")
@@ -1215,9 +1514,6 @@ class StreamProcessor:
                 self._persist_manifest()
                 return
 
-            # Best first, but five shots from the same ten seconds are one shot with
-            # variations. Spread the keepers out, then relax the spacing only if there
-            # aren't enough well-separated shots to fill the slots.
             ordered = sorted(live_items, key=lambda item: item.overall_score, reverse=True)
             spacing = max(0.0, float(getattr(self.config, "min_capture_spacing_sec", 0.0)))
             winners: List[CapturedScreenshot] = []
@@ -1264,6 +1560,33 @@ class StreamProcessor:
                         picked_smile = True
                         break
 
+            # Mood Buckets (#6): when retaining >=4 shots, ensure passionate & calm_portrait
+            # moods each get up to 1 slot if explicitly classified and qualified.
+            if bool(getattr(self.config, "mood_buckets_enabled", True)) and n >= 4:
+                for target_mood in ("warm_smile", "passionate", "calm_portrait"):
+                    if len(winners) >= n - 1:  # always leave at least 1 pure highest-score slot
+                        break
+                    if any(self._item_mood(w) == target_mood for w in winners):
+                        continue
+                    mood_cands = [
+                        c for c in ordered
+                        if c not in winners
+                        and self._item_mood(c) == target_mood
+                        and c.overall_score >= min_qual_score
+                    ]
+                    picked_m = False
+                    for enforce in (True, False):
+                        if picked_m:
+                            break
+                        for c in mood_cands:
+                            if enforce and spacing > 0 and any(
+                                abs(c.captured_at - w.captured_at) < spacing for w in winners
+                            ):
+                                continue
+                            winners.append(c)
+                            picked_m = True
+                            break
+
             for enforce in (True, False):
                 for c in ordered:
                     if len(winners) >= n:
@@ -1280,9 +1603,8 @@ class StreamProcessor:
             
             # Delete inferior screenshot files from disk (pinned shots are never in losers)
             for loser in losers:
-                # Remove the companion subject crop alongside the full frame, otherwise
-                # pruning leaves orphaned crops of shots that were deleted.
-                for path in (loser.filepath, loser.crop_filepath):
+                extra_cutout = cutout_path_for(loser.filepath) if loser.filepath else None
+                for path in (loser.filepath, loser.crop_filepath, getattr(loser, "cutout_filepath", None), extra_cutout):
                     if path and os.path.exists(path):
                         try:
                             os.remove(path)
@@ -1298,3 +1620,87 @@ class StreamProcessor:
         cb = getattr(self, "on_capture_callback", None)
         if kept_live and cb:
             cb(kept_live[0])
+
+    def run_ai_finals(self, include_scan: bool = True) -> Dict[str, Any]:
+        """Runs a side-by-side contact-sheet Tournament Finals pass across top gallery shots (#4a)."""
+        judge = getattr(self, "judge", None)
+        if judge is None or not judge.enabled:
+            return {"ok": False, "error": "AI Judge is disabled"}
+
+        with getattr(self, "captures_lock", contextlib.nullcontext()):
+            pool = [
+                c for c in self.saved_captures
+                if os.path.isfile(c.filepath) and (include_scan or not getattr(c, "from_video_scan", False))
+            ]
+        pool.sort(key=lambda c: c.overall_score, reverse=True)
+        contenders = pool[:8]
+        if len(contenders) < 2:
+            return {"ok": False, "error": "Need at least 2 gallery shots to run Tournament Finals"}
+
+        crops: List[np.ndarray] = []
+        valid_contenders: List[CapturedScreenshot] = []
+        for c in contenders:
+            img_path = c.crop_filepath if (c.crop_filepath and os.path.isfile(c.crop_filepath)) else c.filepath
+            img = cv2.imread(img_path, cv2.IMREAD_COLOR)
+            if img is None or img.size == 0:
+                continue
+            if img_path == c.filepath and c.analysis is not None:
+                h, w = img.shape[:2]
+                rect = subject_crop_rect(c.analysis, w, h, self.config.subject_crop_padding)
+                if rect:
+                    sub = img[rect[1]:rect[1] + rect[3], rect[0]:rect[0] + rect[2]]
+                    if sub.size > 0:
+                        img = sub
+            crops.append(img)
+            valid_contenders.append(c)
+
+        if len(crops) < 2:
+            return {"ok": False, "error": "Could not load contender images"}
+
+        pm = getattr(getattr(self, "analyzer", None), "preference_model", None)
+        fb_prompt = pm.get_judge_feedback_prompt() if pm is not None and hasattr(pm, "get_judge_feedback_prompt") else ""
+        verdict = judge.judge_finals(crops, user_feedback_prompt=fb_prompt)
+        if verdict is None:
+            return {"ok": False, "error": "AI Judge did not return a Finals verdict"}
+
+        badges_applied: Dict[str, str] = {}
+        with getattr(self, "captures_lock", contextlib.nullcontext()):
+            for c in valid_contenders:
+                c.finals_badge = ""
+
+            w_idx = int(verdict.winner_index) - 1
+            if 0 <= w_idx < len(valid_contenders):
+                champ = valid_contenders[w_idx]
+                champ.finals_badge = "#1 Overall"
+                max_other = max((c.overall_score for j, c in enumerate(valid_contenders) if j != w_idx), default=champ.overall_score)
+                if champ.overall_score <= max_other:
+                    champ.overall_score = round(min(1.0, max_other + 0.012), 3)
+                badges_applied[os.path.basename(champ.filepath)] = champ.finals_badge
+
+            s_idx = int(verdict.best_smile_index) - 1
+            if 0 <= s_idx < len(valid_contenders):
+                sm = valid_contenders[s_idx]
+                sm.finals_badge = (f"{sm.finals_badge} · Best Smile" if sm.finals_badge else "Best Smile")
+                badges_applied[os.path.basename(sm.filepath)] = sm.finals_badge
+
+            g_idx = int(verdict.best_gesture_index) - 1
+            if 0 <= g_idx < len(valid_contenders):
+                gs = valid_contenders[g_idx]
+                gs.finals_badge = (f"{gs.finals_badge} · Best Gesture" if gs.finals_badge else "Best Gesture")
+                badges_applied[os.path.basename(gs.filepath)] = gs.finals_badge
+
+            self.saved_captures.sort(key=lambda item: item.overall_score, reverse=True)
+            self._persist_manifest()
+
+        winner_file = (
+            os.path.basename(valid_contenders[int(verdict.winner_index) - 1].filepath)
+            if 1 <= int(verdict.winner_index) <= len(valid_contenders)
+            else ""
+        )
+        return {
+            "ok": True,
+            "winner_index": int(verdict.winner_index),
+            "winner_filename": winner_file,
+            "reasoning": verdict.reasoning,
+            "badges": badges_applied,
+        }

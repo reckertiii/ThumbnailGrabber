@@ -138,6 +138,7 @@ input[type=text]:focus, input[type=password]:focus, select.cam-field:focus {
 }
 
 .video-wrap {
+  position: relative;
   background: #020617;
   border: 2px solid var(--panel);
   border-radius: 10px;
@@ -145,6 +146,14 @@ input[type=text]:focus, input[type=password]:focus, select.cam-field:focus {
   line-height: 0;
 }
 #video { width: 100%; height: auto; display: block; cursor: crosshair; }
+.zone-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  cursor: crosshair;
+  z-index: 4;
+}
 
 .video-bar {
   display: flex;
@@ -769,4 +778,263 @@ button:disabled {
 .btn-clear-pinned:hover {
   background: #991b1b;
   color: #fff;
+}
+
+/* ---------- Next-Gen Studio Toolbars, Badges, PTZ, ML Brain & Loupe ---------- */
+.studio-toolbar, .studio-toggles {
+  display: flex;
+  align-items: center;
+  gap: 10px 14px;
+  padding: 7px 10px;
+  margin-bottom: 6px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  flex-wrap: wrap;
+}
+.studio-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.studio-mini-input, .studio-mini-select {
+  background: var(--bg);
+  border: 1px solid #475569;
+  border-radius: 5px;
+  padding: 3px 8px;
+  color: var(--text);
+  font-size: 11.5px;
+  font-family: inherit;
+}
+.studio-mini-input { width: 135px; }
+.btn-mini.active, .btn-mini-accent {
+  background: #0369a1;
+  border-color: var(--accent);
+  color: #e0f2fe;
+  font-weight: 600;
+}
+.btn-mini-accent:hover { background: #0284c7; }
+
+.audio-badge {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #0f172a;
+  border: 1px solid #334155;
+  color: #94a3b8;
+  margin-left: auto;
+}
+.audio-badge.pause-sweet {
+  border-color: #22c55e;
+  color: #4ade80;
+  font-weight: 700;
+}
+
+.btn-finals {
+  background: #b45309;
+  color: #fef3c7;
+  border: 1px solid #f59e0b;
+  font-size: 12px;
+  padding: 6px 12px;
+}
+.btn-finals:hover { background: #d97706; color: #fff; }
+
+.thumb { width: 204px; }
+.thumb-badges {
+  display: flex;
+  justify-content: center;
+  gap: 4px;
+  flex-wrap: wrap;
+  margin-bottom: 4px;
+}
+.badge-pill {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: #0f172a;
+  border: 1px solid #334155;
+  color: #cbd5e1;
+}
+.badge-pill.finals {
+  background: #78350f;
+  border-color: #f59e0b;
+  color: #fde68a;
+  font-weight: 700;
+}
+.thumb-studio-btns {
+  display: flex;
+  gap: 3px;
+  margin-top: 3px;
+}
+.thumb-studio-btns button {
+  flex: 1;
+  background: #0f172a;
+  border: 1px solid #334155;
+  color: #cbd5e1;
+  border-radius: 3px;
+  padding: 3px 2px;
+  font-size: 10px;
+  font-weight: 600;
+  cursor: pointer;
+  font-family: inherit;
+}
+.thumb-studio-btns button:hover {
+  background: #334155;
+  color: #fff;
+}
+
+/* Sony PTZ Card */
+.ptz-summary {
+  cursor: pointer;
+  font-weight: 700;
+  color: var(--accent);
+  font-size: 12.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  user-select: none;
+}
+.ptz-body { margin-top: 10px; display: flex; flex-direction: column; gap: 10px; }
+.ptz-auto-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.ptz-controls-wrap { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.ptz-dpad {
+  display: grid;
+  grid-template-columns: repeat(3, 32px);
+  gap: 4px;
+}
+.ptz-dpad button { height: 28px; padding: 0; font-size: 13px; }
+.ptz-zoom-presets { display: flex; flex-direction: column; gap: 6px; flex: 1; }
+.ptz-zoom-row, .ptz-preset-row { display: flex; gap: 4px; flex-wrap: wrap; }
+
+/* ML Brain Inspector */
+.ml-drivers { display: flex; flex-direction: column; gap: 6px; }
+.ml-driver-row {
+  display: grid;
+  grid-template-columns: 165px 1fr 56px;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+.ml-driver-track {
+  height: 10px;
+  background: #0f172a;
+  border-radius: 5px;
+  overflow: hidden;
+  border: 1px solid #334155;
+}
+.ml-driver-fill.pos { height: 100%; background: #22c55e; }
+.ml-driver-fill.neg { height: 100%; background: #ef4444; }
+.ml-recent-list {
+  max-height: 220px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.ml-recent-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  background: #0f172a;
+  border: 1px solid #1e293b;
+  border-radius: 6px;
+  font-size: 12px;
+}
+
+/* Burst Micro-Scrub & 100% Zoom Loupe */
+.burst-stage {
+  position: relative;
+  width: 100%;
+  max-height: 440px;
+  background: #020617;
+  border-radius: 8px;
+  overflow: hidden;
+  display: flex;
+  justify-content: center;
+}
+#burstMainImg {
+  max-width: 100%;
+  max-height: 440px;
+  object-fit: contain;
+  display: block;
+  cursor: zoom-in;
+}
+.burst-loupe {
+  position: absolute;
+  width: 170px;
+  height: 170px;
+  border: 2px solid var(--accent);
+  border-radius: 50%;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.75);
+  pointer-events: none;
+  background-repeat: no-repeat;
+  z-index: 8;
+}
+.burst-strip {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  padding: 8px 2px 4px;
+  margin-top: 6px;
+}
+.burst-thumb {
+  flex: 0 0 auto;
+  width: 84px;
+  background: #0f172a;
+  border: 2px solid #334155;
+  border-radius: 5px;
+  padding: 2px;
+  cursor: pointer;
+  text-align: center;
+  font-size: 10px;
+  color: var(--muted);
+}
+.burst-thumb.active {
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 700;
+}
+.burst-thumb img {
+  width: 100%;
+  height: 46px;
+  object-fit: cover;
+  border-radius: 3px;
+  display: block;
+}
+
+/* Sermon Notes Generator */
+.sermon-textarea {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid #475569;
+  border-radius: 6px;
+  padding: 8px 10px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12.5px;
+  resize: vertical;
+}
+.sermon-titles-list, .sermon-quotes-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.sermon-copy-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  background: #0f172a;
+  border: 1px solid #334155;
+  border-radius: 6px;
+  padding: 8px 12px;
+  cursor: pointer;
+  font-size: 13px;
+  color: #f8fafc;
+  text-align: left;
+}
+.sermon-copy-item:hover {
+  border-color: var(--accent);
+  background: #172554;
 }

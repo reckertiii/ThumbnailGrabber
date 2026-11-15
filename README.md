@@ -9,9 +9,11 @@ Scoring is tuned for producing crisp, engaged speaker frames whose background ca
 - **Expression & Temporal Mouth Velocity** (AU12 genuine smile vs mid-syllable speech distortion, tracking frame-to-frame `ΔjawOpen`, `ΔmouthPucker`, and `ΔmouthFunnel` to favor natural speech pauses)
 - **Shoulder Level & Stage Prop / Candid Detection** (detects held props/objects without falsely penalizing torso hands, reserving dedicated prop slots)
 - **Sharpness & Per-Channel RGB Exposure** (Laplacian focus + single-channel RGB highlight blowout and heavy stage LED color-wash detection)
-- **Cutout Suitability** (framing headroom, torso clearance from lecterns/music stands, and background separability)
-- **Expression & Temporal Diversity** (guarantees spread-out captures across a service while reserving a smile slot alongside serious/authoritative teaching poses)
-- **Adaptive Preference Model & Optional Vision AI Judge** (learns from ⭐/👎 ratings + natural-language comments, with optional Claude or local Ollama vision verification)
+- **Cutout Suitability & Interactive Stage Safe-Zones** (framing headroom, torso clearance, plus polygon Safe-Zone & Obstruction masks drawn directly over the live feed)
+- **Expression "Mood Buckets" & Temporal Diversity** (guarantees spread-out captures across a service with dedicated slots for `warm_smile`, `passionate`, `calm_portrait`, and `prop`)
+- **Target Speaker Face Lock & Per-Speaker Baselines** (click any face to lock SFace verification onto your speaker, persist named profiles, and normalize expressions via Welford Z-scores)
+- **Next-Gen Ensemble ML Brain & Vision AI Judge** (learns from ⭐/👎 ratings, implicit download/pin/swap/delete signals, pairwise session comparisons, visual embeddings, past-winner folders, and AI Judge distillation — plus side-by-side "Tournament Finals" contact-sheet judging)
+- **Studio Finishing, Sermon Titles, NDI & Sony SRG-A40 PTZ** (built-in transparent `*_cutout.png` matting, H.264 de-blocking & stage LED skin-tone neutralizer, `±15`-frame micro-scrub filmstrip with 100% zoom loupe, `60s–180s` Time-Machine replay buffer, audio speech-pause gating + Whisper/Ollama sermon title packs, NDI discovery, and Sony SRG-A40 HTTP CGI PTZ & AI Auto-Framing controls)
 
 Captures are written as **fast lossless PNG** by default (`capture_format = "png"`), preserving crisp hair and shoulder edges for background matting.
 
@@ -64,6 +66,17 @@ TG_OUTPUT_DIR=C:\Users\you\Pictures\ThumbnailGrabber
 | `TG_AI_JUDGE_OLLAMA_MODEL` | Ollama vision model tag (default `qwen3-vl:4b`; `qwen3-vl:30b` recommended on 24GB+ RAM) |
 | `TG_AI_JUDGE_OLLAMA_NUM_THREAD` | Match to Ollama's container CPU limit to prevent throttling (`0` = auto) |
 | `TG_AI_JUDGE_ACTIVE_HOURS` | Hours the AI Judge stays armed per session before unloading weights (default `2`, `0` = always) |
+| `TG_AI_JUDGE_OLLAMA_KEEP_ALIVE` | Ollama model residency (`30m` default; `-1` keeps `qwen3-vl:30b` pinned in RAM on high-memory hosts) |
+| `TG_AI_JUDGE_FINALS` | Enable side-by-side contact-sheet "Tournament Finals" pass across top captures (`1` = default) |
+| `TG_AI_JUDGE_DISTILL` | Distill AI Judge verdicts into the local ML preference model at `0.35x` weight (`1` = default) |
+| `TG_DVR_BUFFER_SECONDS` | Rolling Time-Machine RAM replay buffer window in seconds (default `5`, adjustable up to `180` in UI) |
+| `TG_MOOD_BUCKETS` | Reserve distinct expression Mood Bucket slots (`warm_smile`, `passionate`, `calm_portrait`, `prop`) (`1` = default) |
+| `TG_BROADCAST_POLISH` | H.264 RTSP de-blocking & face-masked stage LED color-cast neutralization (`0` = default, toggleable in UI) |
+| `TG_AUTO_CUTOUT` | Automatically generate transparent `*_cutout.png` alongside every saved capture (`0` = default) |
+| `TG_UPSCALE_4K` | Optional 2× edge-directed 4K upscale during Broadcast Polish (`0` = default) |
+| `TG_AUDIO_GATING` | Audio-aware speech-pause & laughter capture gating on RTSP streams (`0` = default) |
+| `TG_WHISPER_MODEL` | Local `faster-whisper` model size for Sermon Title & Pull-Quote generation (default `base.en`) |
+| `TG_SCAN_WORKERS` | Parallel worker count for offline video scanning (`0` = auto-scale across CPU cores) |
 
 ## Running the Web UI
 
@@ -145,16 +158,23 @@ Analysis runs at `analysis_fps` (default 8 FPS) while cameras stream at 30–60 
 
 | File | Role |
 |---|---|
-| `analyzer.py` | YuNet + MediaPipe Face/Hand/Pose scoring, eye-gaze, mouth velocity, RGB exposure, cutout suitability |
-| `stream_processor.py` | RTSP grabber + standby polling, Q95 JPEG DVR buffer, peak burst picker, diversity retention |
-| `video_scanner.py` | Offline video recording scanner with `fast_reject`, start/end time trimming, and diversity NMS |
-| `ai_judge.py` | Optional Claude / Ollama vision-model reviewer with active-window lifecycle |
-| `preference_model.py` | Online scikit-learn SGD preference learner + natural-language comment penalty rules |
-| `settings_store.py` | Atomic persistence for UI settings and folder-scoped gallery/pin manifests in `TG_DATA_DIR` |
-| `camera_probe.py`, `camera_store.py` | RTSP path discovery, diagnostics, and credential storage |
-| `overlay.py` | Annotated HUD & face-mesh renderer for MJPEG preview |
-| `config.py` | Weights, thresholds, and environment configuration |
-| `web/server.py`, `web/static/` | FastAPI server, shared async MJPEG broadcaster, WebSocket telemetry, and browser UI |
+| `analyzer.py` | YuNet + MediaPipe Face/Hand/Pose scoring, eye-gaze, mouth velocity, RGB exposure, mood buckets, cutout suitability |
+| `stream_processor.py` | RTSP/NDI grabber, up to 180s Time-Machine DVR buffer, `±15`-frame burst filmstrip cache, Mood Buckets, AI Finals |
+| `video_scanner.py` | Multi-worker parallel offline video scanner with `fast_reject`, Mood Buckets, burst cache, and AI Finals |
+| `ai_judge.py` | Claude / Ollama vision reviewer, active-window lifecycle, and side-by-side Tournament Finals contact sheet |
+| `preference_model.py` | `v5` 18-feature LogReg + HistGB ensemble, pairwise ranker, visual prototypes, distillation, folder bootstrap, ML Brain inspector |
+| `visual_embedder.py` | 1280-D MobileNetV2 ONNX visual embedder with deterministic 64-D perceptual HSV/Lab/HOG fallback |
+| `speaker_id.py` | SFace ONNX speaker lock, named speaker profiles, and Welford running Z-score expression baselines |
+| `stage_zones.py` | Normalized polygon Stage Safe-Zone & Obstruction masks with point-in-polygon / box overlap geometry |
+| `postprocess.py` | U2-Net-P ONNX / GrabCut transparent `*_cutout.png` generator & Broadcast Polish (de-block, LED neutralizer, 4K upscale) |
+| `audio_analyzer.py` | Live FFmpeg PCM speech-pause/laughter detector + `faster-whisper` & Ollama Sermon Title / Pull-Quote generator |
+| `sony_ptz.py` | Sony SRG-A40 HTTP CGI VISCA-over-IP Pan/Tilt/Zoom, presets, and AI Auto-Framing controller |
+| `ndi_source.py` | Dynamic `libndi` runtime loader (from `TG_DATA_DIR/ndi` or system path) with UDP mDNS `_ndi._tcp.local.` discovery |
+| `settings_store.py` | Atomic persistence for UI settings and folder-scoped gallery/pin/cutout/badge manifests in `TG_DATA_DIR` |
+| `camera_probe.py`, `camera_store.py` | RTSP/NDI/webcam setup, stream-path discovery, HTTP CGI port, and credential storage |
+| `overlay.py` | Annotated HUD, speaker lock badge, stage zone polygons, and face-mesh renderer for MJPEG preview |
+| `config.py` | Weights, thresholds, studio flags, and environment configuration |
+| `web/server.py`, `web/static/` | FastAPI server, MJPEG broadcaster, WebSocket telemetry, ML Brain, Burst Loupe, Sermon Notes, and PTZ UI |
 | `main.py` | Entrypoint for the Web UI server and cross-platform CLI `--scan-video` |
 
 ## Licence

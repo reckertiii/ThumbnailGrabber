@@ -105,7 +105,8 @@ def _analysis_to_dict(a: Any) -> Dict[str, Any]:
         "is_smiling", "is_awkward_expression", "laplacian_variance",
         "face_brightness", "cutout_score", "subject_height_ratio",
         "is_subject_clipped", "hands_on_torso", "background_score",
-        "torso_clear_score", "is_prop_moment",
+        "torso_clear_score", "is_prop_moment", "mood_bucket", "color_cast_score",
+        "speaker_name",
     )
     out: Dict[str, Any] = {}
     for k in fields:
@@ -155,9 +156,18 @@ def save_captures_manifest(output_dir: str, captures: List[Any]) -> Optional[str
             except Exception:
                 rel_crop = os.path.basename(crop_fp)
 
+        cutout_fp = getattr(c, "cutout_filepath", None)
+        rel_cutout = None
+        if cutout_fp:
+            try:
+                rel_cutout = Path(cutout_fp).resolve().relative_to(base.resolve()).as_posix()
+            except Exception:
+                rel_cutout = os.path.basename(cutout_fp)
+
         items.append({
             "rel_path": rel_fp,
             "crop_rel_path": rel_crop,
+            "cutout_rel_path": rel_cutout,
             "timestamp_str": getattr(c, "timestamp_str", "") or "",
             "overall_score": float(getattr(c, "overall_score", 0.0) or 0.0),
             "captured_at": float(getattr(c, "captured_at", 0.0) or 0.0),
@@ -168,6 +178,8 @@ def save_captures_manifest(output_dir: str, captures: List[Any]) -> Optional[str
             "is_prop_moment": bool(getattr(c, "is_prop_moment", False)),
             "from_video_scan": bool(getattr(c, "from_video_scan", False)),
             "is_pinned": bool(getattr(c, "is_pinned", False)),
+            "finals_badge": str(getattr(c, "finals_badge", "") or ""),
+            "mood_bucket": str(getattr(c, "mood_bucket", "") or ""),
             "analysis": _analysis_to_dict(getattr(c, "analysis", None)),
         })
 
@@ -214,7 +226,15 @@ def load_captures_manifest(output_dir: str, adopt_orphans: bool = False) -> List
                     if base in cand_crop.parents and cand_crop.is_file():
                         crop_full = str(cand_crop)
 
+                cutout_rel = entry.get("cutout_rel_path")
+                cutout_full = None
+                if cutout_rel:
+                    cand_cutout = (base / cutout_rel).resolve()
+                    if base in cand_cutout.parents and cand_cutout.is_file():
+                        cutout_full = str(cand_cutout)
+
                 analysis = _dict_to_analysis(entry.get("analysis") or {})
+                mood_b = str(entry.get("mood_bucket") or getattr(analysis, "mood_bucket", "") or "")
                 cap = CapturedScreenshot(
                     filepath=str(full),
                     timestamp_str=str(entry.get("timestamp_str") or ""),
@@ -229,6 +249,9 @@ def load_captures_manifest(output_dir: str, adopt_orphans: bool = False) -> List
                     is_prop_moment=bool(entry.get("is_prop_moment", False)),
                     from_video_scan=bool(entry.get("from_video_scan", False)),
                     is_pinned=bool(entry.get("is_pinned", False)),
+                    cutout_filepath=cutout_full,
+                    finals_badge=str(entry.get("finals_badge") or ""),
+                    mood_bucket=mood_b,
                 )
                 loaded.append(cap)
                 seen_paths.add(os.path.normcase(str(full)))
@@ -239,7 +262,7 @@ def load_captures_manifest(output_dir: str, adopt_orphans: bool = False) -> List
         try:
             for fname in sorted(os.listdir(output_dir)):
                 low = fname.lower()
-                if "_subject." in low:
+                if "_subject." in low or "_cutout." in low or "_polished." in low or "_4k." in low:
                     continue
                 if not low.endswith((".png", ".jpg", ".jpeg")):
                     continue

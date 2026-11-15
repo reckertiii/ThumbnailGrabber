@@ -45,7 +45,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
 # Copy application source code. Tests are intentionally not shipped in the runtime image.
-COPY analyzer.py config.py overlay.py preference_model.py stream_processor.py video_scanner.py ai_judge.py camera_probe.py camera_store.py settings_store.py main.py ./
+COPY analyzer.py config.py overlay.py preference_model.py stream_processor.py video_scanner.py ai_judge.py camera_probe.py camera_store.py settings_store.py visual_embedder.py speaker_id.py stage_zones.py postprocess.py audio_analyzer.py sony_ptz.py ndi_source.py main.py ./
 COPY web/ ./web/
 
 # Create directories for baked models, persistent user data, and captures

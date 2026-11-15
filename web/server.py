@@ -17,6 +17,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import zipfile
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -47,10 +48,16 @@ import camera_probe
 import camera_store
 import settings_store
 from analyzer import AnalysisResult
+from audio_analyzer import SermonNotesGenerator
 from config import AppConfig, home_dir, is_redacted, redact_credentials
+from ndi_source import discover_ndi_sources, ndi_status
 from overlay import draw_overlay
-from stream_processor import CapturedScreenshot, StreamProcessor
+from postprocess import cutout_path_for, get_postprocess_engine, save_cutout_png
+from sony_ptz import SonyPTZController
+from stage_zones import StageZoneConfig
+from stream_processor import CapturedScreenshot, StreamProcessor, subject_crop_rect
 from video_scanner import ScanProgress, VideoInfo, VideoRecordingScanner
+from visual_embedder import get_visual_embedder
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 VIDEO_EXTENSIONS = (".mp4", ".mov", ".mkv", ".avi", ".m4v", ".webm", ".ts", ".mts")
@@ -198,6 +205,12 @@ class AppState:
         self._analysis: Optional[AnalysisResult] = None
         self._frame_seq: int = 0
 
+        # Stage zones (#9) & Sermon Notes (#8)
+        self.stage_zones = StageZoneConfig()
+        self._stage_zones_rev: int = 0
+        self.sermon_notes_gen = SermonNotesGenerator()
+        self.latest_sermon_notes: Optional[Dict[str, Any]] = None
+
         self.apply_persisted_ui_settings()
 
     def apply_persisted_ui_settings(self) -> None:
@@ -220,9 +233,25 @@ class AppState:
                 pass
         if "capture_prop_moments" in saved:
             cfg.capture_prop_moments = bool(saved["capture_prop_moments"])
+        if "mood_buckets_enabled" in saved:
+            cfg.mood_buckets_enabled = bool(saved["mood_buckets_enabled"])
+        if "auto_save_cutout" in saved:
+            cfg.auto_save_cutout = bool(saved["auto_save_cutout"])
+        if "broadcast_polish_enabled" in saved:
+            cfg.broadcast_polish_enabled = bool(saved["broadcast_polish_enabled"])
+        if "upscale_4k_enabled" in saved:
+            cfg.upscale_4k_enabled = bool(saved["upscale_4k_enabled"])
+        if "audio_gating_enabled" in saved:
+            cfg.audio_gating_enabled = bool(saved["audio_gating_enabled"])
+        if "stage_zones" in saved and isinstance(saved["stage_zones"], dict):
+            try:
+                self.stage_zones = StageZoneConfig.from_dict(saved["stage_zones"])
+            except Exception:
+                pass
         if "dvr_buffer_seconds" in saved:
             try:
-                cfg.dvr_buffer_seconds = max(0.0, min(30.0, float(saved["dvr_buffer_seconds"])))
+                max_dvr = max(60.0, float(getattr(cfg, "dvr_max_seconds", 180.0) or 180.0))
+                cfg.dvr_buffer_seconds = max(0.0, min(max_dvr, float(saved["dvr_buffer_seconds"])))
             except (TypeError, ValueError):
                 pass
         if "dvr_buffer_fps" in saved and saved["dvr_buffer_fps"] is not None:
@@ -345,6 +374,7 @@ class AppState:
                 config=self.config,
                 on_frame_callback=self._on_frame,
             )
+            self.processor.analyzer.stage_zones = self.stage_zones
             self.processor.enable_persistence(adopt_orphans=True)
             self.processor.start()
             self.processor.auto_capture_enabled = self.is_capturing
@@ -375,11 +405,12 @@ class AppState:
     def encode_preview_jpeg(self, frame: np.ndarray, analysis: Optional[AnalysisResult],
                             seq: int, max_width: int, quality: int) -> Optional[bytes]:
         """Renders overlay + downscaled JPEG once per unique frame/view key for all tabs."""
-        key = (seq, max_width, quality, self.show_mesh, self.show_hud, id(analysis))
+        key = (seq, max_width, quality, self.show_mesh, self.show_hud, id(analysis), self._stage_zones_rev)
         with self._mjpeg_lock:
             if self._mjpeg_cache_key == key and self._mjpeg_cache_bytes is not None:
                 return self._mjpeg_cache_bytes
-        annotated = draw_overlay(frame, analysis, self.show_mesh, self.show_hud)
+        sz = (getattr(self.processor.analyzer, "stage_zones", None) if (self.processor and getattr(self.processor, "analyzer", None)) else None) or self.stage_zones
+        annotated = draw_overlay(frame, analysis, self.show_mesh, self.show_hud, stage_zones=sz)
         h, w = annotated.shape[:2]
         if max_width and w > max_width:
             scale = max_width / float(w)
@@ -472,6 +503,10 @@ def _face_to_dict(f) -> Dict[str, Any]:
         "is_looking_down": bool(f.is_looking_down),
         "is_shoulder_tilted": bool(f.is_shoulder_tilted),
         "is_prop_moment": bool(getattr(f, "is_prop_moment", False)),
+        "speaker_name": str(getattr(f, "speaker_name", "") or ""),
+        "speaker_similarity": round(float(getattr(f, "speaker_similarity", 0.0) or 0.0), 3),
+        "mood_bucket": str(getattr(f, "mood_bucket", "") or ""),
+        "outside_safe_zone": bool(getattr(f, "outside_safe_zone", False)),
     }
 
 
@@ -479,7 +514,11 @@ def _telemetry() -> Dict[str, Any]:
     proc = state.processor
     frame, analysis, _ = state.snapshot()
     cfg = state.config
-    pm = proc.analyzer.preference_model if proc else None
+    pm = getattr(proc.analyzer, "preference_model", None) if (proc and getattr(proc, "analyzer", None)) else None
+    spk = getattr(proc.analyzer, "speaker_id", None) if (proc and getattr(proc, "analyzer", None)) else None
+    aud_mon = getattr(proc, "audio_monitor", None) if proc else None
+    aud_tel = aud_mon.telemetry() if aud_mon is not None else None
+    sz = (getattr(proc.analyzer, "stage_zones", None) if (proc and getattr(proc, "analyzer", None)) else None) or state.stage_zones
 
     payload: Dict[str, Any] = {
         "status": proc.connection_status if proc else StreamProcessor.STATUS_DISCONNECTED,
@@ -493,6 +532,12 @@ def _telemetry() -> Dict[str, Any]:
         "auto_capture": bool(proc.auto_capture_enabled) if proc else False,
         "single_winner": cfg.single_winner_mode,
         "capture_prop_moments": bool(getattr(cfg, "capture_prop_moments", True)),
+        "mood_buckets_enabled": bool(getattr(cfg, "mood_buckets_enabled", True)),
+        "auto_save_cutout": bool(getattr(cfg, "auto_save_cutout", False)),
+        "broadcast_polish_enabled": bool(getattr(cfg, "broadcast_polish_enabled", True)),
+        "upscale_4k_enabled": bool(getattr(cfg, "upscale_4k_enabled", False)),
+        "audio_gating_enabled": bool(getattr(cfg, "audio_gating_enabled", False)),
+        "dvr_max_seconds": round(float(getattr(cfg, "dvr_max_seconds", 180.0) or 180.0), 0),
         "show_mesh": state.show_mesh,
         "show_hud": state.show_hud,
         # Redacted: camera credentials never leave the server in readable form.
@@ -512,6 +557,9 @@ def _telemetry() -> Dict[str, Any]:
         "ml_samples": len(pm.samples) if pm else 0,
         "ml_notes_count": len(getattr(pm, "feedback_notes", []) or []) if pm else 0,
         "ml_penalties": dict(getattr(pm, "learned_penalties", {}) or {}) if pm else {},
+        "speaker_lock": spk.status() if spk is not None else {"locked": False, "profiles": []},
+        "stage_zones": sz.to_dict() if sz is not None else {"safe_zone": [], "obstruction_zones": []},
+        "audio": (aud_tel.__dict__ if aud_tel is not None else {"active": False, "rms_db": -60.0, "in_speech_pause": False, "is_laughter_burst": False}),
         "frame_size": [int(frame.shape[1]), int(frame.shape[0])] if frame is not None else None,
         "settings": {
             "min_score": int(cfg.thresholds.min_overall_score * 100),
@@ -558,6 +606,9 @@ def _telemetry() -> Dict[str, Any]:
             "is_subject_clipped": bool(analysis.is_subject_clipped),
             "hands_on_torso": bool(analysis.hands_on_torso),
             "is_prop_moment": bool(getattr(analysis, "is_prop_moment", False)),
+            "mood_bucket": str(getattr(analysis, "mood_bucket", "") or ""),
+            "speaker_name": str(getattr(analysis, "speaker_name", "") or ""),
+            "color_cast_score": round(float(getattr(analysis, "color_cast_score", 1.0)), 3),
             "background_score": round(float(analysis.background_score), 3),
             "disqualified_reasons": list(getattr(analysis, "disqualified_reasons", []) or []),
             "hands_covering_face": bool(analysis.hands_covering_face),
@@ -614,6 +665,8 @@ def _visible_captures() -> List[CapturedScreenshot]:
 
 def _captures_payload() -> List[Dict[str, Any]]:
     caps = _visible_captures()
+    proc = state.processor
+    burst_cache = getattr(proc, "_burst_cache", {}) if proc else {}
     out = []
     for idx, c in enumerate(caps):
         name = os.path.basename(c.filepath)
@@ -621,11 +674,15 @@ def _captures_payload() -> List[Dict[str, Any]]:
         a = c.analysis
         is_prop = bool(getattr(c, "is_prop_moment", False) or getattr(a, "is_prop_moment", False))
         is_pinned = bool(getattr(c, "is_pinned", False))
+        mood = str(getattr(c, "mood_bucket", "") or getattr(a, "mood_bucket", "") or "")
+        cpath = getattr(c, "cutout_filepath", None) or cutout_path_for(c.filepath)
+        has_burst = bool(name in burst_cache and len(burst_cache[name].get("frames") or []) > 1)
         out.append({
             "rank": idx + 1,
             "filename": name,
             "url": f"/captures/{rel}?t={int(os.path.getmtime(c.filepath)) if os.path.exists(c.filepath) else 0}",
             "crop_url": _capture_url(c.crop_filepath),
+            "cutout_url": _capture_url(cpath) if (cpath and os.path.exists(cpath)) else None,
             "score": round(float(c.overall_score), 3),
             "timestamp": c.timestamp_str,
             "cutout_score": round(float(getattr(a, "cutout_score", 0.0)), 3),
@@ -635,6 +692,10 @@ def _captures_payload() -> List[Dict[str, Any]]:
             "judge_issues": list(getattr(c, "judge_issues", []) or []),
             "is_prop_moment": is_prop,
             "is_pinned": is_pinned,
+            "mood_bucket": mood,
+            "finals_badge": str(getattr(c, "finals_badge", "") or ""),
+            "speaker_name": str(getattr(a, "speaker_name", "") or ""),
+            "has_burst": has_burst,
             "yaw": round(float(a.yaw_deg), 1),
             "shoulder_tilt": round(float(a.shoulder_tilt_deg), 1),
             "shoulder_detected": bool(a.shoulder_detected),
@@ -758,6 +819,9 @@ async def telemetry_socket(ws: WebSocket):
                                 c.judge_score,
                                 getattr(c, "is_prop_moment", False),
                                 getattr(c, "is_pinned", False),
+                                getattr(c, "finals_badge", ""),
+                                getattr(c, "cutout_filepath", None),
+                                int(os.path.getmtime(c.filepath)) if (c.filepath and os.path.exists(c.filepath)) else 0,
                             )
                             for c in proc.saved_captures
                         ),
@@ -826,7 +890,7 @@ def _resolve_video_path(raw: str) -> Path:
 def _is_network_or_device_source(src: str) -> bool:
     s = (src or "").strip()
     low = s.lower()
-    return s.isdigit() or low.startswith(("rtsp://", "rtsps://", "http://", "https://"))
+    return s.isdigit() or low.startswith(("rtsp://", "rtsps://", "http://", "https://", "ndi://"))
 
 
 def _browse_roots() -> List[Path]:
@@ -901,7 +965,7 @@ def _settings_from_payload(payload: Dict[str, Any]) -> camera_store.CameraSettin
     back, and a blank field on a reconnect must not wipe it."""
     saved = camera_store.load()
     kind = str(payload.get("kind", "rtsp")).strip().lower()
-    if kind not in ("rtsp", "webcam", "file"):
+    if kind not in ("rtsp", "webcam", "file", "ndi"):
         raise HTTPException(status_code=400, detail=f"Unknown camera kind '{kind}'")
 
     password = payload.get("password", None)
@@ -910,6 +974,7 @@ def _settings_from_payload(payload: Dict[str, Any]) -> camera_store.CameraSettin
 
     try:
         port = int(payload.get("port") or camera_probe.DEFAULT_PORT)
+        http_port = int(payload.get("http_port") or (saved.http_port if saved else 80) or 80)
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="Port must be a number")
 
@@ -917,11 +982,13 @@ def _settings_from_payload(payload: Dict[str, Any]) -> camera_store.CameraSettin
         kind=kind,
         host=str(payload.get("host", "") or "").strip(),
         port=port,
+        http_port=http_port,
         path=str(payload.get("path", "") or "").strip(),
         username=str(payload.get("username", "") or "").strip(),
         password=str(password),
         webcam_index=int(payload.get("webcam_index") or 0),
         file_path=str(payload.get("file_path", "") or "").strip(),
+        ndi_source_name=str(payload.get("ndi_source_name", "") or "").strip(),
     )
 
 
@@ -934,6 +1001,7 @@ def get_camera():
         "settings": saved.public() if saved else camera_store.CameraSettings().public(),
         "active_source": redact_credentials(state.config.stream_source),
         "common_paths": camera_probe.COMMON_PATHS,
+        "ndi": ndi_status(),
     }
 
 
@@ -942,6 +1010,34 @@ def test_camera(payload: Dict[str, Any] = Body(...)):
     """Asks the camera directly, without touching the running stream."""
     state.touch_activity()
     cfg = _settings_from_payload(payload)
+
+    if cfg.kind == "ndi":
+        st = ndi_status()
+        if not cfg.ndi_source_name:
+            return {
+                "ok": False, "stage": "ndi", "code": "missing",
+                "message": "Enter or discover an NDI source name.",
+                "hint": st.get("setup_hint", ""),
+            }
+        if not st.get("available"):
+            return {
+                "ok": False, "stage": "ndi", "code": "no_runtime",
+                "message": "NDI runtime library (libndi) is not installed yet.",
+                "hint": st.get("setup_hint", ""),
+            }
+        disc = discover_ndi_sources(timeout_ms=1000)
+        names = [s["name"] for s in (disc.get("sources") or [])]
+        matched = any(cfg.ndi_source_name.lower() in n.lower() for n in names)
+        return {
+            "ok": True,
+            "stage": "ndi",
+            "code": "ok" if matched else "unverified",
+            "message": (
+                f"NDI source '{cfg.ndi_source_name}' found on network."
+                if matched else f"NDI runtime ready; '{cfg.ndi_source_name}' will be resolved on connect."
+            ),
+            "hint": "",
+        }
 
     if cfg.kind == "file":
         if not cfg.file_path:
@@ -999,6 +1095,8 @@ def connect_camera(payload: Dict[str, Any] = Body(...)):
 
     if cfg.kind == "rtsp" and not cfg.host:
         raise HTTPException(status_code=400, detail="Enter the camera's address")
+    if cfg.kind == "ndi" and not cfg.ndi_source_name:
+        raise HTTPException(status_code=400, detail="Enter or select an NDI source name")
     if cfg.kind == "file":
         if not cfg.file_path:
             raise HTTPException(status_code=400, detail="Enter the path to the video file")
@@ -1168,6 +1266,26 @@ def update_settings(payload: Dict[str, Any] = Body(...)):
         val_mm = max(0.0, min(1440.0, float(payload["capture_max_minutes"])))
         cfg.capture_max_minutes = val_mm
         patch["capture_max_minutes"] = val_mm
+    for bool_key in (
+        "mood_buckets_enabled",
+        "auto_save_cutout",
+        "broadcast_polish_enabled",
+        "upscale_4k_enabled",
+        "audio_gating_enabled",
+    ):
+        if bool_key in payload:
+            bval = bool(payload[bool_key])
+            setattr(cfg, bool_key, bval)
+            patch[bool_key] = bval
+            if state.processor:
+                setattr(state.processor.config, bool_key, bval)
+                if bool_key == "audio_gating_enabled":
+                    aud = getattr(state.processor, "audio_monitor", None)
+                    if aud is not None:
+                        if bval and cfg.stream_source:
+                            aud.start(cfg.stream_source)
+                        elif not bval:
+                            aud.stop()
     if patch:
         settings_store.save_ui_settings(patch)
     return {"ok": True}
@@ -1204,6 +1322,26 @@ def update_view(payload: Dict[str, Any] = Body(...)):
             state.processor.analyzer.capture_prop_moments = val
             if state.processor._refine_analyzer is not None:
                 state.processor._refine_analyzer.capture_prop_moments = val
+    for bool_key in (
+        "mood_buckets_enabled",
+        "auto_save_cutout",
+        "broadcast_polish_enabled",
+        "upscale_4k_enabled",
+        "audio_gating_enabled",
+    ):
+        if bool_key in payload:
+            bval = bool(payload[bool_key])
+            setattr(state.config, bool_key, bval)
+            patch[bool_key] = bval
+            if state.processor:
+                setattr(state.processor.config, bool_key, bval)
+                if bool_key == "audio_gating_enabled":
+                    aud = getattr(state.processor, "audio_monitor", None)
+                    if aud is not None:
+                        if bval and state.config.stream_source:
+                            aud.start(state.config.stream_source)
+                        elif not bval:
+                            aud.stop()
     if patch:
         settings_store.save_ui_settings(patch)
     return {"ok": True}
@@ -1231,7 +1369,7 @@ def toggle_person(person_id: int, payload: Dict[str, Any] = Body(default={})):
 
 @app.post("/api/click")
 def click_video(payload: Dict[str, Any] = Body(...)):
-    """Toggle a person by clicking their face box on the video."""
+    """Toggle a person or lock onto a target speaker by clicking their face box on the video."""
     state.touch_activity()
     proc = state.processor
     frame, analysis, _ = state.snapshot()
@@ -1239,9 +1377,17 @@ def click_video(payload: Dict[str, Any] = Body(...)):
         raise HTTPException(status_code=409, detail="No active analysis")
     fx = float(payload.get("x_frac", -1)) * frame.shape[1]
     fy = float(payload.get("y_frac", -1)) * frame.shape[0]
+    mode = str(payload.get("mode", "toggle") or "toggle").strip().lower()
+    speaker_name = str(payload.get("name", "") or "").strip()
     for f in (analysis.faces or []):
         bx, by, bw, bh = f.bbox
         if bx <= fx <= bx + bw and by <= fy <= by + bh:
+            if mode == "lock_speaker":
+                spk = proc.analyzer.speaker_id
+                res = spk.lock_from_frame(frame, f.bbox, save_as_name=speaker_name, download_sface=True)
+                if proc._refine_analyzer is not None:
+                    proc._refine_analyzer.speaker_id = spk
+                return res
             return toggle_person(f.person_id, {})
     return {"ok": False, "detail": "No face at that point"}
 
@@ -1355,12 +1501,35 @@ def download_captures_zip(mode: str = "all"):
     )
 
 
+def _load_capture_crop_bgr(cap: CapturedScreenshot) -> Optional[np.ndarray]:
+    """Loads the subject crop (or full frame fallback) for visual prototype learning."""
+    cand_path = cap.crop_filepath if (cap.crop_filepath and os.path.isfile(cap.crop_filepath)) else cap.filepath
+    if not cand_path or not os.path.isfile(cand_path):
+        return None
+    img = cv2.imread(cand_path, cv2.IMREAD_COLOR)
+    if img is None or img.size == 0:
+        return None
+    if cand_path == cap.filepath and cap.analysis is not None:
+        h, w = img.shape[:2]
+        rect = subject_crop_rect(cap.analysis, w, h, state.config.subject_crop_padding)
+        if rect:
+            sub = img[rect[1]:rect[1] + rect[3], rect[0]:rect[0] + rect[2]]
+            if sub.size > 0:
+                return sub
+    return img
+
+
 @app.get("/api/captures/{filename}/download")
-def download_single_capture(filename: str):
+def download_single_capture(filename: str, learn: int = 1):
     """Downloads a single captured frame with Content-Disposition: attachment."""
     cap = _find_capture(filename)
     if not cap.filepath or not os.path.isfile(cap.filepath):
         raise HTTPException(status_code=404, detail="Capture file missing on disk")
+    proc = state.processor
+    if learn and proc and getattr(proc, "analyzer", None):
+        pm = proc.analyzer.preference_model
+        peers = _visible_captures()
+        pm.record_implicit_feedback(cap, peer_captures=peers, action="download", crop_bgr=_load_capture_crop_bgr(cap))
     ext = os.path.splitext(cap.filepath)[1].lower()
     media = "image/png" if ext == ".png" else "image/jpeg"
     return FileResponse(
@@ -1385,9 +1554,25 @@ def capture_feedback(filename: str, payload: Dict[str, Any] = Body(...)):
     remove = bool(payload.get("remove", False))
 
     pm = proc.analyzer.preference_model
-    pm.add_sample(cap.analysis, is_favorite=is_favorite, comment=comment, reasons=reasons)
+    crop_bgr = _load_capture_crop_bgr(cap)
+    sample_id = pm.add_sample(
+        cap.analysis,
+        is_favorite=is_favorite,
+        comment=comment,
+        reasons=reasons,
+        crop_bgr=crop_bgr,
+        source="human",
+        weight=1.0,
+        filename=cap.filepath,
+    )
 
+    # Pairwise session learning: when starring a shot, record preference over unpinned session peers
     if is_favorite:
+        for peer in _visible_captures()[:8]:
+            if peer is not cap and not getattr(peer, "is_pinned", False) and peer.analysis is not None:
+                pm.add_pairwise_preference(cap.analysis, peer.analysis, weight=0.85)
+        pm.fit()
+        pm.save()
         proc.set_capture_pinned(cap.filepath, True)
 
     removed = False
@@ -1398,6 +1583,7 @@ def capture_feedback(filename: str, payload: Dict[str, Any] = Body(...)):
 
     return {
         "ok": True,
+        "sample_id": sample_id,
         "favorite": is_favorite,
         "is_pinned": bool(getattr(cap, "is_pinned", False)) if not removed else False,
         "comment": comment,
@@ -1407,6 +1593,7 @@ def capture_feedback(filename: str, payload: Dict[str, Any] = Body(...)):
         "notes_count": len(getattr(pm, "feedback_notes", []) or []),
         "learned_penalties": dict(getattr(pm, "learned_penalties", {}) or {}),
         "confidence": round(float(pm.confidence), 3),
+        "trust": round(float(pm.trust), 3),
         "captures": _captures_payload(),
     }
 
@@ -1423,12 +1610,34 @@ def pin_capture(filename: str, payload: Dict[str, Any] = Body(default={})):
     pinned = proc.set_capture_pinned(cap.filepath, None if desired is None else bool(desired))
     if pinned is None:
         raise HTTPException(status_code=404, detail="Capture not found")
+    if pinned and getattr(proc, "analyzer", None):
+        proc.analyzer.preference_model.record_implicit_feedback(
+            cap, peer_captures=_visible_captures(), action="pin", crop_bgr=_load_capture_crop_bgr(cap)
+        )
     return {
         "ok": True,
         "filename": os.path.basename(cap.filepath),
         "is_pinned": pinned,
         "captures": _captures_payload(),
     }
+
+
+@app.delete("/api/captures/{filename}")
+def delete_single_capture(filename: str, learn: int = 1):
+    """Deletes a capture from gallery & disk and optionally records implicit negative feedback."""
+    state.touch_activity()
+    proc = state.processor
+    if not proc:
+        raise HTTPException(status_code=409, detail="Stream not running")
+    cap = _find_capture(filename)
+    if learn and getattr(proc, "analyzer", None):
+        proc.analyzer.preference_model.record_implicit_feedback(
+            cap, action="delete", crop_bgr=_load_capture_crop_bgr(cap)
+        )
+    removed = proc.remove_capture(cap.filepath)
+    if state.scan_results:
+        state.scan_results = [r for r in state.scan_results if r.filepath != cap.filepath]
+    return {"ok": True, "removed": removed, "captures": _captures_payload()}
 
 
 @app.post("/api/captures/clear")
@@ -1763,8 +1972,18 @@ def _run_video_scan_worker(video_path: str, top_n: int, min_score: float,
         state.scan_progress = p
 
     try:
-        shared_judge = getattr(state.processor, "judge", None) if state.processor else None
-        scanner = VideoRecordingScanner(state.config, judge=shared_judge)
+        proc = state.processor
+        shared_judge = getattr(proc, "judge", None) if proc else None
+        shared_spk = getattr(proc.analyzer, "speaker_id", None) if proc else None
+        shared_zones = getattr(proc.analyzer, "stage_zones", None) if proc else state.stage_zones
+        burst_cb = proc.cache_burst_around if proc else None
+        scanner = VideoRecordingScanner(
+            state.config,
+            judge=shared_judge,
+            speaker_id=shared_spk,
+            stage_zones=shared_zones,
+            burst_cache_callback=burst_cb,
+        )
         results = scanner.scan_video(
             video_path=video_path,
             top_n=top_n,
@@ -1950,14 +2169,18 @@ def get_video_scan_status():
         results_payload = []
         for idx, c in enumerate(state.scan_results):
             name = os.path.basename(c.filepath)
+            cpath = getattr(c, "cutout_filepath", None) or cutout_path_for(c.filepath)
             results_payload.append({
                 "rank": idx + 1,
                 "filename": name,
                 "url": _capture_url(c.filepath),
                 "crop_url": _capture_url(c.crop_filepath),
+                "cutout_url": _capture_url(cpath) if (cpath and os.path.exists(cpath)) else None,
                 "score": round(float(c.overall_score), 3),
                 "timestamp": c.timestamp_str,
                 "is_prop_moment": bool(getattr(c, "is_prop_moment", False)),
+                "mood_bucket": str(getattr(c, "mood_bucket", "") or ""),
+                "finals_badge": str(getattr(c, "finals_badge", "") or ""),
             })
         resp["results"] = results_payload
 
@@ -1970,6 +2193,524 @@ def cancel_video_scan():
     if state.scan_cancel_event:
         state.scan_cancel_event.set()
     return {"ok": True, "message": "Cancellation requested"}
+
+
+# ---------------------------------------------------------------------------
+# Next-Gen Studio, ML Brain, Speaker Lock, Stage Zones, Audio & PTZ APIs
+# ---------------------------------------------------------------------------
+
+def _check_bootstrap_folder_allowed(target: Path) -> None:
+    """Allows folders under either TG_OUTPUT_ROOTS or TG_VIDEO_ROOTS when restricted."""
+    out_roots = _browse_roots()
+    vid_roots = _allowed_video_roots()
+    combined = out_roots + [r for r in vid_roots if r not in out_roots]
+    if combined and not any(r == target or r in target.parents for r in combined):
+        raise HTTPException(
+            status_code=403,
+            detail="Folder is outside the directories allowed by TG_OUTPUT_ROOTS / TG_VIDEO_ROOTS",
+        )
+
+
+@app.get("/api/ml/brain")
+def get_ml_brain():
+    state.touch_activity()
+    proc = state.processor
+    if not proc or not getattr(proc, "analyzer", None):
+        raise HTTPException(status_code=409, detail="Analyzer not initialized")
+    pm = proc.analyzer.preference_model
+    summary = pm.get_brain_summary()
+    summary["visual_backbone"] = get_visual_embedder().status()
+    return summary
+
+
+@app.post("/api/ml/undo")
+def ml_undo_rating(payload: Dict[str, Any] = Body(...)):
+    state.touch_activity()
+    proc = state.processor
+    if not proc or not getattr(proc, "analyzer", None):
+        raise HTTPException(status_code=409, detail="Analyzer not initialized")
+    sid = str(payload.get("sample_id", "") or "").strip()
+    if not sid:
+        raise HTTPException(status_code=400, detail="sample_id is required")
+    ok = proc.analyzer.preference_model.undo_rating(sid)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Sample not found")
+    return {"ok": True, **proc.analyzer.preference_model.get_brain_summary()}
+
+
+@app.post("/api/ml/flip")
+def ml_flip_rating(payload: Dict[str, Any] = Body(...)):
+    state.touch_activity()
+    proc = state.processor
+    if not proc or not getattr(proc, "analyzer", None):
+        raise HTTPException(status_code=409, detail="Analyzer not initialized")
+    sid = str(payload.get("sample_id", "") or "").strip()
+    if not sid:
+        raise HTTPException(status_code=400, detail="sample_id is required")
+    ok = proc.analyzer.preference_model.flip_rating(sid)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Sample not found")
+    return {"ok": True, **proc.analyzer.preference_model.get_brain_summary()}
+
+
+@app.post("/api/ml/reset")
+def ml_reset_brain():
+    state.touch_activity()
+    proc = state.processor
+    if not proc or not getattr(proc, "analyzer", None):
+        raise HTTPException(status_code=409, detail="Analyzer not initialized")
+    proc.analyzer.preference_model.reset_all()
+    return {"ok": True, **proc.analyzer.preference_model.get_brain_summary()}
+
+
+@app.post("/api/ml/bootstrap-folder")
+def ml_bootstrap_folder(payload: Dict[str, Any] = Body(...)):
+    """Pre-trains the ML preference model from a folder of past winning thumbnails (ML-3)."""
+    state.touch_activity()
+    proc = state.processor
+    if not proc or not getattr(proc, "analyzer", None):
+        raise HTTPException(status_code=409, detail="Analyzer not initialized")
+    raw = str(payload.get("path", "") or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Folder path is required")
+    try:
+        target = Path(raw).expanduser().resolve()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid folder path")
+    if not target.is_dir():
+        raise HTTPException(status_code=400, detail=f"Folder not found: {target}")
+    _check_bootstrap_folder_allowed(target)
+
+    max_imgs = max(1, min(300, int(payload.get("max_images", 80) or 80)))
+    ref_analyzer = proc._get_or_create_refine_analyzer()
+    res = proc.analyzer.preference_model.bootstrap_from_folder(
+        str(target), ref_analyzer, max_images=max_imgs
+    )
+    if not res.get("ok"):
+        raise HTTPException(status_code=400, detail=res.get("error", "Bootstrap failed"))
+    return {**res, "brain": proc.analyzer.preference_model.get_brain_summary()}
+
+
+@app.post("/api/ml/download-backbone")
+def ml_download_backbone():
+    state.touch_activity()
+    res = get_visual_embedder().download_backbone()
+    return res
+
+
+# --- Speaker Face Lock (#3 & ML-5) ------------------------------------------
+
+@app.get("/api/speaker")
+def get_speaker_status():
+    proc = state.processor
+    if not proc or not getattr(proc, "analyzer", None):
+        return {"locked": False, "profiles": []}
+    return proc.analyzer.speaker_id.status()
+
+
+@app.post("/api/speaker/lock")
+def lock_speaker_endpoint(payload: Dict[str, Any] = Body(default={})):
+    state.touch_activity()
+    proc = state.processor
+    frame, analysis, _ = state.snapshot()
+    if not proc or frame is None or analysis is None or not analysis.faces:
+        raise HTTPException(status_code=409, detail="No detected face on live feed to lock onto")
+
+    pid = payload.get("person_id")
+    save_name = str(payload.get("name", "") or "").strip()
+    target_face = None
+    if pid is not None:
+        target_face = next((f for f in analysis.faces if f.person_id == int(pid)), None)
+    if target_face is None:
+        selected = [f for f in analysis.faces if f.is_selected]
+        pool = selected or analysis.faces
+        target_face = max(pool, key=lambda f: f.bbox[2] * f.bbox[3])
+
+    spk = proc.analyzer.speaker_id
+    res = spk.lock_from_frame(frame, target_face.bbox, save_as_name=save_name, download_sface=True)
+    if not res.get("ok"):
+        raise HTTPException(status_code=400, detail=res.get("error", "Could not lock speaker"))
+    if proc._refine_analyzer is not None:
+        proc._refine_analyzer.speaker_id = spk
+    return res
+
+
+@app.post("/api/speaker/activate")
+def activate_speaker_profile(payload: Dict[str, Any] = Body(...)):
+    state.touch_activity()
+    proc = state.processor
+    if not proc or not getattr(proc, "analyzer", None):
+        raise HTTPException(status_code=409, detail="Stream not running")
+    prof_id = str(payload.get("profile_id", "") or "").strip()
+    res = proc.analyzer.speaker_id.activate_profile(prof_id)
+    if not res.get("ok"):
+        raise HTTPException(status_code=404, detail=res.get("error", "Speaker profile not found"))
+    return res
+
+
+@app.post("/api/speaker/unlock")
+def unlock_speaker_endpoint():
+    state.touch_activity()
+    proc = state.processor
+    if not proc or not getattr(proc, "analyzer", None):
+        raise HTTPException(status_code=409, detail="Stream not running")
+    res = proc.analyzer.speaker_id.unlock()
+    proc.analyzer.speaker_id.save_profiles()
+    return res
+
+
+@app.delete("/api/speaker/profiles/{profile_id}")
+def delete_speaker_profile(profile_id: str):
+    state.touch_activity()
+    proc = state.processor
+    if not proc or not getattr(proc, "analyzer", None):
+        raise HTTPException(status_code=409, detail="Stream not running")
+    removed = proc.analyzer.speaker_id.delete_profile(profile_id)
+    if not removed:
+        raise HTTPException(status_code=404, detail="Speaker profile not found")
+    return {"ok": True, **proc.analyzer.speaker_id.status()}
+
+
+# --- Stage Safe-Zone & Obstruction Polygons (#9) ----------------------------
+
+@app.get("/api/stage-zones")
+def get_stage_zones():
+    sz = (getattr(state.processor.analyzer, "stage_zones", None) if (state.processor and getattr(state.processor, "analyzer", None)) else None) or state.stage_zones
+    return {"ok": True, **sz.to_dict()}
+
+
+@app.post("/api/stage-zones")
+def set_stage_zones(payload: Dict[str, Any] = Body(...)):
+    state.touch_activity()
+    new_zones = StageZoneConfig.from_dict(payload)
+    state.stage_zones = new_zones
+    state._stage_zones_rev += 1
+    if state.processor and getattr(state.processor, "analyzer", None):
+        state.processor.analyzer.stage_zones = new_zones
+        if state.processor._refine_analyzer is not None:
+            state.processor._refine_analyzer.stage_zones = new_zones
+    settings_store.save_ui_settings({"stage_zones": new_zones.to_dict()})
+    return {"ok": True, **new_zones.to_dict()}
+
+
+# --- Time-Machine Replay Mining (#4b), Burst Scrub (#7) & AI Finals (#4a) ---
+
+@app.post("/api/buffer/mine")
+def mine_buffer_endpoint(payload: Dict[str, Any] = Body(default={})):
+    state.touch_activity()
+    proc = state.processor
+    if not proc:
+        raise HTTPException(status_code=409, detail="Stream not running")
+    if not state.output_confirmed:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Confirm the output folder first. Currently {state.config.output_dir}.",
+        )
+    seconds = max(5.0, min(float(getattr(state.config, "dvr_max_seconds", 180.0)), float(payload.get("seconds", 60.0) or 60.0)))
+    max_picks = max(1, min(12, int(payload.get("max_picks", 4) or 4)))
+    saved = proc.mine_dvr_window(lookback_seconds=seconds, max_picks=max_picks)
+    return {
+        "ok": True,
+        "saved_count": len(saved),
+        "filenames": [os.path.basename(c.filepath) for c in saved],
+        "captures": _captures_payload(),
+    }
+
+
+@app.get("/api/captures/{filename}/burst")
+def get_capture_burst(filename: str):
+    proc = state.processor
+    if not proc:
+        raise HTTPException(status_code=409, detail="Stream not running")
+    _find_capture(filename)
+    return proc.get_burst_frames(filename)
+
+
+@app.get("/api/captures/{filename}/burst/{idx}")
+def get_capture_burst_frame(filename: str, idx: int):
+    proc = state.processor
+    if not proc:
+        raise HTTPException(status_code=409, detail="Stream not running")
+    jb = proc.get_burst_frame_jpeg(filename, idx)
+    if jb is None:
+        raise HTTPException(status_code=404, detail="Burst frame not cached")
+    return Response(content=jb, media_type="image/jpeg", headers={"Cache-Control": "no-cache"})
+
+
+@app.post("/api/captures/{filename}/burst/{idx}/select")
+def select_capture_burst_frame(filename: str, idx: int):
+    state.touch_activity()
+    proc = state.processor
+    if not proc:
+        raise HTTPException(status_code=409, detail="Stream not running")
+    cap = proc.select_burst_frame(filename, idx)
+    if cap is None:
+        raise HTTPException(status_code=404, detail="Burst frame not available")
+    return {
+        "ok": True,
+        "filename": os.path.basename(cap.filepath),
+        "score": round(float(cap.overall_score), 3),
+        "captures": _captures_payload(),
+    }
+
+
+@app.post("/api/captures/ai-finals")
+def run_ai_finals_endpoint():
+    state.touch_activity()
+    proc = state.processor
+    if not proc:
+        raise HTTPException(status_code=409, detail="Stream not running")
+    judge = getattr(proc, "judge", None)
+    if judge is not None and judge.enabled and not judge.available:
+        judge.wake()
+    res = proc.run_ai_finals(include_scan=True)
+    if not res.get("ok"):
+        raise HTTPException(status_code=409, detail=res.get("error", "AI Finals failed"))
+    return {**res, "captures": _captures_payload()}
+
+
+# --- Studio Transparent Cutouts (#1) & Broadcast Polish (#11) ---------------
+
+@app.get("/api/captures/{filename}/cutout")
+def get_capture_cutout(filename: str, crop: int = 0, download: int = 1):
+    state.touch_activity()
+    cap = _find_capture(filename)
+    if not cap.filepath or not os.path.isfile(cap.filepath):
+        raise HTTPException(status_code=404, detail="Capture file missing on disk")
+
+    stem, _ = os.path.splitext(cap.filepath)
+    dest_path = f"{stem}_subject_cutout.png" if crop else cutout_path_for(cap.filepath)
+    if not os.path.isfile(dest_path):
+        img = cv2.imread(cap.filepath, cv2.IMREAD_COLOR)
+        if img is None:
+            raise HTTPException(status_code=500, detail="Could not read capture image")
+        written = save_cutout_png(img, cap.analysis, dest_path, crop_to_subject=bool(crop), polish_first=True)
+        if not written or not os.path.isfile(written):
+            raise HTTPException(status_code=500, detail="Failed to generate transparent cutout")
+        if not crop:
+            cap.cutout_filepath = written
+            if state.processor:
+                state.processor._persist_manifest()
+
+    if download:
+        return FileResponse(dest_path, media_type="image/png", filename=os.path.basename(dest_path))
+    return FileResponse(dest_path, media_type="image/png")
+
+
+@app.get("/api/captures/{filename}/polish")
+def get_capture_polished(filename: str, upscale: int = 1, download: int = 1):
+    state.touch_activity()
+    cap = _find_capture(filename)
+    if not cap.filepath or not os.path.isfile(cap.filepath):
+        raise HTTPException(status_code=404, detail="Capture file missing on disk")
+
+    stem, _ = os.path.splitext(cap.filepath)
+    suffix = "_4k.png" if upscale else "_polished.png"
+    dest_path = f"{stem}{suffix}"
+    if not os.path.isfile(dest_path):
+        img = cv2.imread(cap.filepath, cv2.IMREAD_COLOR)
+        if img is None:
+            raise HTTPException(status_code=500, detail="Could not read capture image")
+        polished = get_postprocess_engine().polish_broadcast_frame(
+            img, cap.analysis, deblock=True, neutralize_led=True, upscale_2x=bool(upscale)
+        )
+        ok = cv2.imwrite(dest_path, polished, [int(cv2.IMWRITE_PNG_COMPRESSION), 2])
+        if not ok:
+            raise HTTPException(status_code=500, detail="Failed to write polished image")
+
+    if download:
+        return FileResponse(dest_path, media_type="image/png", filename=os.path.basename(dest_path))
+    return FileResponse(dest_path, media_type="image/png")
+
+
+@app.post("/api/postprocess/warm-models")
+def warm_neural_models():
+    state.touch_activity()
+    mat = get_postprocess_engine().ensure_matting_model()
+    vis = get_visual_embedder().download_backbone()
+    spk = (
+        state.processor.analyzer.speaker_id.ensure_sface_ready()
+        if (state.processor and getattr(state.processor, "analyzer", None))
+        else {"ok": False}
+    )
+    return {"ok": True, "matting": mat, "visual_backbone": vis, "sface": spk}
+
+
+# --- Audio Pause Gating & Whisper Sermon Notes (#8) -------------------------
+
+@app.get("/api/audio/status")
+def get_audio_status():
+    proc = state.processor
+    aud = getattr(proc, "audio_monitor", None) if proc else None
+    tel = aud.telemetry().__dict__ if aud is not None else {"active": False, "rms_db": -60.0}
+    return {
+        "ok": True,
+        "audio_gating_enabled": bool(getattr(state.config, "audio_gating_enabled", False)),
+        "whisper_available": SermonNotesGenerator.whisper_available(),
+        "whisper_model": state.config.whisper_model_size,
+        "telemetry": tel,
+        "has_latest_notes": state.latest_sermon_notes is not None,
+    }
+
+
+@app.post("/api/sermon-notes/generate")
+def generate_sermon_notes(payload: Dict[str, Any] = Body(default={})):
+    state.touch_activity()
+    src_mode = str(payload.get("source", "live") or "live").strip().lower()
+    raw_transcript = str(payload.get("transcript", "") or "").strip()
+    media_path: Optional[str] = None
+    audio_mon = None
+
+    if src_mode == "video":
+        raw_v = str(payload.get("video_path", "") or state.scan_video_path or "").strip()
+        media_path = str(_resolve_video_path(raw_v))
+    elif src_mode == "live" and not raw_transcript:
+        proc = state.processor
+        audio_mon = getattr(proc, "audio_monitor", None) if proc else None
+        # If live source is actually a local video file and no PCM chunks buffered yet, transcribe file directly
+        if (audio_mon is None or audio_mon.telemetry().buffered_minutes <= 0.01) and state.config.stream_source:
+            if not _is_network_or_device_source(state.config.stream_source) and os.path.isfile(state.config.stream_source):
+                media_path = state.config.stream_source
+
+    if not raw_transcript and media_path is None:
+        if audio_mon is None or audio_mon.telemetry().buffered_minutes <= 0.01:
+            raise HTTPException(
+                status_code=400,
+                detail="No buffered live audio yet (enable Audio Pause Gating during stream, select a video file, or paste a transcript).",
+            )
+        if not SermonNotesGenerator.whisper_available():
+            raise HTTPException(
+                status_code=400,
+                detail="faster-whisper is not installed in this Python environment (paste a transcript or run via the Docker image).",
+            )
+    elif not raw_transcript and media_path is not None and not SermonNotesGenerator.whisper_available():
+        raise HTTPException(
+            status_code=400,
+            detail="faster-whisper is not installed in this Python environment (paste a transcript or run via the Docker image).",
+        )
+
+    res = state.sermon_notes_gen.generate_and_save(
+        output_dir=state.config.output_dir if state.output_confirmed else "",
+        media_path=media_path,
+        audio_monitor=audio_mon,
+        raw_transcript=raw_transcript,
+        whisper_model=state.config.whisper_model_size,
+        ollama_url=state.config.ai_judge_ollama_url,
+        ollama_model=state.config.ai_judge_ollama_model,
+        num_thread=state.config.ai_judge_ollama_num_thread,
+    )
+    state.latest_sermon_notes = res
+    return {"ok": True, **res}
+
+
+@app.get("/api/sermon-notes/latest")
+def get_latest_sermon_notes():
+    notes = state.latest_sermon_notes or state.sermon_notes_gen.last_notes
+    return {"ok": True, "notes": notes}
+
+
+# --- NDI Discovery (#12) & Sony SRG-A40 PTZ / AI Auto-Framing (#10) ---------
+
+@app.get("/api/ndi/discover")
+def api_discover_ndi(timeout_ms: int = 1200):
+    state.touch_activity()
+    return discover_ndi_sources(timeout_ms=max(200, min(4000, int(timeout_ms))))
+
+
+def _ptz_controller() -> SonyPTZController:
+    cam = camera_store.load()
+    if cam and cam.kind == "rtsp" and cam.host:
+        return SonyPTZController.from_camera_settings(cam)
+    src = (state.config.stream_source or "").strip()
+    if src.lower().startswith(("rtsp://", "rtsps://")):
+        parts = urllib.parse.urlsplit(src)
+        if parts.hostname:
+            return SonyPTZController(
+                host=parts.hostname,
+                username=urllib.parse.unquote(parts.username or ""),
+                password=urllib.parse.unquote(parts.password or ""),
+                http_port=80,
+            )
+    return SonyPTZController()
+
+
+@app.get("/api/ptz/status")
+def ptz_status():
+    return _ptz_controller().status()
+
+
+@app.post("/api/ptz/move")
+def ptz_move(payload: Dict[str, Any] = Body(...)):
+    state.touch_activity()
+    ctrl = _ptz_controller()
+    if not ctrl.configured:
+        raise HTTPException(status_code=409, detail="Connect an RTSP IP camera first to use Sony PTZ controls")
+    direction = str(payload.get("direction", "stop") or "stop")
+    speed = int(payload.get("speed", 8) or 8)
+    dur = payload.get("duration_ms", 260)
+    dur_ms = int(dur) if dur is not None else None
+    res = ctrl.move(direction=direction, speed=speed, duration_ms=dur_ms)
+    if not res.get("ok"):
+        raise HTTPException(status_code=502, detail=res.get("error", "PTZ move failed"))
+    return res
+
+
+@app.post("/api/ptz/zoom")
+def ptz_zoom(payload: Dict[str, Any] = Body(...)):
+    state.touch_activity()
+    ctrl = _ptz_controller()
+    if not ctrl.configured:
+        raise HTTPException(status_code=409, detail="Connect an RTSP IP camera first to use Sony PTZ controls")
+    direction = str(payload.get("direction", "stop") or "stop")
+    speed = int(payload.get("speed", 4) or 4)
+    dur = payload.get("duration_ms", 240)
+    dur_ms = int(dur) if dur is not None else None
+    res = ctrl.zoom(direction=direction, speed=speed, duration_ms=dur_ms)
+    if not res.get("ok"):
+        raise HTTPException(status_code=502, detail=res.get("error", "PTZ zoom failed"))
+    return res
+
+
+@app.post("/api/ptz/home")
+def ptz_home():
+    state.touch_activity()
+    ctrl = _ptz_controller()
+    if not ctrl.configured:
+        raise HTTPException(status_code=409, detail="Connect an RTSP IP camera first to use Sony PTZ controls")
+    res = ctrl.home()
+    if not res.get("ok"):
+        raise HTTPException(status_code=502, detail=res.get("error", "PTZ home failed"))
+    return res
+
+
+@app.post("/api/ptz/preset")
+def ptz_preset(payload: Dict[str, Any] = Body(...)):
+    state.touch_activity()
+    ctrl = _ptz_controller()
+    if not ctrl.configured:
+        raise HTTPException(status_code=409, detail="Connect an RTSP IP camera first to use Sony PTZ controls")
+    preset_id = int(payload.get("preset_id", 1) or 1)
+    action = str(payload.get("action", "recall") or "recall").strip().lower()
+    if action == "save":
+        res = ctrl.save_preset(preset_id, name=str(payload.get("name", "") or ""))
+    else:
+        res = ctrl.recall_preset(preset_id)
+    if not res.get("ok"):
+        raise HTTPException(status_code=502, detail=res.get("error", "PTZ preset command failed"))
+    return res
+
+
+@app.post("/api/ptz/auto-framing")
+def ptz_auto_framing(payload: Dict[str, Any] = Body(...)):
+    state.touch_activity()
+    ctrl = _ptz_controller()
+    if not ctrl.configured:
+        raise HTTPException(status_code=409, detail="Connect an RTSP IP camera first to use Sony AI Auto-Framing")
+    enabled = bool(payload.get("enabled", True))
+    res = ctrl.set_auto_framing(enabled)
+    if not res.get("ok"):
+        raise HTTPException(status_code=502, detail=res.get("error", "Sony AI Auto-Framing command failed"))
+    return res
 
 
 @app.get("/api/state")

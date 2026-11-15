@@ -18,3 +18,9 @@ pydantic>=2.0
 # Only needed for the Claude API backend; the local Ollama backend talks plain HTTP.
 # Harmless to install either way - the judge stays off without credentials.
 anthropic>=1.7.0
+
+# Studio neural features (U2-Net-P cutout matting, MobileNetV2 visual embeddings,
+# SFace speaker verification, and local Whisper sermon transcription). All modules
+# fall back cleanly to OpenCV/extractive paths if weights or runtimes are absent.
+onnxruntime>=1.17.0
+faster-whisper>=1.0.0

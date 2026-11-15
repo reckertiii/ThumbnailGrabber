@@ -69,6 +69,65 @@ class JudgeResult:
     skipped: bool = False   # True when the judge was off or rate-limited, not when it failed
 
 
+class FinalsVerdict(BaseModel):
+    """Side-by-side contact-sheet tournament verdict (#4a)."""
+    overall_winner: int = Field(ge=1, description="1-based tile number of the single best overall speaker cutout.")
+    best_smile: int = Field(ge=1, description="1-based tile number of the warmest natural smile.")
+    best_gesture: int = Field(ge=1, description="1-based tile number of the cleanest open-handed teaching gesture.")
+    ranking: List[int] = Field(description="All 1-based tile numbers ordered from best to weakest.")
+    rationale: str = Field(description="Under 35 words explaining why overall_winner beat the runners-up.")
+
+    @property
+    def winner_index(self) -> int:
+        return int(self.overall_winner)
+
+    @property
+    def best_smile_index(self) -> int:
+        return int(self.best_smile)
+
+    @property
+    def best_gesture_index(self) -> int:
+        return int(self.best_gesture)
+
+    @property
+    def reasoning(self) -> str:
+        return str(self.rationale)
+
+
+def build_finals_contact_sheet(crops: List[np.ndarray], tile_h: int = 420) -> np.ndarray:
+    """Arranges up to 9 candidate crops into a numbered contact-sheet grid (`#1`..`#N`)."""
+    n = len(crops)
+    if n == 0:
+        return np.zeros((tile_h, tile_h, 3), dtype=np.uint8)
+    cols = 2 if n == 2 else (3 if n <= 9 else 4)
+    rows = (n + cols - 1) // cols
+    tile_w = int(round(tile_h * 0.78))
+    pad = 12
+    canvas_w = cols * tile_w + (cols + 1) * pad
+    canvas_h = rows * tile_h + (rows + 1) * pad
+    sheet = np.full((canvas_h, canvas_w, 3), (20, 26, 38), dtype=np.uint8)
+
+    for idx, img in enumerate(crops):
+        r, c = divmod(idx, cols)
+        x0 = pad + c * (tile_w + pad)
+        y0 = pad + r * (tile_h + pad)
+        if img is not None and img.size > 0:
+            ih, iw = img.shape[:2]
+            scale = min(tile_w / float(max(1, iw)), tile_h / float(max(1, ih)))
+            nw, nh = max(1, int(round(iw * scale))), max(1, int(round(ih * scale)))
+            resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
+            ox = x0 + (tile_w - nw) // 2
+            oy = y0 + (tile_h - nh) // 2
+            sheet[oy:oy + nh, ox:ox + nw] = resized
+        cv2.rectangle(sheet, (x0, y0), (x0 + tile_w, y0 + tile_h), (71, 85, 105), 2)
+        tag = f"#{idx + 1}"
+        cv2.rectangle(sheet, (x0, y0), (x0 + 68, y0 + 40), (15, 23, 42), -1)
+        cv2.rectangle(sheet, (x0, y0), (x0 + 68, y0 + 40), (56, 189, 248), 2)
+        cv2.putText(sheet, tag, (x0 + 10, y0 + 29), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2)
+
+    return sheet
+
+
 # The rubric is the whole point, so it is spelled out rather than left to the model to
 # infer. It describes the end use, because "is this a good photo" depends entirely on
 # what the photo is for.
@@ -688,6 +747,96 @@ class AIJudge:
                 pass
         # A local server that went away mid-session may well come back; keep trying.
         print(f"[AIJudge] Review failed, keeping heuristic score: {msg}")
+
+    def judge_finals(self, crops: List[np.ndarray], user_feedback_prompt: str = "") -> Optional[FinalsVerdict]:
+        """Runs a single side-by-side contact-sheet finals pass across `2..9` candidates (#4a)."""
+        if not self.available or len(crops) < 2:
+            return None
+        subset = crops[:9]
+        n = len(subset)
+        sheet = build_finals_contact_sheet(subset)
+        image_b64 = _encode_image_for_judge(sheet, max(1152, self.max_px))
+        sys_prompt = (
+            "You are picking the winning presentation-slide speaker cutout from a numbered contact sheet "
+            f"(#1 through #{n}). Compare all {n} tiles side-by-side for eye engagement, natural warm expression, "
+            "sharp hands/face, clean posture, and freedom from microphones/stands covering the body. "
+            f"Every tile number you return MUST be between 1 and {n}."
+        )
+        if user_feedback_prompt and user_feedback_prompt.strip():
+            sys_prompt += f"\n\n{user_feedback_prompt.strip()}"
+        user_prompt = (
+            f"Compare tiles #1 through #{n} side-by-side and return overall_winner, best_smile, "
+            f"best_gesture, full ranking of 1..{n}, and a brief rationale."
+        )
+        try:
+            with self._lock:
+                self.calls_made += 1
+            if self.backend == "ollama":
+                opts: Dict[str, Any] = {"temperature": 0, "num_predict": 320}
+                if self.ollama_num_thread > 0:
+                    opts["num_thread"] = self.ollama_num_thread
+                body = {
+                    "model": self.ollama_model,
+                    "stream": False,
+                    "think": False,
+                    "keep_alive": _keep_alive_value(self.ollama_keep_alive),
+                    "options": opts,
+                    "format": FinalsVerdict.model_json_schema(),
+                    "messages": [
+                        {"role": "system", "content": sys_prompt},
+                        {"role": "user", "content": user_prompt, "images": [image_b64]},
+                    ],
+                }
+                req = urllib.request.Request(
+                    f"{self.ollama_url}/api/chat",
+                    data=json.dumps(body).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                msg = data.get("message") or {}
+                txt = (msg.get("content") or msg.get("thinking") or "").strip()
+                lo, hi = txt.find("{"), txt.rfind("}")
+                if lo >= 0 and hi > lo:
+                    txt = txt[lo:hi + 1]
+                fv = FinalsVerdict.model_validate_json(txt)
+            else:
+                response = self._client.messages.parse(
+                    model=self.model,
+                    max_tokens=600,
+                    system=sys_prompt,
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "image",
+                             "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}},
+                            {"type": "text", "text": user_prompt},
+                        ],
+                    }],
+                    output_format=FinalsVerdict,
+                )
+                fv = getattr(response, "parsed_output", None)
+                if fv is None:
+                    return None
+
+            # Clamp indices safely to 1..n
+            fv.overall_winner = max(1, min(n, int(fv.overall_winner)))
+            fv.best_smile = max(1, min(n, int(fv.best_smile)))
+            fv.best_gesture = max(1, min(n, int(fv.best_gesture)))
+            seen = []
+            for r in fv.ranking:
+                ri = int(r)
+                if 1 <= ri <= n and ri not in seen:
+                    seen.append(ri)
+            for ri in range(1, n + 1):
+                if ri not in seen:
+                    seen.append(ri)
+            fv.ranking = seen
+            return fv
+        except Exception as e:
+            print(f"[AIJudge] Side-by-side finals pass failed: {e}")
+            return None
 
 
 def _main() -> int:

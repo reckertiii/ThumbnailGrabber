@@ -14,6 +14,8 @@
   <h1>AI Thumbnail Selector</h1>
   <button id="activeSourcePill" type="button" class="source-pill" title="Active video source — click to configure camera">No camera</button>
   <span class="spacer"></span>
+  <button id="btnOpenBrain" type="button" class="btn btn-slate" title="Inspect learned ML preferences, feature drivers, bootstrap from folder, or undo ratings">🧠 ML Brain</button>
+  <button id="btnOpenSermonNotes" type="button" class="btn btn-slate" title="Transcribe speech &amp; generate Sermon Titles &amp; Pull-Quotes via Whisper + Ollama">📝 Sermon Titles</button>
   <button id="btnOpenScanModal" class="btn btn-purple">📼 Scan Video File</button>
   <button id="btnOpenCamera" class="btn btn-slate">📷 Camera…</button>
   <select id="selCaptureLimit" class="capture-limit-select" title="Auto-stop capture timer so capture never runs indefinitely if forgotten">
@@ -30,8 +32,9 @@
 <main class="layout">
 
   <section class="video-col">
-    <div class="video-wrap">
+    <div class="video-wrap" id="videoWrap">
       <img id="video" src="/video.mjpg" alt="Live analyzed camera feed">
+      <canvas id="zoneCanvas" class="zone-canvas hidden"></canvas>
     </div>
     <div class="video-bar">
       <label class="chk"><input type="checkbox" id="chkMesh" checked> Show Face Mesh</label>
@@ -47,7 +50,34 @@
       <span id="fps" class="muted">— fps</span>
       <button id="btnManual" class="btn btn-green">📸 Manual Screenshot</button>
     </div>
-    <p class="hint">Click a face on the video to include or ignore that person.</p>
+
+    <div class="studio-toolbar">
+      <div class="studio-group">
+        <button id="btnArmSpeakerLock" type="button" class="btn-mini" title="Click a speaker's face on the video to lock exclusively onto them">🎯 Lock Speaker</button>
+        <input type="text" id="inpSpeakerName" class="studio-mini-input" placeholder="Save speaker name…">
+        <select id="selSpeakerProfile" class="studio-mini-select" title="Activate a saved speaker face profile">
+          <option value="">All Speakers (Unlocked)</option>
+        </select>
+        <button id="btnUnlockSpeaker" type="button" class="btn-mini hidden" title="Clear target speaker face lock">🔓 Unlock</button>
+      </div>
+      <div class="studio-group">
+        <button id="btnDrawSafeZone" type="button" class="btn-mini" title="Click vertices on the video to draw a green Safe Zone polygon (ignores faces outside)">📐 Safe Zone</button>
+        <button id="btnDrawObstruction" type="button" class="btn-mini" title="Click vertices on the video to mark a lectern, iPad stand, or monitor">🚧 Add Obstruction</button>
+        <button id="btnFinishZone" type="button" class="btn-mini btn-mini-accent hidden">✓ Save Polygon</button>
+        <button id="btnClearZones" type="button" class="btn-mini" title="Remove all stage safe-zone and obstruction polygons">✕ Clear Zones</button>
+      </div>
+    </div>
+
+    <div class="studio-toggles">
+      <label class="chk" title="Guarantees expression variety across Warm Smile, Passionate Preaching, Calm Portrait, and Stage Prop"><input type="checkbox" id="chkMoodBuckets" checked> 🎨 Mood Buckets</label>
+      <label class="chk" title="Automatically save a lossless transparent RGBA PNG cutout alongside every captured thumbnail"><input type="checkbox" id="chkAutoCutout"> ✂️ Auto Cutout PNG</label>
+      <label class="chk" title="RTSP H.264 macroblock smoothing + stage LED skin-tone cast neutralization"><input type="checkbox" id="chkPolish" checked> ✨ Broadcast Polish</label>
+      <label class="chk" title="2x Lanczos-4 + halo-free detail upscale (1080p → 4K) on saved captures"><input type="checkbox" id="chkUpscale4k"> 4K Upscale</label>
+      <label class="chk" title="Monitor stream audio for natural breath pauses &amp; laughter bursts (+ Whisper transcript buffer)"><input type="checkbox" id="chkAudioGate"> 🎙️ Audio Pause Gating</label>
+      <span id="audioBadge" class="audio-badge hidden">🎙️ —</span>
+    </div>
+
+    <p class="hint" id="videoHint">Click a face on the video to include or ignore that person.</p>
   </section>
 
   <section class="panel-col">
@@ -115,12 +145,56 @@
     </div>
 
     <div class="card">
-      <h2>Frame Buffer</h2>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+        <h2 style="margin:0">Time-Machine Frame Buffer</h2>
+        <button id="btnMineBuffer" type="button" class="btn-mini btn-mini-accent" title="Retroactively mine the rolling RAM replay buffer for the best shots from the last 60 seconds">⏪ Mine Last 60s</button>
+      </div>
       <div class="row" style="align-items:center;gap:8px;display:flex">
-        <input type="range" id="sldBuffer" min="0" max="20" step="1" value="5" style="flex:1">
+        <input type="range" id="sldBuffer" min="0" max="180" step="5" value="5" style="flex:1">
         <span id="outBuffer" style="min-width:42px;text-align:right">5s</span>
       </div>
       <div class="metric wide" id="mBuffer" style="margin-top:6px">Buffer: &mdash;</div>
+    </div>
+
+    <div class="card">
+      <details class="ptz-details">
+        <summary class="ptz-summary">🎮 Sony SRG-A40 PTZ &amp; AI Auto-Framing</summary>
+        <div class="ptz-body">
+          <div class="ptz-auto-row">
+            <span class="muted">Built-in AI Framing:</span>
+            <button type="button" id="btnPtzAutoOn" class="btn-mini btn-mini-accent">🤖 AI Track ON</button>
+            <button type="button" id="btnPtzAutoOff" class="btn-mini">Manual PTZ</button>
+            <span id="ptzStatusLabel" class="muted" style="margin-left:auto;font-size:11px"></span>
+          </div>
+          <div class="ptz-controls-wrap">
+            <div class="ptz-dpad">
+              <button type="button" class="btn-mini" data-ptz-move="upleft">↖</button>
+              <button type="button" class="btn-mini" data-ptz-move="up">↑</button>
+              <button type="button" class="btn-mini" data-ptz-move="upright">↗</button>
+              <button type="button" class="btn-mini" data-ptz-move="left">←</button>
+              <button type="button" id="btnPtzHome" class="btn-mini" title="Return to Home position">⌂</button>
+              <button type="button" class="btn-mini" data-ptz-move="right">→</button>
+              <button type="button" class="btn-mini" data-ptz-move="downleft">↙</button>
+              <button type="button" class="btn-mini" data-ptz-move="down">↓</button>
+              <button type="button" class="btn-mini" data-ptz-move="downright">↘</button>
+            </div>
+            <div class="ptz-zoom-presets">
+              <div class="ptz-zoom-row">
+                <button type="button" class="btn-mini" data-ptz-zoom="wide">🔍− Wide</button>
+                <button type="button" class="btn-mini" data-ptz-zoom="tele">🔍+ Tele</button>
+              </div>
+              <div class="ptz-preset-row">
+                <button type="button" class="btn-mini" data-ptz-preset="1">P1</button>
+                <button type="button" class="btn-mini" data-ptz-preset="2">P2</button>
+                <button type="button" class="btn-mini" data-ptz-preset="3">P3</button>
+                <button type="button" class="btn-mini" data-ptz-preset="4">P4</button>
+                <button type="button" class="btn-mini" data-ptz-preset="5">P5</button>
+                <button type="button" class="btn-mini" data-ptz-preset="6">P6</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </details>
     </div>
 
     <div class="card" id="outputCard">
@@ -137,6 +211,7 @@
   <div class="gallery-header">
     <h2>Captured Best Screenshots</h2>
     <div class="gallery-actions">
+      <button id="btnRunAiFinals" class="btn btn-finals" title="Compare top gallery contenders side-by-side on a single contact sheet with your AI Judge to crown #1 Overall, Best Smile &amp; Best Gesture">🏆 Run AI Finals</button>
       <button id="btnDownloadZip" class="btn btn-zip" title="Download all visible gallery thumbnails as a single .zip file">⬇ Download ZIP</button>
       <button id="btnClearUnpinned" class="btn btn-clear-service" title="Delete all unpinned shots from the gallery and output folder so you are ready for the next service (📌 Saved shots are kept)">🧹 Clear Top Shots (Keep Pinned)</button>
       <button id="btnClearPinned" class="btn btn-clear-pinned" title="Delete all 📌 Saved (pinned) shots from the gallery and output folder">🗑️ Delete Pinned Shots</button>
@@ -315,6 +390,9 @@
       <div class="lb-feedback-actions">
         <label class="chk lb-remove-chk"><input type="checkbox" id="lbRemoveBad" checked> Delete photo when marking 👎 Bad</label>
         <span class="spacer"></span>
+        <button type="button" id="lbBtnBurst" class="btn btn-slate" title="Micro-scrub ±15 frames around this shot">🎞️ Scrub ±15f</button>
+        <button type="button" id="lbBtnCutout" class="btn btn-slate" title="Download transparent RGBA PNG cutout">✂️ Cutout PNG</button>
+        <button type="button" id="lbBtnPolish" class="btn btn-slate" title="Download broadcast-polished 4K PNG">✨ 4K Polish</button>
         <button type="button" id="lbBtnDownload" class="btn btn-zip">⬇ Download</button>
         <button type="button" id="lbBtnPin" class="btn btn-pin-lg">📌 Keep</button>
         <button type="button" id="lbBtnFav" class="btn btn-fav-lg">⭐ Best Shot</button>
@@ -338,7 +416,8 @@
 
       <label class="chk" for="camKind">What are we watching?</label>
       <select id="camKind" class="cam-field">
-        <option value="rtsp">Network camera (RTSP)</option>
+        <option value="rtsp">Network camera (RTSP / Sony PTZ)</option>
+        <option value="ndi">NDI Network Source (NewTek / Vizrt)</option>
         <option value="webcam">Webcam attached to the server</option>
         <option value="file">Video file on the server</option>
       </select>
@@ -347,8 +426,10 @@
         <div class="cam-grid">
           <label for="camHost">Address</label>
           <input type="text" id="camHost" placeholder="192.168.1.100">
-          <label for="camPort">Port</label>
+          <label for="camPort">RTSP Port</label>
           <input type="number" id="camPort" value="554" min="1" max="65535">
+          <label for="camHttpPort">HTTP CGI Port</label>
+          <input type="number" id="camHttpPort" value="80" min="1" max="65535">
           <label for="camUser">Username</label>
           <input type="text" id="camUser" autocomplete="off" placeholder="admin">
           <label for="camPass">Password</label>
@@ -361,6 +442,18 @@
         <datalist id="camPaths"></datalist>
         <p class="cam-note">Leave the stream path blank and press <b>Test</b> &mdash;
         the usual paths are tried and the one that answers is filled in.</p>
+      </div>
+
+      <div id="camNdiFields" class="hidden">
+        <div class="cam-grid">
+          <label for="camNdiName">NDI Source</label>
+          <div class="file-pick-row" style="margin-bottom:0">
+            <input type="text" id="camNdiName" placeholder="PTZ-CAM-1 (Main Stage)">
+            <button id="btnDiscoverNdi" type="button" class="btn btn-slate">🔍 Discover</button>
+          </div>
+        </div>
+        <div id="ndiDiscoveredList" class="folder-shortcuts" style="margin-top:8px"></div>
+        <p id="ndiSetupHint" class="cam-note">Connect directly to uncompressed NDI sources on your broadcast VLAN.</p>
       </div>
 
       <div id="camWebcamFields" class="hidden">
@@ -400,6 +493,118 @@
       <button id="btnCamTest" type="button" class="btn">Test</button>
       <button id="btnCamConnect" type="button" class="btn btn-green">Connect</button>
       <button id="btnCamClose" type="button" class="btn">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<div id="mlBrainModal" class="modal hidden">
+  <div class="modal-inner" style="max-width:780px">
+    <div class="modal-header">
+      <h2>🧠 ML Preference Brain — Transparency &amp; Training</h2>
+      <button id="btnBrainCloseX" class="btn-close">✕</button>
+    </div>
+
+    <div class="modal-section">
+      <h3>1. Model Readiness &amp; Visual Embedding Engine</h3>
+      <div id="mlBrainStats" class="meta-banner">Loading ML Brain…</div>
+      <div style="display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap">
+        <span id="mlBackboneInfo" class="muted" style="font-size:12px"></span>
+        <span class="spacer"></span>
+        <button type="button" id="btnWarmModels" class="btn-mini btn-mini-accent">⚡ Warm / Download Neural Models (RAM Pin)</button>
+      </div>
+    </div>
+
+    <div class="modal-section">
+      <h3>2. Top Learned Feature Drivers (What Your AI Rewards &amp; Penalizes)</h3>
+      <div id="mlDriversList" class="ml-drivers"></div>
+    </div>
+
+    <div class="modal-section">
+      <h3>3. Bootstrap from Past Winning Thumbnails Folder</h3>
+      <p class="hint" style="margin-bottom:8px">Point to an archive folder of past favorite thumbnails so the AI learns your taste immediately.</p>
+      <div class="file-pick-row" style="margin-bottom:0">
+        <input type="text" id="mlBootstrapPath" placeholder="/mnt/Main/Grace Shared/Past Thumbnails">
+        <button type="button" id="btnBrowseBootstrap" class="btn btn-slate">📂 Browse…</button>
+        <button type="button" id="btnRunBootstrap" class="btn btn-green">🚀 Train from Folder</button>
+      </div>
+    </div>
+
+    <div class="modal-section">
+      <h3>4. Recent Rating History (1-Click Undo / Flip)</h3>
+      <div id="mlRecentList" class="ml-recent-list"></div>
+    </div>
+
+    <div class="modal-footer">
+      <button type="button" id="btnMlReset" class="btn btn-danger-outline">🗑 Reset All Learned Preferences</button>
+      <span class="spacer"></span>
+      <button type="button" id="btnBrainClose" class="btn">Close</button>
+    </div>
+  </div>
+</div>
+
+<div id="burstModal" class="modal hidden">
+  <div class="modal-inner" style="max-width:860px">
+    <div class="modal-header">
+      <h2>🎞️ ±15-Frame Micro-Scrub &amp; 100% Eye/Lip Zoom Loupe</h2>
+      <button id="btnBurstCloseX" class="btn-close">✕</button>
+    </div>
+    <p class="hint">Hover over the image to inspect eyes &amp; mouth at 100% pixel zoom. Scrub ±0.5s to pick the exact micro-expression peak.</p>
+    <div class="modal-section">
+      <div class="burst-stage" id="burstStage">
+        <img id="burstMainImg" alt="Burst frame preview">
+        <div id="burstLoupe" class="burst-loupe hidden"></div>
+      </div>
+      <div class="row" style="display:flex;align-items:center;gap:10px;margin-top:10px">
+        <input type="range" id="sldBurstScrub" min="0" max="0" value="0" style="flex:1">
+        <span id="burstOffsetLabel" style="min-width:96px;text-align:right;font-weight:700;color:#38bdf8">0 ms</span>
+      </div>
+      <div id="burstStrip" class="burst-strip"></div>
+    </div>
+    <div class="modal-footer">
+      <span id="burstStatusNote" class="muted"></span>
+      <span class="spacer"></span>
+      <button type="button" id="btnBurstSelect" class="btn btn-green">✅ Use This Frame &amp; Teach AI</button>
+      <button type="button" id="btnBurstClose" class="btn">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<div id="sermonNotesModal" class="modal hidden">
+  <div class="modal-inner" style="max-width:740px">
+    <div class="modal-header">
+      <h2>📝 Sermon Title &amp; Pull-Quote Generator (Whisper + Ollama)</h2>
+      <button id="btnSermonCloseX" class="btn-close">✕</button>
+    </div>
+    <div class="modal-section">
+      <h3>1. Speech Source</h3>
+      <div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:10px">
+        <label class="chk"><input type="radio" name="sermonSrc" value="live" checked> Live Audio Buffer</label>
+        <label class="chk"><input type="radio" name="sermonSrc" value="video"> Server Video File</label>
+        <label class="chk"><input type="radio" name="sermonSrc" value="transcript"> Paste Transcript</label>
+      </div>
+      <div id="sermonVideoRow" class="file-pick-row hidden">
+        <input type="text" id="sermonVideoPath" placeholder="Server video path">
+        <button type="button" id="btnSermonBrowseVideo" class="btn btn-slate">📂 Browse…</button>
+      </div>
+      <textarea id="sermonTranscriptInput" class="sermon-textarea hidden" rows="4" placeholder="Paste sermon transcript or message notes here…"></textarea>
+      <div style="display:flex;align-items:center;gap:10px;margin-top:8px">
+        <button type="button" id="btnGenSermonNotes" class="btn btn-purple">✨ Transcribe &amp; Generate Titles</button>
+        <span id="sermonGenStatus" class="muted"></span>
+      </div>
+    </div>
+
+    <div id="sermonResultsWrap" class="modal-section hidden">
+      <h3>2. Suggested Slide / YouTube Titles (Click to Copy)</h3>
+      <div id="sermonTitlesList" class="sermon-titles-list"></div>
+      <h3 style="margin-top:14px">3. Verbatim Pull-Quotes</h3>
+      <div id="sermonQuotesList" class="sermon-quotes-list"></div>
+      <h3 style="margin-top:14px">4. Overview</h3>
+      <p id="sermonSummaryText" class="muted" style="line-height:1.5;margin:0"></p>
+    </div>
+
+    <div class="modal-footer">
+      <span class="spacer"></span>
+      <button type="button" id="btnSermonClose" class="btn">Close</button>
     </div>
   </div>
 </div>

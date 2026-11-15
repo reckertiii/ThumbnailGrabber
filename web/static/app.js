@@ -12,8 +12,12 @@ let visibleCapturesCount = 0;
 
 // Separate custom scan output folder so 10 Hz live telemetry never overwrites it
 let customScanOutputDir = "";
-let folderPickerTarget = "live"; // "live" | "scan"
-let videoBrowserTarget = "scan"; // "scan" | "camera"
+let folderPickerTarget = "live"; // "live" | "scan" | "bootstrap"
+let videoBrowserTarget = "scan"; // "scan" | "camera" | "sermon"
+let videoClickMode = "toggle";   // "toggle" | "lock_speaker" | "safe_zone" | "obstruction"
+let draftZonePoints = [];
+let savedStageZones = { safe_zone: [], obstruction_zones: [] };
+let lastSpeakerSig = "";
 
 // ---------------------------------------------------------------- helpers
 
@@ -78,6 +82,26 @@ function downloadCaptureFile(filename) {
   a.remove();
 }
 
+function downloadCutoutPng(filename, crop = false) {
+  if (!filename) return;
+  toast("✂️ Generating lossless transparent RGBA PNG cutout…");
+  const a = document.createElement("a");
+  a.href = `/api/captures/${encodeURIComponent(filename)}/cutout?download=1&crop=${crop ? 1 : 0}`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
+function downloadPolishedPng(filename) {
+  if (!filename) return;
+  toast("✨ Generating broadcast-polished 4K PNG…");
+  const a = document.createElement("a");
+  a.href = `/api/captures/${encodeURIComponent(filename)}/polish?download=1&upscale=1`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
 // ---------------------------------------------------------------- telemetry
 
 const STATUS = {
@@ -127,6 +151,9 @@ function render(d) {
   }
 
   const buf = d.buffer;
+  if (d.dvr_max_seconds && $("sldBuffer")) {
+    $("sldBuffer").max = String(Math.round(d.dvr_max_seconds));
+  }
   if (buf) {
     if (!holding.has("sldBuffer")) {
       $("sldBuffer").value = Math.round(buf.seconds);
@@ -180,6 +207,7 @@ function render(d) {
   btn.disabled = needsFolder;
   btn.title = needsFolder ? "Confirm the output folder first" : "";
   $("btnManual").disabled = !d.output_confirmed;
+  if ($("btnMineBuffer")) $("btnMineBuffer").disabled = !d.output_confirmed;
   setClass($("outputCard"), "needs-attention", !d.output_confirmed);
   $("outputHint").textContent = d.output_confirmed
     ? ""
@@ -191,6 +219,38 @@ function render(d) {
   $("chkMesh").checked = !!d.show_mesh;
   $("chkHud").checked = !!d.show_hud;
   if ($("chkProps")) $("chkProps").checked = d.capture_prop_moments !== false;
+  if ($("chkMoodBuckets")) $("chkMoodBuckets").checked = d.mood_buckets_enabled !== false;
+  if ($("chkAutoCutout")) $("chkAutoCutout").checked = !!d.auto_save_cutout;
+  if ($("chkPolish")) $("chkPolish").checked = d.broadcast_polish_enabled !== false;
+  if ($("chkUpscale4k")) $("chkUpscale4k").checked = !!d.upscale_4k_enabled;
+  if ($("chkAudioGate")) $("chkAudioGate").checked = !!d.audio_gating_enabled;
+
+  // Audio live badge
+  const audBadge = $("audioBadge");
+  if (audBadge) {
+    if (d.audio_gating_enabled && d.audio && d.audio.active) {
+      audBadge.classList.remove("hidden");
+      const stateLabel = d.audio.in_speech_pause
+        ? "🟢 BREATH PAUSE"
+        : d.audio.is_laughter_burst
+        ? "😄 LAUGHTER"
+        : d.audio.is_speaking
+        ? "🎙️ SPEAKING"
+        : "🔇 QUIET";
+      audBadge.textContent = `${stateLabel} (${d.audio.rms_db} dB · ${d.audio.buffered_minutes || 0}m)`;
+      setClass(audBadge, "pause-sweet", d.audio.in_speech_pause || d.audio.is_laughter_burst);
+    } else {
+      audBadge.classList.add("hidden");
+    }
+  }
+
+  // Speaker lock sync
+  if (d.speaker_lock) {
+    syncSpeakerLockUI(d.speaker_lock);
+  }
+  if (d.stage_zones && videoClickMode !== "safe_zone" && videoClickMode !== "obstruction") {
+    savedStageZones = d.stage_zones;
+  }
 
   // Sliders (skip any the user is dragging)
   const s = d.settings || {};
@@ -277,6 +337,13 @@ function renderPeople(selected, target) {
   [...wrap.children].forEach((b, i) => setClass(b, "on", selected.includes(i + 1)));
 }
 
+const MOOD_LABELS = {
+  warm_smile: "😊 Smile",
+  passionate: "🔥 Passionate",
+  calm_portrait: "😌 Portrait",
+  prop: "🎭 Prop",
+};
+
 function renderGallery(caps) {
   visibleCapturesCount = caps.length;
   const json = JSON.stringify(caps);
@@ -303,6 +370,28 @@ function renderGallery(caps) {
     const propBadge = c.is_prop_moment ? ` · <span title="Candid stage prop moment">🎭 Prop</span>` : "";
     const pinBadge = c.is_pinned ? ` · <span class="pin-badge" title="Protected from auto-deletion">📌 Saved</span>` : "";
     info.innerHTML = `<span class="rank-badge">🏆 #${Number(c.rank) || 1}</span> | <b>${Math.round(c.score * 100)}%</b>${propBadge}${pinBadge}`;
+
+    const badgeRow = document.createElement("div");
+    badgeRow.className = "thumb-badges";
+    if (c.finals_badge) {
+      const fb = document.createElement("span");
+      fb.className = "badge-pill finals";
+      fb.textContent = "🏆 " + c.finals_badge;
+      badgeRow.appendChild(fb);
+    }
+    const moodText = MOOD_LABELS[c.mood_bucket] || "";
+    if (moodText && !(c.mood_bucket === "prop" && c.is_prop_moment)) {
+      const mb = document.createElement("span");
+      mb.className = "badge-pill";
+      mb.textContent = moodText;
+      badgeRow.appendChild(mb);
+    }
+    if (c.speaker_name) {
+      const sb = document.createElement("span");
+      sb.className = "badge-pill";
+      sb.textContent = "🎯 " + c.speaker_name;
+      badgeRow.appendChild(sb);
+    }
 
     const btns = document.createElement("div");
     btns.className = "thumb-btns";
@@ -335,7 +424,29 @@ function renderGallery(caps) {
 
     btns.append(pin, fav, rej, dl);
 
-    card.append(img, info, btns);
+    const studioBtns = document.createElement("div");
+    studioBtns.className = "thumb-studio-btns";
+
+    const scrubBtn = document.createElement("button");
+    scrubBtn.textContent = "🎞️ ±15f";
+    scrubBtn.title = "Micro-scrub ±15 frames & inspect with 100% zoom loupe";
+    scrubBtn.onclick = () => openBurstModal(c.filename);
+
+    const cutBtn = document.createElement("button");
+    cutBtn.textContent = "✂️ PNG";
+    cutBtn.title = "Download lossless transparent RGBA PNG cutout";
+    cutBtn.onclick = () => downloadCutoutPng(c.filename);
+
+    const polBtn = document.createElement("button");
+    polBtn.textContent = "✨ 4K";
+    polBtn.title = "Download broadcast-polished 4K PNG";
+    polBtn.onclick = () => downloadPolishedPng(c.filename);
+
+    studioBtns.append(scrubBtn, cutBtn, polBtn);
+
+    card.append(img, info);
+    if (badgeRow.children.length) card.appendChild(badgeRow);
+    card.append(btns, studioBtns);
     g.appendChild(card);
   });
 }
@@ -587,14 +698,44 @@ if ($("numRetained")) {
 if ($("chkProps")) {
   $("chkProps").onchange = (e) => post("/api/view", { capture_prop_moments: e.target.checked }).catch((err) => toast(err.message));
 }
+if ($("chkMoodBuckets")) {
+  $("chkMoodBuckets").onchange = (e) => post("/api/view", { mood_buckets_enabled: e.target.checked }).catch((err) => toast(err.message));
+}
+if ($("chkAutoCutout")) {
+  $("chkAutoCutout").onchange = (e) => post("/api/view", { auto_save_cutout: e.target.checked }).catch((err) => toast(err.message));
+}
+if ($("chkPolish")) {
+  $("chkPolish").onchange = (e) => post("/api/view", { broadcast_polish_enabled: e.target.checked }).catch((err) => toast(err.message));
+}
+if ($("chkUpscale4k")) {
+  $("chkUpscale4k").onchange = (e) => post("/api/view", { upscale_4k_enabled: e.target.checked }).catch((err) => toast(err.message));
+}
+if ($("chkAudioGate")) {
+  $("chkAudioGate").onchange = (e) => post("/api/view", { audio_gating_enabled: e.target.checked }).catch((err) => toast(err.message));
+}
 
-// Click a face on the video to include / ignore that person
-$("video").onclick = (ev) => {
+// Click a face on the video to include / ignore or lock onto target speaker
+$("video").onclick = async (ev) => {
   const r = ev.target.getBoundingClientRect();
-  post("/api/click", {
-    x_frac: (ev.clientX - r.left) / r.width,
-    y_frac: (ev.clientY - r.top) / r.height,
-  }).catch(() => {});
+  const x_frac = (ev.clientX - r.left) / r.width;
+  const y_frac = (ev.clientY - r.top) / r.height;
+  if (videoClickMode === "lock_speaker") {
+    try {
+      const spkName = $("inpSpeakerName") ? $("inpSpeakerName").value.trim() : "";
+      const res = await post("/api/click", { x_frac, y_frac, mode: "lock_speaker", name: spkName });
+      if (res.ok) {
+        toast(`🎯 Locked onto ${res.active_name || "Speaker"}!`);
+        setVideoClickMode("toggle");
+        syncSpeakerLockUI(res);
+      } else {
+        toast(res.detail || "Click directly on a detected face box");
+      }
+    } catch (e) {
+      toast(e.message);
+    }
+    return;
+  }
+  post("/api/click", { x_frac, y_frac }).catch(() => {});
 };
 
 // ---------------------------------------------------------------- server video browser
@@ -677,6 +818,8 @@ function selectServerVideo(filePath) {
   closeVideoBrowser();
   if (videoBrowserTarget === "camera") {
     $("camFile").value = filePath;
+  } else if (videoBrowserTarget === "sermon") {
+    if ($("sermonVideoPath")) $("sermonVideoPath").value = filePath;
   } else {
     $("scanVideoPath").value = filePath;
     inspectVideoPath(filePath);
@@ -983,6 +1126,8 @@ function openFolderModal(target) {
   if ($("folderModalTitle")) {
     $("folderModalTitle").textContent = folderPickerTarget === "scan"
       ? "Choose Video Scan Output Folder"
+      : folderPickerTarget === "bootstrap"
+      ? "Choose Past Winners Folder to Train AI"
       : "Choose Live Output Folder";
   }
   $("folderModal").classList.remove("hidden");
@@ -993,6 +1138,7 @@ function closeFolderModal() { $("folderModal").classList.add("hidden"); }
 
 $("btnPickFolder").onclick = () => openFolderModal("live");
 $("btnScanPickFolder").onclick = () => openFolderModal("scan");
+if ($("btnBrowseBootstrap")) $("btnBrowseBootstrap").onclick = () => openFolderModal("bootstrap");
 if ($("btnScanResetFolder")) {
   $("btnScanResetFolder").onclick = () => {
     customScanOutputDir = "";
@@ -1008,6 +1154,11 @@ $("folderPath").onkeydown = (e) => { if (e.key === "Enter") loadFolder($("folder
 
 $("btnFolderUse").onclick = async () => {
   const path = $("folderPath").value.trim() || folderCurrent;
+  if (folderPickerTarget === "bootstrap") {
+    if ($("mlBootstrapPath")) $("mlBootstrapPath").value = path;
+    closeFolderModal();
+    return;
+  }
   if (folderPickerTarget === "scan") {
     customScanOutputDir = path;
     $("scanOutputDir").textContent = path;
@@ -1076,6 +1227,24 @@ async function submitLightboxFeedback(favorite) {
   await feedback(filename, favorite, { comment, reasons, remove });
 }
 
+if ($("lbBtnBurst")) {
+  $("lbBtnBurst").onclick = () => {
+    if (!currentLightboxCapture) return;
+    const fname = currentLightboxCapture.filename;
+    $("lightbox").classList.add("hidden");
+    openBurstModal(fname);
+  };
+}
+if ($("lbBtnCutout")) {
+  $("lbBtnCutout").onclick = () => {
+    if (currentLightboxCapture) downloadCutoutPng(currentLightboxCapture.filename);
+  };
+}
+if ($("lbBtnPolish")) {
+  $("lbBtnPolish").onclick = () => {
+    if (currentLightboxCapture) downloadPolishedPng(currentLightboxCapture.filename);
+  };
+}
 if ($("lbBtnDownload")) {
   $("lbBtnDownload").onclick = () => {
     if (currentLightboxCapture) downloadCaptureFile(currentLightboxCapture.filename);
@@ -1111,12 +1280,16 @@ document.addEventListener("keydown", (e) => {
     $("videoScanModal").classList.add("hidden");
     $("folderModal").classList.add("hidden");
     $("cameraModal").classList.add("hidden");
+    if ($("mlBrainModal")) $("mlBrainModal").classList.add("hidden");
+    if ($("burstModal")) $("burstModal").classList.add("hidden");
+    if ($("sermonNotesModal")) $("sermonNotesModal").classList.add("hidden");
+    if (videoClickMode !== "toggle") setVideoClickMode("toggle");
   }
 });
 
 
 /* ---------------------------------------------------------------------------
- * Camera connection
+ * Camera connection (RTSP / NDI / Webcam / File)
  * ------------------------------------------------------------------------- */
 
 function camKind() { return $("camKind").value; }
@@ -1124,6 +1297,7 @@ function camKind() { return $("camKind").value; }
 function camShowFields() {
   const k = camKind();
   $("camRtspFields").classList.toggle("hidden", k !== "rtsp");
+  if ($("camNdiFields")) $("camNdiFields").classList.toggle("hidden", k !== "ndi");
   $("camWebcamFields").classList.toggle("hidden", k !== "webcam");
   $("camFileFields").classList.toggle("hidden", k !== "file");
 }
@@ -1134,10 +1308,13 @@ function camPayload() {
   if (k === "rtsp") {
     p.host = $("camHost").value.trim();
     p.port = Number($("camPort").value) || 554;
+    p.http_port = Number($("camHttpPort") ? $("camHttpPort").value : 80) || 80;
     p.username = $("camUser").value.trim();
     p.path = $("camPath").value.trim();
     const pw = $("camPass").value;
     if (pw) p.password = pw;
+  } else if (k === "ndi") {
+    p.ndi_source_name = $("camNdiName") ? $("camNdiName").value.trim() : "";
   } else if (k === "webcam") {
     p.webcam_index = Number($("camIndex").value) || 0;
   } else {
@@ -1189,8 +1366,10 @@ async function camOpen() {
     $("camKind").value = c.kind || "rtsp";
     $("camHost").value = c.host || "";
     $("camPort").value = c.port || 554;
+    if ($("camHttpPort")) $("camHttpPort").value = c.http_port || 80;
     $("camUser").value = c.username || "";
     $("camPath").value = c.path || "";
+    if ($("camNdiName")) $("camNdiName").value = c.ndi_source_name || "";
     $("camIndex").value = c.webcam_index || 0;
     $("camFile").value = c.file_path || "";
     $("camPass").value = "";
@@ -1198,6 +1377,11 @@ async function camOpen() {
     $("camActive").textContent = d.active_source ? "Now: " + d.active_source : "No active source";
     if ($("btnCamForget")) {
       $("btnCamForget").disabled = !d.configured;
+    }
+    if ($("ndiSetupHint") && d.ndi) {
+      $("ndiSetupHint").textContent = d.ndi.available
+        ? `NDI Runtime active (${d.ndi.library_path})`
+        : (d.ndi.setup_hint || "Connect to NDI sources on your broadcast VLAN.");
     }
 
     const dl = $("camPaths");
@@ -1211,6 +1395,37 @@ async function camOpen() {
   } catch (e) {
     camResult("bad", "Could not read the saved camera settings.", e.message);
   }
+}
+
+if ($("btnDiscoverNdi")) {
+  $("btnDiscoverNdi").onclick = async () => {
+    const btn = $("btnDiscoverNdi");
+    btn.disabled = true;
+    btn.textContent = "Scanning…";
+    try {
+      const d = await fetch("/api/ndi/discover?timeout_ms=1400").then((r) => r.json());
+      const wrap = $("ndiDiscoveredList");
+      wrap.innerHTML = "";
+      (d.sources || []).forEach((s) => {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.textContent = "📡 " + s.name;
+        b.onclick = () => { if ($("camNdiName")) $("camNdiName").value = s.name; };
+        wrap.appendChild(b);
+      });
+      if (!(d.sources || []).length) {
+        toast("No NDI senders detected on this subnet yet");
+      }
+      if ($("ndiSetupHint") && d.setup_hint) {
+        $("ndiSetupHint").textContent = d.setup_hint;
+      }
+    } catch (e) {
+      toast("NDI discovery error: " + e.message);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "🔍 Discover";
+    }
+  };
 }
 
 function camClose() { $("cameraModal").classList.add("hidden"); }
@@ -1274,6 +1489,638 @@ $("btnCamConnect").onclick = async () => {
     btn.disabled = false;
   }
 };
+
+
+/* ---------------------------------------------------------------------------
+ * Target Speaker Lock (#3) & Interactive Stage Safe-Zone / Obstructions (#9)
+ * ------------------------------------------------------------------------- */
+
+function setVideoClickMode(mode) {
+  videoClickMode = mode || "toggle";
+  draftZonePoints = [];
+  const canvas = $("zoneCanvas");
+  const isDrawingZone = videoClickMode === "safe_zone" || videoClickMode === "obstruction";
+  if (canvas) {
+    canvas.classList.toggle("hidden", !isDrawingZone);
+    if (isDrawingZone) renderZoneCanvas();
+  }
+  if ($("btnFinishZone")) $("btnFinishZone").classList.toggle("hidden", !isDrawingZone);
+  setClass($("btnArmSpeakerLock"), "active", videoClickMode === "lock_speaker");
+  setClass($("btnDrawSafeZone"), "active", videoClickMode === "safe_zone");
+  setClass($("btnDrawObstruction"), "active", videoClickMode === "obstruction");
+
+  const hint = $("videoHint");
+  if (hint) {
+    if (videoClickMode === "lock_speaker") {
+      hint.textContent = "🎯 Click directly on the target speaker's face box on the video to lock onto them (press Esc to cancel).";
+    } else if (videoClickMode === "safe_zone") {
+      hint.textContent = "📐 Click 3+ corners around the preaching stage to define the Safe Zone, then click '✓ Save Polygon'.";
+    } else if (videoClickMode === "obstruction") {
+      hint.textContent = "🚧 Click 3+ corners around a lectern, mic stand, or monitor to penalize overlap, then click '✓ Save Polygon'.";
+    } else {
+      hint.textContent = "Click a face on the video to include or ignore that person.";
+    }
+  }
+}
+
+function syncSpeakerLockUI(spk) {
+  const sig = JSON.stringify(spk);
+  if (sig === lastSpeakerSig) return;
+  lastSpeakerSig = sig;
+  const sel = $("selSpeakerProfile");
+  if (sel && document.activeElement !== sel) {
+    sel.innerHTML = "";
+    const opt0 = document.createElement("option");
+    opt0.value = "";
+    opt0.textContent = spk.locked && !spk.active_profile_id
+      ? `🎯 ${spk.active_name || "Locked Speaker"} (Ad-hoc)`
+      : "All Speakers (Unlocked)";
+    sel.appendChild(opt0);
+    (spk.profiles || []).forEach((p) => {
+      const o = document.createElement("option");
+      o.value = p.id;
+      o.textContent = `🎯 ${p.name} (${p.baseline_samples || 0} cal)`;
+      sel.appendChild(o);
+    });
+    sel.value = spk.locked ? (spk.active_profile_id || "") : "";
+  }
+  if ($("btnUnlockSpeaker")) {
+    $("btnUnlockSpeaker").classList.toggle("hidden", !spk.locked);
+  }
+}
+
+if ($("btnArmSpeakerLock")) {
+  $("btnArmSpeakerLock").onclick = () => {
+    setVideoClickMode(videoClickMode === "lock_speaker" ? "toggle" : "lock_speaker");
+  };
+}
+if ($("selSpeakerProfile")) {
+  $("selSpeakerProfile").onchange = async (e) => {
+    const pid = e.target.value;
+    try {
+      if (!pid) {
+        const r = await post("/api/speaker/unlock", {});
+        syncSpeakerLockUI(r);
+        toast("🔓 Speaker lock cleared");
+      } else {
+        const r = await post("/api/speaker/activate", { profile_id: pid });
+        syncSpeakerLockUI(r);
+        toast(`🎯 Locked onto ${r.active_name}`);
+      }
+    } catch (err) {
+      toast(err.message);
+    }
+  };
+}
+if ($("btnUnlockSpeaker")) {
+  $("btnUnlockSpeaker").onclick = async () => {
+    try {
+      const r = await post("/api/speaker/unlock", {});
+      syncSpeakerLockUI(r);
+      toast("🔓 Speaker lock cleared");
+    } catch (e) {
+      toast(e.message);
+    }
+  };
+}
+
+function renderZoneCanvas() {
+  const canvas = $("zoneCanvas");
+  const vid = $("video");
+  if (!canvas || !vid) return;
+  const rect = vid.getBoundingClientRect();
+  canvas.width = Math.max(1, Math.round(rect.width));
+  canvas.height = Math.max(1, Math.round(rect.height));
+  const ctx = canvas.getContext("2d");
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  if (draftZonePoints.length > 0) {
+    const isSafe = videoClickMode === "safe_zone";
+    ctx.strokeStyle = isSafe ? "#22c55e" : "#f59e0b";
+    ctx.fillStyle = isSafe ? "rgba(34, 197, 94, 0.18)" : "rgba(245, 158, 11, 0.22)";
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    draftZonePoints.forEach((pt, idx) => {
+      const px = pt[0] * canvas.width;
+      const py = pt[1] * canvas.height;
+      if (idx === 0) ctx.moveTo(px, py);
+      else ctx.lineTo(px, py);
+    });
+    if (draftZonePoints.length >= 3) ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+
+    draftZonePoints.forEach((pt) => {
+      ctx.fillStyle = "#fff";
+      ctx.beginPath();
+      ctx.arc(pt[0] * canvas.width, pt[1] * canvas.height, 4, 0, Math.PI * 2);
+      ctx.fill();
+    });
+  }
+}
+
+if ($("zoneCanvas")) {
+  $("zoneCanvas").onclick = (ev) => {
+    const r = ev.target.getBoundingClientRect();
+    const x = Math.max(0, Math.min(1, (ev.clientX - r.left) / r.width));
+    const y = Math.max(0, Math.min(1, (ev.clientY - r.top) / r.height));
+    draftZonePoints.push([Number(x.toFixed(4)), Number(y.toFixed(4))]);
+    renderZoneCanvas();
+  };
+}
+if ($("btnDrawSafeZone")) {
+  $("btnDrawSafeZone").onclick = () => setVideoClickMode(videoClickMode === "safe_zone" ? "toggle" : "safe_zone");
+}
+if ($("btnDrawObstruction")) {
+  $("btnDrawObstruction").onclick = () => setVideoClickMode(videoClickMode === "obstruction" ? "toggle" : "obstruction");
+}
+if ($("btnFinishZone")) {
+  $("btnFinishZone").onclick = async () => {
+    if (draftZonePoints.length < 3) {
+      return toast("Click at least 3 points on the video to form a polygon");
+    }
+    const next = {
+      safe_zone: savedStageZones.safe_zone || [],
+      obstruction_zones: [...(savedStageZones.obstruction_zones || [])],
+    };
+    if (videoClickMode === "safe_zone") {
+      next.safe_zone = draftZonePoints;
+    } else if (videoClickMode === "obstruction") {
+      next.obstruction_zones.push({
+        name: `Obstruction ${(next.obstruction_zones.length || 0) + 1}`,
+        points: draftZonePoints,
+      });
+    }
+    try {
+      const res = await post("/api/stage-zones", next);
+      savedStageZones = { safe_zone: res.safe_zone, obstruction_zones: res.obstruction_zones };
+      setVideoClickMode("toggle");
+      toast("📐 Stage polygon saved & active on live stream");
+    } catch (e) {
+      toast(e.message);
+    }
+  };
+}
+if ($("btnClearZones")) {
+  $("btnClearZones").onclick = async () => {
+    try {
+      const res = await post("/api/stage-zones", { safe_zone: [], obstruction_zones: [] });
+      savedStageZones = { safe_zone: res.safe_zone, obstruction_zones: res.obstruction_zones };
+      setVideoClickMode("toggle");
+      toast("📐 Stage zones cleared");
+    } catch (e) {
+      toast(e.message);
+    }
+  };
+}
+
+
+/* ---------------------------------------------------------------------------
+ * Time-Machine Replay Mining (#4b) & AI Tournament Finals (#4a)
+ * ------------------------------------------------------------------------- */
+
+if ($("btnMineBuffer")) {
+  $("btnMineBuffer").onclick = async () => {
+    const btn = $("btnMineBuffer");
+    btn.disabled = true;
+    btn.textContent = "⏪ Mining…";
+    try {
+      const secs = Math.max(15, Number($("sldBuffer").value) || 60);
+      const r = await post("/api/buffer/mine", { seconds: secs, max_picks: 4 });
+      if (r.captures) renderGallery(r.captures);
+      toast(r.saved_count
+        ? `⏪ Time-Machine extracted ${r.saved_count} best shot${r.saved_count === 1 ? "" : "s"} from the buffer!`
+        : "⏪ No qualified speaker moments found in the current replay buffer.");
+    } catch (e) {
+      toast("Mine failed: " + e.message);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "⏪ Mine Last 60s";
+    }
+  };
+}
+
+if ($("btnRunAiFinals")) {
+  $("btnRunAiFinals").onclick = async () => {
+    const btn = $("btnRunAiFinals");
+    btn.disabled = true;
+    btn.textContent = "🏆 Judging Finals…";
+    try {
+      const r = await post("/api/captures/ai-finals", {});
+      if (r.captures) renderGallery(r.captures);
+      toast(`🏆 Finals Winner: ${r.winner_filename || "#" + r.winner_index} — ${r.reasoning || ""}`);
+    } catch (e) {
+      toast("AI Finals: " + e.message);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "🏆 Run AI Finals";
+    }
+  };
+}
+
+
+/* ---------------------------------------------------------------------------
+ * ML Brain Inspector & Bootstrap from Past Winners Folder (ML-1..6)
+ * ------------------------------------------------------------------------- */
+
+async function loadMlBrain() {
+  try {
+    const d = await fetch("/api/ml/brain").then((r) => r.json());
+    renderMlBrain(d);
+  } catch (e) {
+    if ($("mlBrainStats")) $("mlBrainStats").textContent = "⚠ " + e.message;
+  }
+}
+
+function renderMlBrain(d) {
+  const stats = $("mlBrainStats");
+  if (stats) {
+    const ens = d.ensemble_active ? "Linear + GradientBoost + Pairwise" : "Linear + Pairwise";
+    stats.innerHTML = d.is_trained
+      ? `✓ <b>Trained (${ens})</b> — Samples: <b>${d.sample_count}</b> (⭐ ${d.likes} / 👎 ${d.rejects} · ${d.pairwise_count || 0} pairs · ${d.visual_sample_count || 0} visual crops) | CV Accuracy: <b>${Math.round((d.confidence || 0) * 100)}%</b> | Effective Trust: <b>${Math.round((d.trust || 0) * 100)}%</b>`
+      : `⏳ <b>Warming Up</b> — Samples: <b>${d.sample_count || 0}</b> (need ≥ 10 with both ⭐ Best and 👎 Bad, or bootstrap from a folder below)`;
+  }
+  if ($("mlBackboneInfo") && d.visual_backbone) {
+    const vb = d.visual_backbone;
+    $("mlBackboneInfo").textContent = `Visual Embedder: ${vb.backend} (${vb.dim}-D)`;
+  }
+
+  const drv = $("mlDriversList");
+  if (drv) {
+    drv.innerHTML = "";
+    const list = (d.top_drivers || []).slice(0, 8);
+    if (!list.length) {
+      drv.innerHTML = '<div class="muted">Feature weights appear once at least 10 ratings are recorded.</div>';
+    } else {
+      list.forEach((item) => {
+        const row = document.createElement("div");
+        row.className = "ml-driver-row";
+        const pct = Math.min(100, Math.max(6, Math.round(Math.abs(item.rel_strength || 0) * 100)));
+        const isPos = item.weight >= 0;
+        row.innerHTML = `
+          <span>${escHtml(item.label)}</span>
+          <div class="ml-driver-track"><div class="ml-driver-fill ${isPos ? "pos" : "neg"}" style="width:${pct}%"></div></div>
+          <span style="text-align:right;color:${isPos ? "#4ade80" : "#f87171"}">${isPos ? "+" : ""}${Number(item.weight).toFixed(2)}</span>
+        `;
+        drv.appendChild(row);
+      });
+    }
+  }
+
+  const rec = $("mlRecentList");
+  if (rec) {
+    rec.innerHTML = "";
+    const items = d.recent_ratings || [];
+    if (!items.length) {
+      rec.innerHTML = '<div class="muted">No ratings recorded yet.</div>';
+    } else {
+      items.forEach((r) => {
+        const el = document.createElement("div");
+        el.className = "ml-recent-item";
+        const icon = r.favorite ? "⭐" : "👎";
+        const note = [r.source, r.filename, (r.reasons || []).join(", "), r.comment].filter(Boolean).join(" · ");
+        const txt = document.createElement("span");
+        txt.style.flex = "1";
+        txt.textContent = `${icon} ${note}`;
+
+        const flipBtn = document.createElement("button");
+        flipBtn.className = "btn-mini";
+        flipBtn.textContent = "⇄ Flip";
+        flipBtn.onclick = async () => {
+          try {
+            const res = await post("/api/ml/flip", { sample_id: r.id });
+            renderMlBrain(res);
+            toast("⇄ Rating flipped & model refit");
+          } catch (err) { toast(err.message); }
+        };
+
+        const undoBtn = document.createElement("button");
+        undoBtn.className = "btn-mini";
+        undoBtn.textContent = "✕ Undo";
+        undoBtn.onclick = async () => {
+          try {
+            const res = await post("/api/ml/undo", { sample_id: r.id });
+            renderMlBrain(res);
+            toast("✕ Rating removed & model refit");
+          } catch (err) { toast(err.message); }
+        };
+
+        el.append(txt, flipBtn, undoBtn);
+        rec.appendChild(el);
+      });
+    }
+  }
+}
+
+if ($("btnOpenBrain")) {
+  $("btnOpenBrain").onclick = () => {
+    $("mlBrainModal").classList.remove("hidden");
+    loadMlBrain();
+  };
+}
+if ($("btnBrainCloseX")) $("btnBrainCloseX").onclick = () => $("mlBrainModal").classList.add("hidden");
+if ($("btnBrainClose")) $("btnBrainClose").onclick = () => $("mlBrainModal").classList.add("hidden");
+
+if ($("btnRunBootstrap")) {
+  $("btnRunBootstrap").onclick = async () => {
+    const path = $("mlBootstrapPath") ? $("mlBootstrapPath").value.trim() : "";
+    if (!path) return toast("Select or enter a folder of past winning thumbnails first");
+    const btn = $("btnRunBootstrap");
+    btn.disabled = true;
+    btn.textContent = "Training…";
+    try {
+      const res = await post("/api/ml/bootstrap-folder", { path, max_images: 80 });
+      if (res.brain) renderMlBrain(res.brain);
+      else loadMlBrain();
+      toast(`🚀 Bootstrapped from ${res.added_positives} past winners!`);
+    } catch (e) {
+      toast("Bootstrap failed: " + e.message);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "🚀 Train from Folder";
+    }
+  };
+}
+
+if ($("btnWarmModels")) {
+  $("btnWarmModels").onclick = async () => {
+    const btn = $("btnWarmModels");
+    btn.disabled = true;
+    btn.textContent = "Downloading & Pinning…";
+    try {
+      await post("/api/postprocess/warm-models", {});
+      toast("⚡ Neural ONNX models warmed & pinned in RAM");
+      loadMlBrain();
+    } catch (e) {
+      toast("Warm models error: " + e.message);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "⚡ Warm / Download Neural Models (RAM Pin)";
+    }
+  };
+}
+
+if ($("btnMlReset")) {
+  $("btnMlReset").onclick = async () => {
+    if (!window.confirm("Reset all learned ML ratings, visual prototypes, and comment rules?")) return;
+    try {
+      const res = await post("/api/ml/reset", {});
+      renderMlBrain(res);
+      toast("🗑 ML Brain reset");
+    } catch (e) {
+      toast(e.message);
+    }
+  };
+}
+
+
+/* ---------------------------------------------------------------------------
+ * ±15-Frame Burst Micro-Scrub & 100% Zoom Loupe (#7)
+ * ------------------------------------------------------------------------- */
+
+let burstTargetFilename = "";
+let burstFramesMeta = [];
+let burstCurrentIdx = 0;
+
+async function openBurstModal(filename) {
+  burstTargetFilename = filename;
+  $("burstModal").classList.remove("hidden");
+  $("burstStrip").innerHTML = "";
+  $("burstStatusNote").textContent = "Loading cached high-res burst frames…";
+  try {
+    const d = await fetch(`/api/captures/${encodeURIComponent(filename)}/burst`).then((r) => r.json());
+    if (!d.available || !(d.frames || []).length) {
+      $("burstMainImg").src = `/captures/${encodeURIComponent(filename)}?t=${Date.now()}`;
+      $("sldBurstScrub").min = 0;
+      $("sldBurstScrub").max = 0;
+      $("sldBurstScrub").value = 0;
+      $("burstOffsetLabel").textContent = "Single frame";
+      $("burstStatusNote").textContent = "Increase Time-Machine Frame Buffer (>5s) to cache ±15 neighbor frames on new captures.";
+      $("btnBurstSelect").disabled = true;
+      return;
+    }
+    $("btnBurstSelect").disabled = false;
+    burstFramesMeta = d.frames;
+    burstCurrentIdx = d.selected_idx || 0;
+    const sld = $("sldBurstScrub");
+    sld.min = 0;
+    sld.max = Math.max(0, burstFramesMeta.length - 1);
+    sld.value = burstCurrentIdx;
+    $("burstStatusNote").textContent = `${burstFramesMeta.length} high-res frames cached in RAM — hover image for 100% zoom loupe.`;
+
+    const strip = $("burstStrip");
+    burstFramesMeta.forEach((fm) => {
+      const item = document.createElement("div");
+      item.className = "burst-thumb" + (fm.index === burstCurrentIdx ? " active" : "");
+      const im = document.createElement("img");
+      im.src = `/api/captures/${encodeURIComponent(filename)}/burst/${fm.index}`;
+      const lbl = document.createElement("div");
+      lbl.textContent = (fm.offset_ms >= 0 ? "+" : "") + fm.offset_ms + "ms";
+      item.append(im, lbl);
+      item.onclick = () => setBurstPreviewIndex(fm.index);
+      strip.appendChild(item);
+    });
+    setBurstPreviewIndex(burstCurrentIdx);
+  } catch (e) {
+    $("burstStatusNote").textContent = "⚠ " + e.message;
+  }
+}
+
+function setBurstPreviewIndex(idx) {
+  burstCurrentIdx = idx;
+  $("sldBurstScrub").value = idx;
+  const fm = burstFramesMeta[idx];
+  const url = `/api/captures/${encodeURIComponent(burstTargetFilename)}/burst/${idx}`;
+  $("burstMainImg").src = url;
+  if ($("burstLoupe")) $("burstLoupe").style.backgroundImage = `url("${url}")`;
+  $("burstOffsetLabel").textContent = fm
+    ? `${fm.offset_ms >= 0 ? "+" : ""}${fm.offset_ms} ms`
+    : `#${idx}`;
+  [...$("burstStrip").children].forEach((el, i) => el.classList.toggle("active", i === idx));
+}
+
+if ($("sldBurstScrub")) {
+  $("sldBurstScrub").oninput = (e) => setBurstPreviewIndex(Number(e.target.value));
+}
+if ($("btnBurstSelect")) {
+  $("btnBurstSelect").onclick = async () => {
+    if (!burstTargetFilename) return;
+    const btn = $("btnBurstSelect");
+    btn.disabled = true;
+    try {
+      const r = await post(`/api/captures/${encodeURIComponent(burstTargetFilename)}/burst/${burstCurrentIdx}/select`, {});
+      if (r.captures) renderGallery(r.captures);
+      $("burstModal").classList.add("hidden");
+      toast(`✅ Swapped to frame #${burstCurrentIdx} (Score ${Math.round((r.score || 0) * 100)}%) & recorded ML preference!`);
+    } catch (e) {
+      toast("Swap failed: " + e.message);
+    } finally {
+      btn.disabled = false;
+    }
+  };
+}
+if ($("btnBurstCloseX")) $("btnBurstCloseX").onclick = () => $("burstModal").classList.add("hidden");
+if ($("btnBurstClose")) $("btnBurstClose").onclick = () => $("burstModal").classList.add("hidden");
+
+// 100% Pixel Zoom Loupe on hover
+if ($("burstStage") && $("burstMainImg") && $("burstLoupe")) {
+  const stage = $("burstStage");
+  const img = $("burstMainImg");
+  const loupe = $("burstLoupe");
+  stage.addEventListener("mousemove", (ev) => {
+    if (!img.naturalWidth || !img.src) return;
+    const r = img.getBoundingClientRect();
+    const sr = stage.getBoundingClientRect();
+    if (ev.clientX < r.left || ev.clientX > r.right || ev.clientY < r.top || ev.clientY > r.bottom) {
+      loupe.classList.add("hidden");
+      return;
+    }
+    loupe.classList.remove("hidden");
+    loupe.style.backgroundImage = `url("${img.src}")`;
+    loupe.style.backgroundSize = `${img.naturalWidth}px ${img.naturalHeight}px`;
+    const fx = (ev.clientX - r.left) / r.width;
+    const fy = (ev.clientY - r.top) / r.height;
+    const bgX = Math.round(fx * img.naturalWidth - 85);
+    const bgY = Math.round(fy * img.naturalHeight - 85);
+    loupe.style.backgroundPosition = `${-bgX}px ${-bgY}px`;
+    loupe.style.left = `${Math.min(sr.width - 176, Math.max(6, ev.clientX - sr.left - 85))}px`;
+    loupe.style.top = `${Math.min(sr.height - 176, Math.max(6, ev.clientY - sr.top - 85))}px`;
+  });
+  stage.addEventListener("mouseleave", () => loupe.classList.add("hidden"));
+}
+
+
+/* ---------------------------------------------------------------------------
+ * Sermon Title & Pull-Quote Generator (#8)
+ * ------------------------------------------------------------------------- */
+
+if ($("btnOpenSermonNotes")) {
+  $("btnOpenSermonNotes").onclick = async () => {
+    $("sermonNotesModal").classList.remove("hidden");
+    try {
+      const r = await fetch("/api/sermon-notes/latest").then((res) => res.json());
+      if (r.notes && (r.notes.titles || []).length) renderSermonNotes(r.notes);
+    } catch (_) {}
+  };
+}
+if ($("btnSermonCloseX")) $("btnSermonCloseX").onclick = () => $("sermonNotesModal").classList.add("hidden");
+if ($("btnSermonClose")) $("btnSermonClose").onclick = () => $("sermonNotesModal").classList.add("hidden");
+
+document.querySelectorAll('input[name="sermonSrc"]').forEach((rad) => {
+  rad.onchange = () => {
+    const val = document.querySelector('input[name="sermonSrc"]:checked')?.value || "live";
+    if ($("sermonVideoRow")) $("sermonVideoRow").classList.toggle("hidden", val !== "video");
+    if ($("sermonTranscriptInput")) $("sermonTranscriptInput").classList.toggle("hidden", val !== "transcript");
+  };
+});
+if ($("btnSermonBrowseVideo")) {
+  $("btnSermonBrowseVideo").onclick = () => openVideoBrowser("sermon");
+}
+
+function renderSermonNotes(d) {
+  $("sermonResultsWrap").classList.remove("hidden");
+  const tWrap = $("sermonTitlesList");
+  tWrap.innerHTML = "";
+  (d.titles || []).forEach((t) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "sermon-copy-item";
+    b.innerHTML = `<b>${escHtml(t)}</b><span class="muted" style="font-size:11px">📋 Copy</span>`;
+    b.onclick = () => {
+      navigator.clipboard?.writeText(t);
+      toast(`📋 Copied title: "${t}"`);
+    };
+    tWrap.appendChild(b);
+  });
+
+  const qWrap = $("sermonQuotesList");
+  qWrap.innerHTML = "";
+  (d.quotes || []).forEach((q) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "sermon-copy-item";
+    b.innerHTML = `<span>"${escHtml(q)}"</span><span class="muted" style="font-size:11px">📋 Copy</span>`;
+    b.onclick = () => {
+      navigator.clipboard?.writeText(q);
+      toast("📋 Pull-quote copied");
+    };
+    qWrap.appendChild(b);
+  });
+
+  $("sermonSummaryText").textContent = d.summary || "";
+}
+
+if ($("btnGenSermonNotes")) {
+  $("btnGenSermonNotes").onclick = async () => {
+    const source = document.querySelector('input[name="sermonSrc"]:checked')?.value || "live";
+    const video_path = $("sermonVideoPath") ? $("sermonVideoPath").value.trim() : "";
+    const transcript = $("sermonTranscriptInput") ? $("sermonTranscriptInput").value.trim() : "";
+    const btn = $("btnGenSermonNotes");
+    btn.disabled = true;
+    $("sermonGenStatus").textContent = "Transcribing & generating via Ollama…";
+    try {
+      const r = await post("/api/sermon-notes/generate", { source, video_path, transcript });
+      renderSermonNotes(r);
+      $("sermonGenStatus").textContent = r.notes_file ? `Saved to ${r.notes_file}` : `Generated (${r.source})`;
+      toast("📝 Sermon titles & pull-quotes ready!");
+    } catch (e) {
+      $("sermonGenStatus").textContent = "⚠ " + e.message;
+      toast(e.message);
+    } finally {
+      btn.disabled = false;
+    }
+  };
+}
+
+
+/* ---------------------------------------------------------------------------
+ * Sony SRG-A40 PTZ & AI Auto-Framing Controls (#10)
+ * ------------------------------------------------------------------------- */
+
+document.querySelectorAll("[data-ptz-move]").forEach((btn) => {
+  btn.onclick = () => {
+    const direction = btn.getAttribute("data-ptz-move");
+    post("/api/ptz/move", { direction, speed: 8, duration_ms: 260 })
+      .catch((e) => toast("PTZ: " + e.message));
+  };
+});
+document.querySelectorAll("[data-ptz-zoom]").forEach((btn) => {
+  btn.onclick = () => {
+    const direction = btn.getAttribute("data-ptz-zoom");
+    post("/api/ptz/zoom", { direction, speed: 4, duration_ms: 240 })
+      .catch((e) => toast("PTZ Zoom: " + e.message));
+  };
+});
+document.querySelectorAll("[data-ptz-preset]").forEach((btn) => {
+  btn.onclick = () => {
+    const preset_id = Number(btn.getAttribute("data-ptz-preset"));
+    post("/api/ptz/preset", { preset_id, action: "recall" })
+      .then(() => toast(`🎮 Recalled Camera Preset ${preset_id}`))
+      .catch((e) => toast("Preset: " + e.message));
+  };
+});
+if ($("btnPtzHome")) {
+  $("btnPtzHome").onclick = () =>
+    post("/api/ptz/home", {}).then(() => toast("⌂ Camera Homing")).catch((e) => toast("PTZ: " + e.message));
+}
+if ($("btnPtzAutoOn")) {
+  $("btnPtzAutoOn").onclick = () =>
+    post("/api/ptz/auto-framing", { enabled: true })
+      .then(() => {
+        if ($("ptzStatusLabel")) $("ptzStatusLabel").textContent = "AI Framing: ON";
+        toast("🤖 Sony AI Auto-Framing ENABLED");
+      })
+      .catch((e) => toast("Sony AI Framing: " + e.message));
+}
+if ($("btnPtzAutoOff")) {
+  $("btnPtzAutoOff").onclick = () =>
+    post("/api/ptz/auto-framing", { enabled: false })
+      .then(() => {
+        if ($("ptzStatusLabel")) $("ptzStatusLabel").textContent = "AI Framing: OFF";
+        toast("🎮 Sony AI Auto-Framing paused (Manual PTZ)");
+      })
+      .catch((e) => toast("Sony AI Framing: " + e.message));
+}
 
 connect();
 checkInitialScanState();

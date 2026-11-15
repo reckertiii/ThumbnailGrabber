@@ -2,6 +2,7 @@ import os
 import cv2
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Optional, Callable, List, Dict, Any, Tuple
 import numpy as np
@@ -9,6 +10,7 @@ import numpy as np
 from config import AppConfig, QualityWeights, QualityThresholds
 from analyzer import PersonQualityAnalyzer, AnalysisResult
 from stream_processor import CapturedScreenshot, write_capture, subject_crop_rect
+from postprocess import cutout_path_for
 from ai_judge import AIJudge, JudgeVerdict
 
 @dataclass
@@ -65,9 +67,17 @@ class VideoRecordingScanner:
     and extracts the highest-quality thumbnails / best screenshots.
     """
 
-    def __init__(self, config: Optional[AppConfig] = None, judge: Optional[AIJudge] = None):
+    def __init__(
+        self,
+        config: Optional[AppConfig] = None,
+        judge: Optional[AIJudge] = None,
+        speaker_id: Any = None,
+        stage_zones: Any = None,
+        burst_cache_callback: Optional[Callable[..., None]] = None,
+    ):
         self.config = config or AppConfig()
         self.judge = judge if judge is not None else AIJudge(self.config)
+        self.burst_cache_callback = burst_cache_callback
         self.analyzer = PersonQualityAnalyzer(
             self.config.weights,
             self.config.thresholds,
@@ -84,7 +94,33 @@ class VideoRecordingScanner:
             require_exact_people_count=getattr(self.config, "require_exact_people_count", False),
             capture_prop_moments=getattr(self.config, "capture_prop_moments", True),
             fast_reject=True,
+            speaker_id=speaker_id,
+            stage_zones=stage_zones,
         )
+
+    def _build_worker_analyzer(self, frame_step: int) -> PersonQualityAnalyzer:
+        worker = PersonQualityAnalyzer(
+            self.config.weights,
+            self.config.thresholds,
+            ema_alpha=self.config.ema_alpha,
+            stability_window=self.config.score_stability_window,
+            stability_threshold=self.config.score_stability_threshold,
+            blink_suppression_ms=self.config.blink_suppression_ms,
+            max_people_target=self.analyzer.max_people_target,
+            selected_person_ids=list(self.analyzer.selected_person_ids),
+            require_temporal_stability=False,
+            pose_hand_interval=2,
+            use_ml_preference=getattr(self.config, "use_ml_preference", True),
+            ml_weight=getattr(self.config, "ml_weight", 0.35),
+            require_exact_people_count=self.analyzer.require_exact_people_count,
+            capture_prop_moments=getattr(self.analyzer, "capture_prop_moments", True),
+            fast_reject=True,
+            speaker_id=getattr(self.analyzer, "speaker_id", None),
+            stage_zones=getattr(self.analyzer, "stage_zones", None),
+        )
+        worker.preference_model = self.analyzer.preference_model
+        worker._face_persistence_frames = 0 if frame_step > 1 else 2
+        return worker
 
     @staticmethod
     def get_video_info(video_path: str) -> Optional[VideoInfo]:
@@ -186,6 +222,7 @@ class VideoRecordingScanner:
         cancel_event: Optional[threading.Event] = None,
         start_sec: float = 0.0,
         end_sec: Optional[float] = None,
+        workers: Optional[int] = None,
     ) -> List[CapturedScreenshot]:
         """Scans the video file, analyzes sampled frames, selects the top diverse thumbnails,
         and saves them to output_dir.
@@ -328,72 +365,172 @@ class VideoRecordingScanner:
 
         last_progress_emit = time.time()
 
-        while current_frame_idx < end_frame:
-            if cancel_event and cancel_event.is_set():
-                break
+        # Resolve worker count for parallel video scanning (#4c)
+        cfg_workers = int(getattr(self.config, "scan_workers", 0) or 0)
+        if workers is not None:
+            eff_workers = max(1, min(8, int(workers)))
+            use_parallel = eff_workers > 1 and span_frames >= eff_workers * max(2, frame_step)
+        else:
+            eff_workers = cfg_workers if cfg_workers > 0 else min(4, max(1, (os.cpu_count() or 2) // 2))
+            use_parallel = eff_workers > 1 and span_frames >= 240
 
-            # Skip intermediate frames without decoding BGR pixels or running full-frame
-            # Laplacian filters. cap.grab() advances the demuxer/decoder state in <0.1ms,
-            # whereas cap.read() + BGR conversion + 1080p Laplacian on every skipped frame
-            # bottlenecks 60fps 1080p videos to ~0.5x real-time (~1 hour for a 36m video).
-            if (current_frame_idx - start_frame) % frame_step != 0:
-                if not cap.grab():
+        if use_parallel:
+            cap.release()
+            prog_lock = threading.Lock()
+            frames_done_shared = 0
+
+            # Partition [start_frame, end_frame) into eff_workers step-aligned chunks
+            raw_chunk = max(frame_step, span_frames // eff_workers)
+            aligned_chunk = max(frame_step, (raw_chunk // frame_step) * frame_step)
+            ranges: List[Tuple[int, int]] = []
+            c_start = start_frame
+            for w_i in range(eff_workers):
+                c_end = end_frame if w_i == eff_workers - 1 else min(end_frame, c_start + aligned_chunk)
+                if c_start < c_end:
+                    ranges.append((c_start, c_end))
+                c_start = c_end
+
+            def _scan_chunk(chunk_range: Tuple[int, int]) -> List[ScannedCandidate]:
+                nonlocal frames_analyzed, frames_done_shared, last_progress_emit
+                nonlocal champion_score, champion_frame, champion_analysis
+                ch_start, ch_end = chunk_range
+                local_cands: Dict[int, ScannedCandidate] = {}
+                w_cap = cv2.VideoCapture(video_path)
+                if not w_cap.isOpened():
+                    return []
+                try:
+                    if ch_start > 0:
+                        w_cap.set(cv2.CAP_PROP_POS_FRAMES, ch_start)
+                    w_analyzer = self._build_worker_analyzer(frame_step)
+                    idx = ch_start
+                    while idx < ch_end:
+                        if cancel_event and cancel_event.is_set():
+                            break
+                        if (idx - start_frame) % frame_step != 0:
+                            if not w_cap.grab():
+                                break
+                            with prog_lock:
+                                frames_done_shared += 1
+                            idx += 1
+                            continue
+                        ret_w, frm_w = w_cap.read()
+                        if not ret_w or frm_w is None:
+                            break
+                        t_sec = idx / video_fps
+                        analysis_w = w_analyzer.analyze_frame(frm_w)
+                        cand_w = None
+                        if analysis_w.face_detected:
+                            cand_w = ScannedCandidate(
+                                frame_idx=idx,
+                                timestamp_sec=t_sec,
+                                timestamp_str=self.format_timestamp(t_sec),
+                                frame=frm_w.copy(),
+                                analysis=analysis_w,
+                                overall_score=analysis_w.overall_score,
+                                meets_min_score=(analysis_w.is_qualified and analysis_w.overall_score >= min_score),
+                            )
+                            b_key = int(cand_w.timestamp_sec / bucket_sec)
+                            prev_b = local_cands.get(b_key)
+                            if prev_b is None or cand_w.rank_score > prev_b.rank_score:
+                                local_cands[b_key] = cand_w
+
+                        with prog_lock:
+                            frames_done_shared += 1
+                            frames_analyzed += 1
+                            if cand_w is not None and cand_w.overall_score > champion_score:
+                                champion_score = cand_w.overall_score
+                                champion_frame = cand_w.frame
+                                champion_analysis = cand_w.analysis
+                            now_w = time.time()
+                            if progress_callback and (now_w - last_progress_emit >= 0.20):
+                                last_progress_emit = now_w
+                                el = max(0.001, now_w - start_time)
+                                spd = frames_done_shared / el
+                                rem = max(0, span_frames - frames_done_shared)
+                                pct_w = min(100.0, (frames_done_shared / float(span_frames)) * 100.0)
+                                progress_callback(ScanProgress(
+                                    status="scanning",
+                                    progress_pct=pct_w,
+                                    current_frame_idx=min(end_frame, start_frame + frames_done_shared),
+                                    total_frames=end_frame,
+                                    current_time_sec=min(end_s, (start_frame + frames_done_shared) / video_fps),
+                                    total_duration_sec=end_s,
+                                    fps_speed=spd,
+                                    estimated_time_remaining_sec=(rem / spd if spd > 0 else 0.0),
+                                    total_candidates_analyzed=frames_analyzed,
+                                    best_score_found=champion_score,
+                                    current_frame=frm_w,
+                                    champion_frame=champion_frame,
+                                    champion_analysis=champion_analysis,
+                                ))
+                        idx += 1
+                finally:
+                    w_cap.release()
+                return list(local_cands.values())
+
+            with ThreadPoolExecutor(max_workers=len(ranges)) as pool_exec:
+                for chunk_cands in pool_exec.map(_scan_chunk, ranges):
+                    for c_item in chunk_cands:
+                        _consider(c_item)
+            current_frame_idx = min(end_frame, start_frame + frames_done_shared)
+        else:
+            while current_frame_idx < end_frame:
+                if cancel_event and cancel_event.is_set():
                     break
+
+                if (current_frame_idx - start_frame) % frame_step != 0:
+                    if not cap.grab():
+                        break
+                    current_frame_idx += 1
+                    continue
+
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    break
+
+                current_time_sec = current_frame_idx / video_fps
+
+                frames_analyzed += 1
+                _analyze_and_collect(current_frame_idx, current_time_sec, frame)
+
+                now = time.time()
+                if now - last_progress_emit >= 0.20 or current_frame_idx >= end_frame - frame_step:
+                    last_progress_emit = now
+                    elapsed = now - start_time
+                    frames_done = max(1, current_frame_idx - start_frame + 1)
+                    fps_speed = frames_done / elapsed if elapsed > 0 else 0.0
+                    
+                    frames_remaining = max(0, end_frame - current_frame_idx)
+                    eta_sec = frames_remaining / fps_speed if fps_speed > 0 else 0.0
+                    pct = min(100.0, ((current_frame_idx - start_frame) / float(span_frames)) * 100.0)
+
+                    if progress_callback:
+                        progress_callback(ScanProgress(
+                            status="scanning",
+                            progress_pct=pct,
+                            current_frame_idx=current_frame_idx,
+                            total_frames=end_frame,
+                            current_time_sec=current_time_sec,
+                            total_duration_sec=end_s,
+                            fps_speed=fps_speed,
+                            estimated_time_remaining_sec=eta_sec,
+                            total_candidates_analyzed=frames_analyzed,
+                            best_score_found=champion_score,
+                            current_frame=frame,
+                            champion_frame=champion_frame,
+                            champion_analysis=champion_analysis,
+                        ))
+
                 current_frame_idx += 1
-                continue
 
-            # Decode only the sampled frame
-            ret, frame = cap.read()
-            if not ret or frame is None:
-                break
-
-            current_time_sec = current_frame_idx / video_fps
-
-            frames_analyzed += 1
-            _analyze_and_collect(current_frame_idx, current_time_sec, frame)
-
-            # Progress notification throttled to ~5 updates/sec
-            now = time.time()
-            if now - last_progress_emit >= 0.20 or current_frame_idx >= end_frame - frame_step:
-                last_progress_emit = now
-                elapsed = now - start_time
-                frames_done = max(1, current_frame_idx - start_frame + 1)
-                fps_speed = frames_done / elapsed if elapsed > 0 else 0.0
-                
-                frames_remaining = max(0, end_frame - current_frame_idx)
-                eta_sec = frames_remaining / fps_speed if fps_speed > 0 else 0.0
-                pct = min(100.0, ((current_frame_idx - start_frame) / float(span_frames)) * 100.0)
-
-                if progress_callback:
-                    progress_callback(ScanProgress(
-                        status="scanning",
-                        progress_pct=pct,
-                        current_frame_idx=current_frame_idx,
-                        total_frames=end_frame,
-                        current_time_sec=current_time_sec,
-                        total_duration_sec=end_s,
-                        fps_speed=fps_speed,
-                        estimated_time_remaining_sec=eta_sec,
-                        total_candidates_analyzed=frames_analyzed,
-                        best_score_found=champion_score,
-                        current_frame=frame,
-                        champion_frame=champion_frame,
-                        champion_analysis=champion_analysis,
-                    ))
-
-            current_frame_idx += 1
-
-        cap.release()
+            cap.release()
 
         # Check if cancelled
         is_cancelled = cancel_event.is_set() if cancel_event else False
 
         # === Non-Maximum Suppression (Temporal Diversity Filtering) ===
-        # Filter candidate frames so that picked thumbnails aren't all clustered in the same second
         pool = list(buckets.values())
         if self.judge.available and pool and not is_cancelled:
-            # Review a short list of finalists — twice the requested count, spaced out —
-            # rather than every bucket, so a long recording costs a handful of calls.
             finalists = self._select_diverse_top_candidates(
                 pool, top_n=top_n * 2, min_interval_sec=min_interval_sec
             )
@@ -405,38 +542,98 @@ class VideoRecordingScanner:
             pool, top_n=top_n, min_interval_sec=min_interval_sec
         )
 
+        # Optional side-by-side Contact-Sheet Tournament Finals pass (#4a)
+        finals_badges: Dict[int, str] = {}
+        if (
+            self.judge.available
+            and not is_cancelled
+            and len(selected_candidates) >= 2
+            and bool(getattr(self.config, "ai_judge_finals_enabled", True))
+        ):
+            crops_finals = []
+            for sc in selected_candidates[:8]:
+                fh, fw = sc.frame.shape[:2]
+                f_rect = subject_crop_rect(sc.analysis, fw, fh, self.config.subject_crop_padding)
+                crops_finals.append(
+                    sc.frame if f_rect is None else sc.frame[f_rect[1]:f_rect[1] + f_rect[3], f_rect[0]:f_rect[0] + f_rect[2]]
+                )
+            pm = getattr(getattr(self, "analyzer", None), "preference_model", None)
+            fb_prompt = pm.get_judge_feedback_prompt() if pm is not None and hasattr(pm, "get_judge_feedback_prompt") else ""
+            fv = self.judge.judge_finals(crops_finals, user_feedback_prompt=fb_prompt)
+            if fv is not None:
+                wi = int(fv.winner_index) - 1
+                if 0 <= wi < len(selected_candidates):
+                    finals_badges[wi] = "#1 Overall"
+                si = int(fv.best_smile_index) - 1
+                if 0 <= si < len(selected_candidates):
+                    finals_badges[si] = f"{finals_badges[si]} · Best Smile" if si in finals_badges else "Best Smile"
+                gi = int(fv.best_gesture_index) - 1
+                if 0 <= gi < len(selected_candidates):
+                    finals_badges[gi] = f"{finals_badges[gi]} · Best Gesture" if gi in finals_badges else "Best Gesture"
+
         # Save selected thumbnails to disk
         video_base_name = os.path.splitext(info.filename)[0]
         results: List[CapturedScreenshot] = []
 
-        for rank_idx, cand in enumerate(selected_candidates, 1):
-            score_int = int(round(cand.overall_score * 100))
-            is_prop = bool(
-                getattr(cand.analysis, "is_prop_moment", False) or
-                (cand.verdict is not None and getattr(cand.verdict, "holding_prop", False) and getattr(self.config, "capture_prop_moments", True))
-            )
-            prop_tag = "_prop" if is_prop else ""
-            base_name = f"{video_base_name}_ts_{cand.timestamp_str}_rank{rank_idx}{prop_tag}_score{score_int}"
+        burst_cap = cv2.VideoCapture(video_path) if (self.burst_cache_callback and selected_candidates and not is_cancelled) else None
+        half_burst = max(3, int(getattr(self.config, "burst_filmstrip_frames", 15) or 15))
 
-            out_filepath, crop_path = write_capture(
-                cand.frame, cand.analysis, out_dir, base_name, self.config
-            )
+        try:
+            for idx_zero, cand in enumerate(selected_candidates):
+                rank_idx = idx_zero + 1
+                score_int = int(round(cand.overall_score * 100))
+                is_prop = bool(
+                    getattr(cand.analysis, "is_prop_moment", False) or
+                    (cand.verdict is not None and getattr(cand.verdict, "holding_prop", False) and getattr(self.config, "capture_prop_moments", True))
+                )
+                if is_prop and not getattr(cand.analysis, "mood_bucket", ""):
+                    cand.analysis.mood_bucket = "prop"
+                prop_tag = "_prop" if is_prop else ""
+                base_name = f"{video_base_name}_ts_{cand.timestamp_str}_rank{rank_idx}{prop_tag}_score{score_int}"
 
-            cap_item = CapturedScreenshot(
-                filepath=out_filepath,
-                timestamp_str=cand.timestamp_str,
-                overall_score=cand.overall_score,
-                analysis=cand.analysis,
-                crop_filepath=crop_path,
-                captured_at=cand.timestamp_sec,
-                heuristic_score=cand.heuristic_score,
-                judge_score=(float(cand.verdict.score) if cand.verdict else None),
-                judge_summary=(cand.verdict.summary if cand.verdict else ""),
-                judge_issues=(list(cand.verdict.issues) if cand.verdict else []),
-                is_prop_moment=is_prop,
-                from_video_scan=True,
-            )
-            results.append(cap_item)
+                out_filepath, crop_path = write_capture(
+                    cand.frame, cand.analysis, out_dir, base_name, self.config
+                )
+                cpath = cutout_path_for(out_filepath)
+                cutout_fp = cpath if os.path.isfile(cpath) else None
+                mood_b = str(getattr(cand.analysis, "mood_bucket", "") or "")
+
+                if burst_cap is not None and burst_cap.isOpened() and self.burst_cache_callback:
+                    b_lo = max(0, cand.frame_idx - half_burst)
+                    b_hi = min(total_frames - 1, cand.frame_idx + half_burst)
+                    burst_cap.set(cv2.CAP_PROP_POS_FRAMES, b_lo)
+                    b_frames: List[Tuple[float, bytes]] = []
+                    for bf_i in range(b_lo, b_hi + 1):
+                        ok_b, bf_img = burst_cap.read()
+                        if not ok_b or bf_img is None:
+                            break
+                        ok_j, enc_j = cv2.imencode(".jpg", bf_img, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+                        if ok_j:
+                            b_frames.append((bf_i / video_fps, enc_j.tobytes()))
+                    if b_frames:
+                        self.burst_cache_callback(os.path.basename(out_filepath), cand.timestamp_sec, cand.frame, b_frames)
+
+                cap_item = CapturedScreenshot(
+                    filepath=out_filepath,
+                    timestamp_str=cand.timestamp_str,
+                    overall_score=cand.overall_score,
+                    analysis=cand.analysis,
+                    crop_filepath=crop_path,
+                    captured_at=cand.timestamp_sec,
+                    heuristic_score=cand.heuristic_score,
+                    judge_score=(float(cand.verdict.score) if cand.verdict else None),
+                    judge_summary=(cand.verdict.summary if cand.verdict else ""),
+                    judge_issues=(list(cand.verdict.issues) if cand.verdict else []),
+                    is_prop_moment=is_prop,
+                    from_video_scan=True,
+                    cutout_filepath=cutout_fp,
+                    finals_badge=finals_badges.get(idx_zero, ""),
+                    mood_bucket=mood_b,
+                )
+                results.append(cap_item)
+        finally:
+            if burst_cap is not None:
+                burst_cap.release()
 
         # Final progress emit
         final_status = "cancelled" if is_cancelled else "completed"
@@ -500,8 +697,14 @@ class VideoRecordingScanner:
                 if result.verdict is None:
                     continue
                 cand.verdict = result.verdict
+                if getattr(self.config, "ai_judge_distill_to_ml", True) and pm is not None and hasattr(pm, "record_judge_distillation"):
+                    try:
+                        pm.record_judge_distillation(cand.analysis, result.verdict, crop_bgr=crop)
+                    except Exception:
+                        pass
                 if getattr(result.verdict, "holding_prop", False) and getattr(self.config, "capture_prop_moments", True):
                     cand.analysis.is_prop_moment = True
+                    cand.analysis.mood_bucket = "prop"
                 elif result.verdict.issues:
                     issue_text = " ".join(result.verdict.issues or []).lower()
                     if any(kw in issue_text for kw in (
@@ -582,6 +785,23 @@ class VideoRecordingScanner:
                     continue
                 selected.append(cand)
                 break
+
+        # Mood Buckets (#6): when top_n >= 4, ensure passionate & calm_portrait moods get
+        # representation if qualified candidates exist.
+        if bool(getattr(self.config, "mood_buckets_enabled", True)) and top_n >= 4:
+            for target_mood in ("warm_smile", "passionate", "calm_portrait"):
+                if len(selected) >= top_n - 1:
+                    break
+                if any(getattr(sel.analysis, "mood_bucket", "") == target_mood for sel in selected):
+                    continue
+                mood_pref = [c for c in preferred if getattr(c.analysis, "mood_bucket", "") == target_mood]
+                for cand in mood_pref:
+                    if any(c.frame_idx == cand.frame_idx for c in selected):
+                        continue
+                    if any(abs(cand.timestamp_sec - sel.timestamp_sec) < min_interval_sec for sel in selected):
+                        continue
+                    selected.append(cand)
+                    break
 
         _take(preferred, enforce_gap=True)
         _take(fallback, enforce_gap=True)

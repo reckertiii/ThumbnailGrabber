@@ -19,6 +19,8 @@ from mediapipe.tasks.python import vision as mp_vision
 
 from config import QualityWeights, QualityThresholds
 from preference_model import UserPreferenceModel
+from speaker_id import SpeakerIdentifier
+from stage_zones import StageZoneConfig
 
 # Where the downloaded ML weights live. Overridable so a container can bake them into
 # an image path that isn't shadowed by a mounted volume — with the weights under a bind
@@ -135,6 +137,12 @@ class SingleFaceAnalysis:
     pose_points: Optional[Dict[str, Any]] = None
     is_prop_moment: bool = False        # True when speaker is holding/presenting a prop on stage
     prop_bbox: Optional[Tuple[int, int, int, int]] = None
+    mood_bucket: str = "calm_portrait"  # warm_smile | passionate | calm_portrait | prop
+    color_cast_score: float = 1.0       # 1.0 = natural skin chroma, <1.0 = LED colour wash
+    stage_obstruction_overlap: float = 0.0
+    outside_safe_zone: bool = False
+    speaker_similarity: float = 0.0
+    speaker_name: str = ""
     
     # Score Breakdown
     head_pose_score: float = 0.0
@@ -218,6 +226,10 @@ class AnalysisResult:
     eye_gaze_away_score: float = 0.0
     mouth_velocity: float = 0.0
     hands_detected_count: int = 0
+    mood_bucket: str = "calm_portrait"
+    color_cast_score: float = 1.0
+    stage_obstruction_overlap: float = 0.0
+    speaker_name: str = ""
     
     # Primary Face Bounding Box & Landmarks
     face_bbox: Optional[Tuple[int, int, int, int]] = None
@@ -252,7 +264,9 @@ class PersonQualityAnalyzer:
                  min_consecutive_qualified: int = 2,
                  require_exact_people_count: bool = False,
                  capture_prop_moments: bool = True,
-                 fast_reject: bool = False):
+                 fast_reject: bool = False,
+                 speaker_id: Any = None,
+                 stage_zones: Any = None):
         self.weights = weights or QualityWeights()
         self.thresholds = thresholds or QualityThresholds()
         self.max_people_target = max(1, min(6, max_people_target))  # Clamp between 1 and 6
@@ -279,8 +293,12 @@ class PersonQualityAnalyzer:
         self._cached_pose_result = None
         self.selected_person_ids: set = set(selected_person_ids if selected_person_ids is not None else [1, 2, 3, 4, 5, 6])
         
-        # User Preference ML Model (Scikit-Learn)
+        # User Preference ML Model (Scikit-Learn + Visual Embeddings + Pairwise)
         self.preference_model = UserPreferenceModel()
+        # Target Speaker Face Lock (#3) & Per-Speaker Baselines (ML-5)
+        self.speaker_id = speaker_id if speaker_id is not None else SpeakerIdentifier(auto_download_sface=False)
+        # Interactive Stage Safe-Zone & Obstruction Masks (#9)
+        self.stage_zones = stage_zones if stage_zones is not None else StageZoneConfig()
         
         # Temporal smoothing state
         self._ema_alpha = ema_alpha
@@ -561,8 +579,24 @@ class PersonQualityAnalyzer:
 
         f_res.score = round(max(0.0, min(1.0, raw_score)), 3)
 
+        # Classify Expression "Mood Bucket" (#6)
+        if prop_active:
+            f_res.mood_bucket = "prop"
+        elif f_res.is_smiling or f_res.smile_ratio >= 0.35:
+            f_res.mood_bucket = "warm_smile"
+        elif (f_res.arms_clear or (0.06 <= f_res.jaw_open_score <= 0.28)) and not f_res.hands_on_torso:
+            f_res.mood_bucket = "passionate"
+        else:
+            f_res.mood_bucket = "calm_portrait"
+
         # --- Hard disqualifiers: unusable, not merely imperfect ---------------
         reasons: List[str] = []
+        if getattr(f_res, "outside_safe_zone", False):
+            reasons.append("outside stage safe zone")
+        if "not locked speaker" in (getattr(f_res, "disqualified_reasons", None) or []):
+            reasons.append("not locked speaker")
+        if getattr(f_res, "stage_obstruction_overlap", 0.0) >= 0.28 and not prop_active:
+            reasons.append("behind stage obstruction")
         if f_res.score < self.thresholds.min_overall_score:
             reasons.append(f"score {f_res.score:.0%} below {self.thresholds.min_overall_score:.0%}")
         effective_max_yaw = self.thresholds.max_yaw_deg * (1.35 if prop_active else 1.0)
@@ -664,12 +698,18 @@ class PersonQualityAnalyzer:
             self._tracked_slots = {}
 
         # 2. Assign remaining unmatched detections to free slots (1 to 6)
-        # Sort remaining unmatched by area descending
+        # When Target Speaker Face Lock or Stage Safe-Zone is active, evaluate up to 6
+        # candidates even if max_people_target == 1 so a closer walk-on cannot mask the speaker.
+        has_spatial_or_id_filter = (
+            (getattr(self, "speaker_id", None) is not None and self.speaker_id.locked)
+            or (getattr(self, "stage_zones", None) is not None and self.stage_zones.has_safe_zone)
+        )
+        slot_cap = 6 if has_spatial_or_id_filter else self.max_people_target
         unmatched_detections.sort(key=lambda d: d['area'], reverse=True)
         for det in unmatched_detections:
-            # Find lowest available slot ID between 1 and max_people_target
+            # Find lowest available slot ID between 1 and slot_cap
             free_pid = None
-            for candidate_pid in range(1, self.max_people_target + 1):
+            for candidate_pid in range(1, slot_cap + 1):
                 if candidate_pid not in matched_slots and candidate_pid not in self._tracked_slots:
                     free_pid = candidate_pid
                     break
@@ -681,8 +721,8 @@ class PersonQualityAnalyzer:
                     'face': det['face'], 'missed': 0
                 }
 
-        # Filter slots to up to max_people_target
-        active_pids = sorted([p for p in matched_slots.keys() if p <= self.max_people_target])
+        # Filter slots to up to slot_cap
+        active_pids = sorted([p for p in matched_slots.keys() if p <= slot_cap])
 
         if not active_pids:
             result.face_detected = False
@@ -698,11 +738,21 @@ class PersonQualityAnalyzer:
         # Analyze each individual face (up to 6)
         analyzed_faces: List[SingleFaceAnalysis] = []
         any_blinking = False
+        scaled_yunet_rows: Dict[int, np.ndarray] = {}
 
         for pid in active_pids:
             face_data = matched_slots[pid]
             face_analysis = self._analyze_single_face(pid, face_data, frame, orig_w, orig_h, scale)
-            face_analysis.is_selected = (pid in self.selected_person_ids)
+            face_analysis.is_selected = (pid in self.selected_person_ids) if not has_spatial_or_id_filter else True
+            # Stage Safe-Zone filter (#9)
+            if getattr(self, "stage_zones", None) is not None and self.stage_zones.has_safe_zone:
+                if not self.stage_zones.is_face_inside_safe_zone(face_analysis.raw_bbox, orig_w, orig_h):
+                    face_analysis.outside_safe_zone = True
+                    face_analysis.is_selected = False
+            if face_data is not None and len(face_data) >= 14:
+                row_full = np.asarray(face_data, dtype=np.float32).copy()
+                row_full[:14] /= float(scale)
+                scaled_yunet_rows[pid] = row_full
             analyzed_faces.append(face_analysis)
             if face_analysis.is_selected and face_analysis.is_blinking:
                 any_blinking = True
@@ -723,7 +773,13 @@ class PersonQualityAnalyzer:
         # silently drops every blendshape metric back to the crude 2D fallbacks.
         if self.face_landmarker is not None:
             for f_item in analyzed_faces:
-                self._landmark_face(frame, f_item)
+                if not getattr(f_item, "outside_safe_zone", False):
+                    self._landmark_face(frame, f_item)
+
+        # Target Speaker Face Lock (#3) & Per-Speaker Adaptive Baselines (ML-5)
+        if getattr(self, "speaker_id", None) is not None:
+            in_zone_faces = [f for f in analyzed_faces if not getattr(f, "outside_safe_zone", False)]
+            self.speaker_id.evaluate_and_filter_faces(frame, in_zone_faces, raw_yunet_rows=scaled_yunet_rows)
 
         # Update blink suppression cooldown after blendshapes have refined blink state
         any_blinking = any(f.is_selected and f.is_blinking for f in analyzed_faces)
@@ -960,8 +1016,11 @@ class PersonQualityAnalyzer:
                 self._compute_cutout_score(frame, f_item, result.hand_skeletons)
             self._finalize_face_score(f_item)
 
-        # Populate root level fields from first SELECTED face (falling back to face 0 only if none selected)
-        primary = primary_ref
+        # Re-select primary_ref after post-pose cutout & final face scores
+        selected_faces_final = [f for f in analyzed_faces if f.is_selected]
+        primary = selected_faces_final[0] if selected_faces_final else primary_ref
+        if primary.mood_bucket == "calm_portrait" and result.hands_detected_count > 0 and not primary.hands_on_torso:
+            primary.mood_bucket = "passionate"
         result.face_bbox = primary.bbox
         result.head_pose_score = primary.head_pose_score
         result.eye_openness_score = primary.eye_openness_score
@@ -1001,6 +1060,10 @@ class PersonQualityAnalyzer:
         result.background_score = primary.background_score
         result.torso_clear_score = primary.torso_clear_score
         result.torso_crossing = primary.torso_crossing
+        result.mood_bucket = primary.mood_bucket
+        result.color_cast_score = primary.color_cast_score
+        result.stage_obstruction_overlap = primary.stage_obstruction_overlap
+        result.speaker_name = primary.speaker_name
         result.is_prop_moment = any(f.is_selected and f.is_prop_moment for f in analyzed_faces) or primary.is_prop_moment
         result.prop_bbox = primary.prop_bbox
         if result.is_prop_moment and result.prop_bbox is None:
@@ -1043,10 +1106,26 @@ class PersonQualityAnalyzer:
 
         rule_score = max(0.0, min(1.0, raw_score))
         
-        # Scikit-Learn Machine Learning Preference Prediction
+        # Scikit-Learn + Visual Embedding Machine Learning Preference Prediction
         try:
-            features = UserPreferenceModel.extract_features(primary if primary else result, self.thresholds)
-            ml_pred = self.preference_model.predict(features)
+            src_obj = primary if primary else result
+            # Copy frame-level hand sharpness onto face item so extract_features sees it
+            if getattr(result, "hand_laplacian_variance", 0.0) > 0:
+                setattr(src_obj, "hand_laplacian_variance", result.hand_laplacian_variance)
+            setattr(src_obj, "is_hand_blurry", result.is_hand_blurry)
+            features = UserPreferenceModel.extract_features(src_obj, self.thresholds)
+            ml_crop = None
+            if getattr(self.preference_model, "_pos_visual_proto", None) is not None and primary is not None:
+                c_rect = primary.subject_bbox or primary.bbox
+                if c_rect and c_rect[2] > 16 and c_rect[3] > 16:
+                    cx0, cy0, cw0, ch0 = c_rect
+                    sub_c = frame[max(0, cy0):min(orig_h, cy0 + ch0), max(0, cx0):min(orig_w, cx0 + cw0)]
+                    if sub_c.size > 0:
+                        ml_crop = sub_c
+            try:
+                ml_pred = self.preference_model.predict(features, crop_bgr=ml_crop)
+            except TypeError:
+                ml_pred = self.preference_model.predict(features)
             result.ml_score = ml_pred
             result.ml_trained = self.preference_model.is_trained
             
@@ -1227,8 +1306,9 @@ class PersonQualityAnalyzer:
         f_res.laplacian_variance = lap_var
         f_res.sharpness_score = self._sharpness_to_score(lap_var)
 
-        # 2. Exposure & Centering
+        # 2. Exposure, Stage Colour Cast & Centering
         f_res.exposure_score, f_res.face_brightness = self._compute_exposure_score(face_roi, gray_roi)
+        f_res.color_cast_score = self._compute_color_cast_score(face_roi)
         f_res.centering_score = self._compute_centering_score(fx, fy, fw, fh, orig_w, orig_h)
 
         # 3. Head Pose Estimation
@@ -1496,12 +1576,17 @@ class PersonQualityAnalyzer:
         # --- 4. Background cleanliness --------------------------------------
         f_res.background_score = self._background_cleanliness(frame, (sx0, sy0, sx1, sy1))
 
-        # --- 5. Nothing crossing the body -----------------------------------
+        # --- 5. Nothing crossing the body (+ Stage Obstruction Masks #9) -----
         crossing = self._torso_crossing(frame, pose)
         f_res.torso_crossing = round(crossing, 3)
         # Calibrated on real captures: ~0.07 standing clear, ~0.29 with a table across
         # the lower torso, ~0.39 pressed against it with both hands on top.
         torso_clear = max(0.0, min(1.0, 1.0 - (crossing - 0.05) / 0.35))
+        if getattr(self, "stage_zones", None) is not None and self.stage_zones.has_obstructions and f_res.subject_bbox:
+            obs_ratio, _obs_name = self.stage_zones.compute_torso_obstruction(f_res.subject_bbox, w, h)
+            f_res.stage_obstruction_overlap = obs_ratio
+            if obs_ratio > 0.02 and not is_prop:
+                torso_clear = min(torso_clear, max(0.0, 1.0 - obs_ratio * 2.2))
         if is_prop:
             # A held prop in front of the speaker creates horizontal edges that should
             # not be mistaken for a lectern or table cutting the body in half.
@@ -2096,6 +2181,27 @@ class PersonQualityAnalyzer:
                     exposure_score *= 0.62
 
         return round(max(0.0, min(1.0, exposure_score)), 2), round(mean_brightness, 1)
+
+    @staticmethod
+    def _compute_color_cast_score(face_roi: Optional[np.ndarray]) -> float:
+        """Scores skin white-balance cleanliness (1.0 = natural skin, lower = heavy LED spill)."""
+        if face_roi is None or face_roi.size == 0 or face_roi.ndim != 3 or face_roi.shape[2] != 3:
+            return 1.0
+        rh, rw = face_roi.shape[:2]
+        if rh < 12 or rw < 12:
+            return 1.0
+        center = face_roi[int(rh * 0.18):max(int(rh * 0.18) + 2, int(rh * 0.82)),
+                          int(rw * 0.18):max(int(rw * 0.18) + 2, int(rw * 0.82))]
+        if center.size < 12:
+            return 1.0
+        mean_b = float(np.mean(center[:, :, 0]))
+        mean_g = float(np.mean(center[:, :, 1]))
+        mean_r = float(np.mean(center[:, :, 2]))
+        blue_excess = max(0.0, (mean_b - mean_g) - 10.0) / 55.0
+        green_excess = max(0.0, (mean_g - max(mean_r, mean_b)) - 8.0) / 55.0
+        magenta_excess = max(0.0, (mean_r - mean_g) - 65.0) / 55.0 if mean_g < 105.0 else 0.0
+        cast_pen = min(0.65, max(blue_excess, green_excess, magenta_excess) * 0.60)
+        return round(max(0.35, min(1.0, 1.0 - cast_pen)), 2)
 
     def _compute_centering_score(self, fx: int, fy: int, fw: int, fh: int,
                                   frame_w: int, frame_h: int) -> float:

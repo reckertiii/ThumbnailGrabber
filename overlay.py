@@ -22,9 +22,37 @@ PERSON_COLORS = [
 
 
 def draw_overlay(frame_bgr: np.ndarray, analysis: Optional[AnalysisResult],
-                 show_mesh: bool = True, show_hud: bool = True) -> np.ndarray:
+                 show_mesh: bool = True, show_hud: bool = True,
+                 stage_zones=None) -> np.ndarray:
     """Returns a copy of frame_bgr with the analysis HUD drawn on it."""
     display_frame = frame_bgr.copy()
+    fh_full, fw_full = display_frame.shape[:2]
+
+    # 0. Stage Safe-Zone & Obstruction polygons (#9)
+    if show_hud and stage_zones is not None and fw_full > 0 and fh_full > 0:
+        if getattr(stage_zones, "has_safe_zone", False):
+            pts_safe = np.array(
+                [[int(round(px * fw_full)), int(round(py * fh_full))] for px, py in stage_zones.safe_zone],
+                dtype=np.int32,
+            )
+            cv2.polylines(display_frame, [pts_safe], isClosed=True, color=(130, 230, 120), thickness=2)
+            p0 = pts_safe[0]
+            cv2.putText(display_frame, "SAFE ZONE", (int(p0[0]) + 6, max(16, int(p0[1]) + 18)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (130, 230, 120), 1)
+        for obs in (getattr(stage_zones, "obstruction_zones", None) or []):
+            if len(obs.points) >= 3:
+                pts_obs = np.array(
+                    [[int(round(px * fw_full)), int(round(py * fh_full))] for px, py in obs.points],
+                    dtype=np.int32,
+                )
+                tint = display_frame.copy()
+                cv2.fillPoly(tint, [pts_obs], (35, 45, 220))
+                display_frame = cv2.addWeighted(tint, 0.22, display_frame, 0.78, 0)
+                cv2.polylines(display_frame, [pts_obs], isClosed=True, color=(60, 80, 248), thickness=2)
+                op0 = pts_obs[0]
+                cv2.putText(display_frame, f"MASK: {obs.name}", (int(op0[0]) + 6, max(16, int(op0[1]) - 6)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (110, 130, 255), 1)
+
     if analysis is None:
         return display_frame
 
@@ -88,7 +116,9 @@ def draw_overlay(frame_bgr: np.ndarray, analysis: Optional[AnalysisResult],
 
             if is_sel:
                 color = PERSON_COLORS[idx % len(PERSON_COLORS)] if f_item.is_qualified else (0, 165, 255)
-                label = f"P{f_item.person_id}: {int(f_item.score * 100)}%"
+                spk_tag = getattr(f_item, 'speaker_name', '')
+                prefix = f"{spk_tag} " if spk_tag else f"P{f_item.person_id}: "
+                label = f"{prefix}{int(f_item.score * 100)}%"
                 if getattr(f_item, 'is_prop_moment', False):
                     label += " [PROP/CANDID]"
                 if getattr(f_item, 'is_licking_lips', False):

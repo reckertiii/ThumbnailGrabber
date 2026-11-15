@@ -109,11 +109,33 @@ services:
       TG_AI_JUDGE_OLLAMA_NUM_THREAD: "20"
       # Active window when woken on Start Capture (also auto-sleeps when capture stops).
       TG_AI_JUDGE_ACTIVE_HOURS: "2"
+      # Keep qwen3-vl:30b pinned in RAM on high-memory TrueNAS hosts (-1 = never unload while active).
+      TG_AI_JUDGE_OLLAMA_KEEP_ALIVE: "-1"
+      # Side-by-side contact-sheet "Tournament Finals" pass & ML distillation.
+      TG_AI_JUDGE_FINALS: "1"
+      TG_AI_JUDGE_DISTILL: "1"
 
-    # Q95 JPEG DVR buffer compression keeps 5s of 1080p under ~150 MB and 20s under ~600 MB.
+      # --- 500 GB RAM TrueNAS Studio & ML Features -----------------------------
+      # Rolling Time-Machine RAM replay buffer (up to 180s; ~1.5 GB Q95 JPEG at 60s 1080p30).
+      TG_DVR_BUFFER_SECONDS: "60"
+      # Guaranteed expression diversity ("Mood Buckets": smile, passionate, calm, prop).
+      TG_MOOD_BUCKETS: "1"
+      # Studio finishing: H.264 de-blocking & face-masked stage LED color neutralizer.
+      TG_BROADCAST_POLISH: "1"
+      # Optional automatic *_cutout.png background removal & 2x 4K upscale on every capture.
+      TG_AUTO_CUTOUT: "0"
+      TG_UPSCALE_4K: "0"
+      # Optional live RTSP audio speech-pause / laughter gating & Whisper model size.
+      TG_AUDIO_GATING: "0"
+      TG_WHISPER_MODEL: "base.en"
+      # Parallel video scan worker pool (0 = auto-scale across CPU cores, up to 8 workers).
+      TG_SCAN_WORKERS: "0"
+
+    # Sized comfortably for 60s-180s Time-Machine RAM buffer, parallel video scan workers,
+    # ±15-frame micro-scrub burst cache, and optional ONNX / Whisper models on 500 GB RAM TrueNAS.
     deploy:
       resources:
         limits:
-          memory: 4G
+          memory: 24G
         reservations:
-          memory: 1G
+          memory: 4G

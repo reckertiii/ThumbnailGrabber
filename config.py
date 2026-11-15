@@ -190,11 +190,17 @@ class AppConfig:
     # Frames are held as Q95 JPEG bytes in memory (~300-400 KB/frame at 1080p instead of
     # 6.22 MB raw BGR), cutting buffer RAM by ~85% while keeping refinement lossless-sharp.
     # 0 disables the buffer and the refinement pass.
-    dvr_buffer_seconds: float = 5.0
+    dvr_buffer_seconds: float = field(
+        default_factory=lambda: max(0.0, min(180.0, float(os.environ.get("TG_DVR_BUFFER_SECONDS", "5.0") or 0.0)))
+    )
+    dvr_max_seconds: float = 180.0         # Up to 3-minute Time-Machine buffer on high-RAM NAS
     dvr_buffer_fps: int = 30               # Frames per second retained (sizes the buffer)
     dvr_refine_window_sec: float = 0.3     # Scrub +/- this around the chosen moment
     dvr_refine_candidates: int = 3         # Fully re-score this many of the sharpest frames
-    dvr_jpeg_compression: bool = True      # Store buffered frames as Q95 JPEG bytes to save ~85% RAM
+    dvr_jpeg_compression: bool = field(
+        default_factory=lambda: os.environ.get("TG_DVR_JPEG", "1").strip().lower() not in ("0", "false", "no", "off")
+    )
+    burst_filmstrip_frames: int = 15       # +/- N frames cached per winner for Micro-Scrub fine-tuning
     # Candidates found while a judge review is in flight are queued rather than dropped,
     # so a slow reviewer costs latency instead of lost moments.
     review_queue_size: int = 10
@@ -309,6 +315,41 @@ class AppConfig:
     # slots in the retained gallery so standard headshots don't overwrite them.
     capture_prop_moments: bool = True
     max_prop_captures: int = 2
+
+    # Expression "Mood Buckets" (#6): guarantee balanced expression variety across slots
+    mood_buckets_enabled: bool = field(
+        default_factory=lambda: os.environ.get("TG_MOOD_BUCKETS", "1").strip().lower() not in ("0", "false", "no", "off")
+    )
+
+    # Studio Cutouts (#1) & Broadcast Polish (#11)
+    auto_save_cutout: bool = field(
+        default_factory=lambda: os.environ.get("TG_AUTO_CUTOUT", "0").strip().lower() in ("1", "true", "yes", "on")
+    )
+    broadcast_polish_enabled: bool = field(
+        default_factory=lambda: os.environ.get("TG_BROADCAST_POLISH", "0").strip().lower() in ("1", "true", "yes", "on")
+    )
+    upscale_4k_enabled: bool = field(
+        default_factory=lambda: os.environ.get("TG_UPSCALE_4K", "0").strip().lower() in ("1", "true", "yes", "on")
+    )
+
+    # Audio-Aware Gating & Local Whisper Sermon Notes (#8)
+    audio_gating_enabled: bool = field(
+        default_factory=lambda: os.environ.get("TG_AUDIO_GATING", "1").strip().lower() not in ("0", "false", "no", "off")
+    )
+    whisper_model_size: str = field(
+        default_factory=lambda: os.environ.get("TG_WHISPER_MODEL", "base.en").strip() or "base.en"
+    )
+
+    # Parallel Multi-Worker Video Scanning (#4c) & AI Judge Finals / ML Distillation (#4a, ML-4)
+    scan_workers: int = field(
+        default_factory=lambda: max(0, min(16, int(os.environ.get("TG_SCAN_WORKERS", "0") or 0)))
+    )
+    ai_judge_finals_enabled: bool = field(
+        default_factory=lambda: os.environ.get("TG_AI_JUDGE_FINALS", "1").strip().lower() not in ("0", "false", "no", "off")
+    )
+    ai_judge_distill_to_ml: bool = field(
+        default_factory=lambda: os.environ.get("TG_AI_JUDGE_DISTILL_ML", "1").strip().lower() not in ("0", "false", "no", "off")
+    )
 
     # Weights & Thresholds
     weights: QualityWeights = field(default_factory=QualityWeights)

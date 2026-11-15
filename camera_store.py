@@ -35,14 +35,16 @@ def settings_path() -> str:
 
 @dataclass
 class CameraSettings:
-    kind: str = "rtsp"          # rtsp | webcam | file
+    kind: str = "rtsp"          # rtsp | webcam | file | ndi
     host: str = ""
     port: int = DEFAULT_PORT
+    http_port: int = 80
     path: str = ""
     username: str = ""
     password: str = ""
     webcam_index: int = 0
     file_path: str = ""
+    ndi_source_name: str = ""
 
     # --- what the UI is allowed to see ------------------------------------
     def public(self) -> Dict[str, Any]:
@@ -64,6 +66,11 @@ class CameraSettings:
             return str(int(self.webcam_index))
         if self.kind == "file":
             return self.file_path
+        if self.kind == "ndi":
+            src = (self.ndi_source_name or "").strip()
+            if not src:
+                return ""
+            return src if src.lower().startswith("ndi://") else f"ndi://{src}"
         if not self.host:
             return ""
         if redacted:
@@ -77,6 +84,8 @@ class CameraSettings:
             return True
         if self.kind == "file":
             return bool(self.file_path)
+        if self.kind == "ndi":
+            return bool((self.ndi_source_name or "").strip())
         return bool(self.host and self.path)
 
 

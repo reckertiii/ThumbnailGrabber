@@ -67,11 +67,22 @@ Use **[deploy/truenas-compose.yml](deploy/truenas-compose.yml)** via **Apps → 
 | `TG_AI_JUDGE_OLLAMA_MODEL` | `qwen3-vl:30b` | Must match pulled Ollama tag |
 | `TG_AI_JUDGE_OLLAMA_NUM_THREAD` | `20` | Match your Ollama app's CPU core limit to avoid throttling |
 | `TG_AI_JUDGE_ACTIVE_HOURS` | `2` | Unloads the Ollama model when idle |
+| `TG_AI_JUDGE_OLLAMA_KEEP_ALIVE` | `-1` | Keeps `qwen3-vl:30b` pinned in RAM during active sessions on high-memory hosts |
+| `TG_DVR_BUFFER_SECONDS` | `60` | Rolling Time-Machine RAM replay buffer (adjustable up to `180s` in the Web UI; click `⏪ Mine Last 60s` anytime) |
+| `TG_MOOD_BUCKETS` | `1` | Guarantees expression diversity across smile, passionate, calm, and prop slots |
+| `TG_BROADCAST_POLISH` | `1` | Strips H.264 macroblock artifacts and neutralizes harsh magenta/blue stage LED skin casts |
+| `TG_SCAN_WORKERS` | `0` | Multi-worker parallel offline video scanning across CPU cores |
 | `TZ` | `America/New_York` | Local timestamps on saved filenames |
 
 ### Memory & CPU Resources
 
-Give the container **2–4 GB RAM** and **4+ CPUs**. Because the rolling DVR buffer stores frames as Q95 JPEG in RAM, a 5-second 1080p buffer at 30 FPS uses only ~130 MB (and releases to 0 MB automatically during Idle Standby).
+Give the container **4–24 GB RAM** (depending on your Time-Machine buffer window and parallel video scan worker count) and **4–16 CPUs**. On a high-memory TrueNAS host (e.g. 500 GB RAM), setting `memory: 24G` in `deploy/truenas-compose.yml` easily accommodates a 60–180s 1080p DVR replay buffer (~1.5–4.5 GB Q95 JPEG), multi-worker parallel video scanning, `±15`-frame micro-scrub burst caches, and optional ONNX / `faster-whisper` models stored in `TG_DATA_DIR` (all DVR RAM still drops to 0 MB automatically during Idle Standby).
+
+### Optional Studio Add-Ons (`TG_DATA_DIR`)
+
+- **Neural Matting, Embeddings & Speaker Lock**: Click **Warm Studio Models** (or trigger your first cutout / speaker lock) to cache Apache-2.0 ONNX weights (`u2netp.onnx`, `vision_backbone_mnv2.onnx`, `face_recognition_sface_2021dec.onnx`) directly into `/mnt/Main/apps/tg-models` so they persist across container updates without bloating the base Docker image.
+- **NDI Network Streams**: To ingest NDI sources alongside RTSP, drop `libndi.so.5` / `libndi.so.6` from the NewTek/Vizrt NDI SDK into `/mnt/Main/apps/tg-models/ndi/` and use `host` networking (or multicast routing) for mDNS discovery in **`📷 Camera… → NDI Network Source`**.
+- **Sony SRG-A40 PTZ & AI Auto-Framing**: When connected to your Sony SRG-A40, open the **Sony SRG-A40 PTZ & AI Auto-Framing** drawer under the live monitor to nudge Pan/Tilt/Zoom, recall camera presets `1–6`, or toggle the camera's built-in AI Auto-Framing over HTTP CGI.
 
 ---
 
