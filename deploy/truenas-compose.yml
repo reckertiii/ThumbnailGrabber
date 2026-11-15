@@ -70,19 +70,28 @@ services:
       # matching volume above, or the picker offers a folder it cannot reach.
       TG_OUTPUT_ROOTS: "/mnt/Main/apps:/mnt/Main/Grace Shared:/mnt/Main/Grace Central Services:/mnt/Main/Grace Cortland:/mnt/Main/Grace Dryden"
 
-      # Directories the video scanner may read. Same rule.
+      # Directories the video scanner & browser may read. Same rule.
       TG_VIDEO_ROOTS: "/mnt/Main/apps:/mnt/Main/Grace Shared:/mnt/Main/Grace Central Services:/mnt/Main/Grace Cortland:/mnt/Main/Grace Dryden"
 
-      # The saved camera and your star/reject ratings. Must be on a mount, or you
-      # re-enter the camera after every update.
+      # Saved camera, UI settings, folder gallery/pin manifests, and ML ratings.
+      # Must be on a mount so updates preserve everything.
       TG_DATA_DIR: "/mnt/Main/apps/tg-models"
 
       TG_MAX_UPLOAD_MB: "4096"
 
+      # Optional HTTP Basic Auth password (leave blank on trusted LAN).
+      TG_WEB_PASSWORD: ""
+
+      # --- lifecycle & resource guards ----------------------------------------
+      # Automatically stop capture after this many minutes if left running (0 = unlimited).
+      TG_CAPTURE_MAX_MINUTES: "120"
+      # Pause CV inference & free DVR RAM when no browser is open and capture is off.
+      TG_IDLE_STANDBY: "1"
+
       # --- camera -------------------------------------------------------------
       # First-run default only, and not needed: connect the camera in the UI and
       # it is saved to TG_DATA_DIR and used from then on. Leaving this empty keeps
-      # the camera password out of the app config.
+      # the camera password out of the app config and starts cleanly in standby.
       TG_STREAM_SOURCE: ""
 
       TZ: "America/New_York"          # capture filenames use local time
@@ -98,16 +107,13 @@ services:
       # Must match the CPU limit on the Ollama app. Left at 0, Ollama spawns one
       # thread per host core, overruns its quota and is throttled — about 3x slower.
       TG_AI_JUDGE_OLLAMA_NUM_THREAD: "20"
-      # The judge stops reviewing this long after startup and releases the model.
-      # Press Wake in the UI to re-arm it and load it again.
+      # Active window when woken on Start Capture (also auto-sleeps when capture stops).
       TG_AI_JUDGE_ACTIVE_HOURS: "2"
 
-    # The frame buffer is the largest single allocation and is adjustable from the
-    # UI, so the limit needs headroom above whatever you set it to. 5s at 1080p is
-    # ~0.9 GB; 20s is ~3.5 GB, which does not fit in 4G alongside everything else.
+    # Q95 JPEG DVR buffer compression keeps 5s of 1080p under ~150 MB and 20s under ~600 MB.
     deploy:
       resources:
         limits:
-          memory: 8G
+          memory: 4G
         reservations:
-          memory: 2G
+          memory: 1G

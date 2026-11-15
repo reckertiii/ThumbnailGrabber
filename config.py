@@ -50,12 +50,15 @@ def is_redacted(url: str) -> bool:
 
 
 def _default_stream_source() -> str:
-    """Stream source from TG_STREAM_SOURCE, else webcam 0.
+    """Stream source from TG_STREAM_SOURCE, else webcam 0 when unset.
 
-    Set TG_STREAM_SOURCE in .env, e.g.
-        TG_STREAM_SOURCE=rtsp://user:pass@192.168.1.100:554/media/video1
+    If TG_STREAM_SOURCE is explicitly set to "" (as in the TrueNAS compose file
+    before a camera is configured in the UI), preserve "" so the container enters
+    a clean 'unconfigured' state instead of failing on /dev/video0.
     """
-    return os.environ.get("TG_STREAM_SOURCE", "").strip() or "0"
+    if "TG_STREAM_SOURCE" in os.environ:
+        return os.environ.get("TG_STREAM_SOURCE", "").strip()
+    return "0"
 
 def home_dir() -> Optional[Path]:
     """The user's home directory, or None when there isn't one.
@@ -184,15 +187,28 @@ class AppConfig:
     # ~30, so most frames are never examined and a brief good expression can fall between
     # samples. The buffer keeps every frame for a few seconds so a chosen moment can be
     # re-examined at full frame rate for the crispest version of itself.
-    # Memory is the constraint: a 1080p frame is 6.22 MB, so 5s x 30fps is about 0.93 GB.
+    # Frames are held as Q95 JPEG bytes in memory (~300-400 KB/frame at 1080p instead of
+    # 6.22 MB raw BGR), cutting buffer RAM by ~85% while keeping refinement lossless-sharp.
     # 0 disables the buffer and the refinement pass.
     dvr_buffer_seconds: float = 5.0
     dvr_buffer_fps: int = 30               # Frames per second retained (sizes the buffer)
     dvr_refine_window_sec: float = 0.3     # Scrub +/- this around the chosen moment
     dvr_refine_candidates: int = 3         # Fully re-score this many of the sharpest frames
+    dvr_jpeg_compression: bool = True      # Store buffered frames as Q95 JPEG bytes to save ~85% RAM
     # Candidates found while a judge review is in flight are queued rather than dropped,
     # so a slow reviewer costs latency instead of lost moments.
     review_queue_size: int = 10
+
+    # Auto-stop capture timer (minutes). Prevents capture and the AI judge from running
+    # all week if someone forgets to press Stop after a service. 0 = unlimited.
+    capture_max_minutes: float = field(
+        default_factory=lambda: max(0.0, float(os.environ.get("TG_CAPTURE_MAX_MINUTES", "120") or 0))
+    )
+    # Pause CV inference and empty the DVR buffer when capture is off and no browser is
+    # watching the UI, dropping Monday-Saturday NAS CPU usage to ~0%.
+    idle_standby_enabled: bool = field(
+        default_factory=lambda: os.environ.get("TG_IDLE_STANDBY", "1").strip().lower() not in ("0", "false", "no", "off")
+    )
 
     burst_window_seconds: float = 2.5      # Time window to find peak score candidate frame
     cooldown_seconds: float = 2.0          # Minimum cooldown between auto-saved screenshots
@@ -222,7 +238,9 @@ class AppConfig:
     # one is reachable with the model pulled, otherwise off. Force one with
     # "anthropic" or "ollama"; "off" disables the judge entirely.
     ai_judge_backend: str = field(default_factory=lambda: os.environ.get("TG_AI_JUDGE_BACKEND", "auto"))
-    ai_judge_model: str = "claude-opus-5"      # claude-sonnet-5 is the cheaper option
+    ai_judge_model: str = field(
+        default_factory=lambda: os.environ.get("TG_AI_JUDGE_MODEL", "claude-sonnet-4-6").strip() or "claude-sonnet-4-6"
+    )
     # Local backend. qwen3-vl:4b (3.3 GB) is the sensible default on a CPU-only box;
     # qwen3-vl:8b (6.1 GB) judges noticeably better if there is RAM for it.
     ai_judge_ollama_url: str = field(default_factory=lambda: os.environ.get("OLLAMA_HOST", "http://localhost:11434"))
@@ -270,11 +288,14 @@ class AppConfig:
     # Empty means anywhere the process can read, which is the historical behaviour for
     # these endpoints. Set it alongside TG_VIDEO_ROOTS when the port is exposed.
     output_browse_roots: str = field(default_factory=lambda: os.environ.get("TG_OUTPUT_ROOTS", "").strip())
+    # Optional HTTP Basic Auth password for the web UI & API (leave empty on trusted LAN).
+    web_password: str = field(default_factory=lambda: os.environ.get("TG_WEB_PASSWORD", "").strip())
 
-    # RTSP Reconnection
-    rtsp_max_retries: int = 10             # Max reconnection attempts before giving up
+    # RTSP Reconnection & Standby Polling
+    rtsp_max_retries: int = 10             # Fast backoff attempts before entering quiet standby poll
     rtsp_backoff_base: float = 1.0         # Initial retry delay in seconds
     rtsp_backoff_max: float = 30.0         # Maximum retry delay in seconds
+    rtsp_standby_poll_sec: float = 15.0    # Standby poll interval when camera is powered off between services
     
     # Capture spacing. Two keepers from the same few seconds are one shot with
     # variations, so retention prefers spread-out captures and a new one only displaces

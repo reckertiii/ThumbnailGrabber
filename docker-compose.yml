@@ -11,15 +11,21 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - TG_STREAM_SOURCE=${TG_STREAM_SOURCE:-0}
+      - TG_STREAM_SOURCE=${TG_STREAM_SOURCE:-}
       - TG_OUTPUT_DIR=/app/captures
       - TZ=${TZ:-America/New_York}
-      # Restrict which host directories the web UI may scan videos from. The web
-      # endpoints are unauthenticated, so set this if the port is exposed.
+      # Restrict which host directories the web UI may browse or scan videos from.
+      - TG_OUTPUT_ROOTS=${TG_OUTPUT_ROOTS:-}
       - TG_VIDEO_ROOTS=${TG_VIDEO_ROOTS:-}
       - TG_MAX_UPLOAD_MB=${TG_MAX_UPLOAD_MB:-4096}
-      # Optional. Turns on the AI judge (see README).
+      # Optional HTTP Basic Auth password (leave blank on trusted LAN).
+      - TG_WEB_PASSWORD=${TG_WEB_PASSWORD:-}
+      # Lifecycle & CPU/RAM optimization
+      - TG_CAPTURE_MAX_MINUTES=${TG_CAPTURE_MAX_MINUTES:-120}
+      - TG_IDLE_STANDBY=${TG_IDLE_STANDBY:-1}
+      # Optional. Turns on the AI judge via Anthropic Claude API (see README).
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - TG_AI_JUDGE_MODEL=${TG_AI_JUDGE_MODEL:-claude-sonnet-4-6}
       # Local judge instead. Point at any Ollama — the bundled one below, or the
       # TrueNAS Ollama app. "auto" prefers Claude when a key is set.
       - OLLAMA_HOST=${OLLAMA_HOST:-http://ollama:11434}
@@ -28,8 +34,8 @@ services:
       - TG_AI_JUDGE_OLLAMA_KEEP_ALIVE=${TG_AI_JUDGE_OLLAMA_KEEP_ALIVE:-30m}
       - TG_AI_JUDGE_OLLAMA_NUM_THREAD=${TG_AI_JUDGE_OLLAMA_NUM_THREAD:-0}
       - TG_AI_JUDGE_ACTIVE_HOURS=${TG_AI_JUDGE_ACTIVE_HOURS:-2}
-    # Note: ./models holds user ratings only. The ML weights are baked into the
-    # image at /opt/tg-models so this mount cannot hide them.
+    # Note: ./models holds user ratings, camera config, and UI/gallery manifests.
+    # The ML weights are baked into the image at /opt/tg-models so this mount cannot hide them.
     volumes:
       - ./captures:/app/captures
       - ./models:/app/models
@@ -49,8 +55,9 @@ services:
 
   # Automatic container updater: polls GitHub Container Registry every 5 minutes
   # and seamlessly pulls & restarts thumbnail-grabber when a new build finishes.
+  # Uses the actively maintained nickfedor/watchtower fork (compatible with Docker 26+).
   watchtower:
-    image: containrrr/watchtower:latest
+    image: nickfedor/watchtower:latest
     container_name: thumbnail-grabber-watchtower
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock

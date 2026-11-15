@@ -1,6 +1,9 @@
 import cv2
 import time
 import os
+import socket
+import types
+import urllib.parse
 import threading
 import contextlib
 from collections import deque
@@ -11,6 +14,7 @@ import numpy as np
 from config import AppConfig, redact_credentials
 from analyzer import PersonQualityAnalyzer, AnalysisResult
 from ai_judge import AIJudge, JudgeResult
+import settings_store
 
 @dataclass
 class CapturedScreenshot:
@@ -37,11 +41,11 @@ def subject_crop_rect(analysis: AnalysisResult, frame_w: int, frame_h: int,
     the face box. Returns None if neither is usable.
     """
     faces = analysis.faces or []
-    primary = faces[0] if faces else None
+    primary = next((f for f in faces if getattr(f, "is_selected", True)), faces[0]) if faces else None
     rect = getattr(primary, "subject_bbox", None) if primary else None
 
     if not rect or rect[2] <= 0 or rect[3] <= 0:
-        bbox = analysis.face_bbox
+        bbox = (getattr(primary, "bbox", None) if primary else None) or analysis.face_bbox
         if not bbox or bbox[2] <= 0 or bbox[3] <= 0:
             return None
         fx, fy, fw, fh = bbox
@@ -71,7 +75,11 @@ def write_capture(frame: np.ndarray, analysis: AnalysisResult, out_dir: str,
     if fmt not in ("png", "jpg", "jpeg"):
         fmt = "png"
     ext = ".png" if fmt == "png" else ".jpg"
-    params = [] if fmt == "png" else [int(cv2.IMWRITE_JPEG_QUALITY), int(config.jpeg_quality)]
+    params = (
+        [int(cv2.IMWRITE_PNG_COMPRESSION), 1]
+        if fmt == "png"
+        else [int(cv2.IMWRITE_JPEG_QUALITY), int(config.jpeg_quality)]
+    )
 
     filepath = os.path.join(out_dir, base_name + ext)
     cv2.imwrite(filepath, frame, params)
@@ -92,9 +100,11 @@ def write_capture(frame: np.ndarray, analysis: AnalysisResult, out_dir: str,
 class StreamProcessor:
     # Connection status constants
     STATUS_DISCONNECTED = "disconnected"
+    STATUS_UNCONFIGURED = "unconfigured"
     STATUS_CONNECTING = "connecting"
     STATUS_CONNECTED = "connected"
     STATUS_RECONNECTING = "reconnecting"
+    STATUS_STANDBY = "standby"
     STATUS_FAILED = "failed"
 
     def __init__(self, config: AppConfig, on_frame_callback: Optional[Callable[[np.ndarray, AnalysisResult], None]] = None, on_capture_callback: Optional[Callable[[CapturedScreenshot], None]] = None):
@@ -141,8 +151,15 @@ class StreamProcessor:
         # first use so it costs nothing when the buffer is off.
         self._refine_analyzer: Optional[PersonQualityAnalyzer] = None
         if dvr_frames > 0:
+            est_mb = (dvr_frames * 0.36) if getattr(config, "dvr_jpeg_compression", True) else (dvr_frames * 6.22)
             print(f"[StreamProcessor] Frame buffer: {config.dvr_buffer_seconds:.0f}s "
-                  f"({dvr_frames} frames, ~{dvr_frames * 6.22 / 1024:.2f} GB at 1080p)")
+                  f"({dvr_frames} frames, ~{est_mb:.0f} MB at 1080p"
+                  f"{', Q95 JPEG' if getattr(config, 'dvr_jpeg_compression', True) else ''})")
+
+        # Lifecycle & persistence flags
+        self.paused: bool = False
+        self.idle_standby: bool = False
+        self.persist_manifests: bool = False
 
         # Buffer for peak detection & Single Winner tracking
         self.candidate_buffer = deque()
@@ -253,6 +270,115 @@ class StreamProcessor:
             except Exception:
                 pass
 
+    def enable_persistence(self, adopt_orphans: bool = True) -> None:
+        """Enables folder-scoped capture/pin manifest persistence in TG_DATA_DIR."""
+        self.persist_manifests = True
+        with getattr(self, "captures_lock", contextlib.nullcontext()):
+            loaded = settings_store.load_captures_manifest(
+                self.config.output_dir, adopt_orphans=adopt_orphans
+            )
+            self.saved_captures = loaded
+            self.captures_count = len([c for c in loaded if not getattr(c, "from_video_scan", False)])
+            if loaded:
+                self._persist_manifest()
+
+    def _persist_manifest(self) -> None:
+        if getattr(self, "persist_manifests", False) and getattr(self, "config", None) and self.config.output_dir:
+            settings_store.save_captures_manifest(self.config.output_dir, self.saved_captures)
+
+    def switch_output_dir(self, new_dir: str, adopt_orphans: bool = True) -> List[CapturedScreenshot]:
+        """Switches output directory cleanly, saving the previous folder's manifest and loading the new one."""
+        with getattr(self, "captures_lock", contextlib.nullcontext()):
+            if getattr(self, "persist_manifests", False) and self.config.output_dir:
+                settings_store.save_captures_manifest(self.config.output_dir, self.saved_captures)
+            self.config.output_dir = new_dir
+            if hasattr(self, "candidate_buffer") and self.candidate_buffer is not None:
+                self.candidate_buffer.clear()
+            if hasattr(self, "_review_lock") and hasattr(self, "_review_queue"):
+                with self._review_lock:
+                    self._review_queue.clear()
+            if getattr(self, "persist_manifests", False):
+                loaded = settings_store.load_captures_manifest(new_dir, adopt_orphans=adopt_orphans)
+                self.saved_captures = loaded
+                self.captures_count = len([c for c in loaded if not getattr(c, "from_video_scan", False)])
+                if loaded:
+                    self._persist_manifest()
+            else:
+                self.saved_captures = []
+                self.captures_count = 0
+            return list(self.saved_captures)
+
+    def add_scan_captures(self, new_captures: List[CapturedScreenshot], target_dir: Optional[str] = None) -> None:
+        """Records offline video-scan captures into the appropriate folder's gallery/manifest."""
+        if not new_captures:
+            return
+        dest = os.path.abspath(target_dir or self.config.output_dir)
+        curr = os.path.abspath(self.config.output_dir) if self.config.output_dir else ""
+        same_dir = os.path.normcase(dest) == os.path.normcase(curr)
+        if same_dir:
+            with getattr(self, "captures_lock", contextlib.nullcontext()):
+                existing_paths = {os.path.normcase(c.filepath) for c in self.saved_captures}
+                for cap in new_captures:
+                    if os.path.normcase(cap.filepath) not in existing_paths:
+                        self.saved_captures.append(cap)
+                        existing_paths.add(os.path.normcase(cap.filepath))
+                self._persist_manifest()
+        elif getattr(self, "persist_manifests", False):
+            other = settings_store.load_captures_manifest(dest, adopt_orphans=False)
+            existing_paths = {os.path.normcase(c.filepath) for c in other}
+            for cap in new_captures:
+                if os.path.normcase(cap.filepath) not in existing_paths:
+                    other.append(cap)
+                    existing_paths.add(os.path.normcase(cap.filepath))
+            settings_store.save_captures_manifest(dest, other)
+
+    def set_idle_standby(self, enabled: bool) -> bool:
+        """Toggles Zero-CPU Idle Standby (pauses CV inference & frees DVR RAM when idle)."""
+        new_val = bool(enabled)
+        prev = getattr(self, "idle_standby", False)
+        self.idle_standby = new_val
+        if new_val and not prev:
+            with self._dvr_lock:
+                self._dvr.clear()
+            if hasattr(self, "candidate_buffer") and self.candidate_buffer is not None:
+                self.candidate_buffer.clear()
+            self.current_fps = 0.0
+            print("[StreamProcessor] Entered idle standby (0 viewers, capture off — CV paused, DVR released).")
+        elif not new_val and prev:
+            print("[StreamProcessor] Woke from idle standby.")
+        return self.idle_standby
+
+    @staticmethod
+    def _rtsp_tcp_reachable(url: str, timeout: float = 1.5) -> bool:
+        """Fast 1-socket check before invoking FFmpeg while a powered-off camera is in standby."""
+        try:
+            parsed = urllib.parse.urlsplit(url)
+            host = parsed.hostname
+            port = parsed.port or (322 if parsed.scheme.lower() == "rtsps" else 554)
+            if not host:
+                return True
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except OSError:
+            return False
+
+    @staticmethod
+    def _dvr_entry_nbytes(entry: tuple) -> int:
+        payload = entry[1]
+        if isinstance(payload, (bytes, bytearray)):
+            return len(payload)
+        return int(getattr(payload, "nbytes", 0))
+
+    @staticmethod
+    def _decode_dvr_frame(entry: tuple) -> Optional[np.ndarray]:
+        payload = entry[1]
+        if isinstance(payload, np.ndarray):
+            return payload
+        if isinstance(payload, (bytes, bytearray)):
+            arr = np.frombuffer(payload, dtype=np.uint8)
+            return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        return None
+
     def _open_capture(self) -> Optional[cv2.VideoCapture]:
         source = self.config.stream_source.strip()
         
@@ -273,20 +399,61 @@ class StreamProcessor:
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         return cap
 
+    def _wait_for_rtsp_standby(self, source: str) -> Optional[cv2.VideoCapture]:
+        """Polls a powered-off RTSP camera lightly until it comes online or stop() is called."""
+        poll_sec = max(1.0, float(getattr(self.config, "rtsp_standby_poll_sec", 15.0) or 15.0))
+        self._set_status(self.STATUS_STANDBY)
+        print(f"[StreamProcessor] Camera offline ({redact_credentials(source)}); "
+              f"standing by and polling every {poll_sec:.0f}s until powered on.")
+        # Only pre-probe TCP when _open_capture hasn't been replaced by a test stub.
+        use_tcp_probe = isinstance(getattr(self, "_open_capture", None), types.MethodType)
+        while not self._stop_event.is_set():
+            if self._stop_event.wait(poll_sec):
+                return None
+            if use_tcp_probe and not self._rtsp_tcp_reachable(source, timeout=1.5):
+                continue
+            cap = self._open_capture()
+            if cap is not None:
+                print("[StreamProcessor] RTSP camera online — connected from standby.")
+                return cap
+        return None
+
     def _grabber_loop(self):
         """Dedicated high-speed loop reading camera frames as fast as they arrive."""
-        self.cap = self._open_capture()
-        if not self.cap:
-            self._set_status(self.STATUS_FAILED)
-            self.running = False
-            self._stop_event.set()  # also stops the analysis loop
+        source = (self.config.stream_source or "").strip()
+        if not source:
+            self._set_status(self.STATUS_UNCONFIGURED)
+            self._stop_event.wait()
             return
 
-        is_rtsp = self.config.stream_source.startswith("rtsp://")
+        is_rtsp = source.lower().startswith(("rtsp://", "rtsps://"))
+        self.cap = self._open_capture()
+        if not self.cap:
+            if is_rtsp:
+                self.cap = self._wait_for_rtsp_standby(source)
+                if not self.cap:
+                    return
+            else:
+                self._set_status(self.STATUS_FAILED)
+                self.running = False
+                self._stop_event.set()  # also stops the analysis loop
+                return
+
         self._set_status(self.STATUS_CONNECTED)
         self.reconnect_attempt = 0
+        idle_tick = 0
 
         while not self._stop_event.is_set():
+            # Zero-CPU Idle Standby: drain live camera socket with cheap grab() without
+            # full H.264/BGR decode on most frames, decoding 1 frame ~every 1.5s.
+            if getattr(self, "idle_standby", False) and (is_rtsp or source.isdigit()) and hasattr(self.cap, "grab"):
+                idle_tick += 1
+                if idle_tick % 45 != 0:
+                    ok_grab = self.cap.grab()
+                    if ok_grab:
+                        time.sleep(0.015)
+                        continue
+
             ret, frame = self.cap.read()
             if not ret or frame is None:
                 if is_rtsp:
@@ -294,11 +461,15 @@ class StreamProcessor:
                     self.reconnect_attempt += 1
                     
                     if self.reconnect_attempt > self.config.rtsp_max_retries:
-                        print(f"[StreamProcessor] RTSP reconnection failed after {self.config.rtsp_max_retries} attempts. Giving up.")
-                        self._set_status(self.STATUS_FAILED)
-                        self.running = False
-                        self._stop_event.set()  # also stops the analysis loop
-                        return
+                        if self.cap:
+                            self.cap.release()
+                            self.cap = None
+                        self.cap = self._wait_for_rtsp_standby(source)
+                        if not self.cap:
+                            return
+                        self._set_status(self.STATUS_CONNECTED)
+                        self.reconnect_attempt = 0
+                        continue
                     
                     # Exponential backoff: 1s, 2s, 4s, 8s, ... capped at rtsp_backoff_max
                     backoff = min(
@@ -328,7 +499,7 @@ class StreamProcessor:
                     continue
                 else:
                     # Video file loop
-                    if self.cap and self.cap.get(cv2.CAP_PROP_FRAME_COUNT) > 0:
+                    if self.cap and hasattr(self.cap, "get") and self.cap.get(cv2.CAP_PROP_FRAME_COUNT) > 0:
                         self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                         continue
                     else:
@@ -339,11 +510,16 @@ class StreamProcessor:
             with self.frame_lock:
                 self.latest_frame = frame
                 self.frames_grabbed += 1
-            if self._dvr.maxlen:
+            if self._dvr.maxlen and not getattr(self, "idle_standby", False):
+                dvr_item = (now_grab, frame)
+                if getattr(self.config, "dvr_jpeg_compression", True):
+                    ok_enc, enc = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+                    if ok_enc:
+                        dvr_item = (now_grab, enc.tobytes(), frame.shape)
                 with self._dvr_lock:
                     # deque(maxlen) evicts the oldest, so memory stays bounded without
                     # any trimming pass on the hot path.
-                    self._dvr.append((now_grab, frame))
+                    self._dvr.append(dvr_item)
 
             # Yield slightly to prevent 100% CPU lock in grabber thread
             time.sleep(0.001)
@@ -357,7 +533,7 @@ class StreamProcessor:
         frame_counter = 0
 
         while not self._stop_event.is_set():
-            if getattr(self, "paused", False):
+            if getattr(self, "paused", False) or getattr(self, "idle_standby", False):
                 time.sleep(0.25)
                 continue
             start_time = time.time()
@@ -397,7 +573,8 @@ class StreamProcessor:
             # gone, which is the "good shot passed by" case. Anything refinement can't
             # rescue is rejected again after the fact.
             now = time.time()
-            primary = (analysis.faces or [None])[0]
+            faces = analysis.faces or []
+            primary = next((f for f in faces if getattr(f, "is_selected", True)), faces[0]) if faces else None
             reasons = list(getattr(primary, "disqualified_reasons", []) or []) if primary else []
             # Blur also drags the score under the threshold, so a smeared frame lists
             # both reasons. Treat it as blur-only when every reason is blur or the
@@ -460,11 +637,11 @@ class StreamProcessor:
         """
         with self._dvr_lock:
             frames = len(self._dvr)
-            held = sum(f.nbytes for _, f in self._dvr)
-            newest = self._dvr[-1][1] if frames else None
+            held = sum(self._dvr_entry_nbytes(entry) for entry in self._dvr)
+            newest_entry = self._dvr[-1] if frames else None
             span = (self._dvr[-1][0] - self._dvr[0][0]) if frames > 1 else 0.0
         capacity = self._dvr.maxlen or 0
-        per_frame = int(newest.nbytes) if newest is not None else 0
+        per_frame = self._dvr_entry_nbytes(newest_entry) if newest_entry is not None else 0
         # What the camera is really delivering. dvr_buffer_fps only sizes the buffer;
         # if the camera runs faster, the same frame count covers proportionally less
         # time, so the configured seconds quietly become fewer. Reporting both makes
@@ -474,6 +651,7 @@ class StreamProcessor:
             "measured_fps": measured_fps,
             "seconds_short": bool(measured_fps and span + 0.3 < float(self.config.dvr_buffer_seconds)),
             "enabled": capacity > 0,
+            "compressed": bool(getattr(self.config, "dvr_jpeg_compression", True)),
             "seconds": float(self.config.dvr_buffer_seconds),
             "fps": int(self.config.dvr_buffer_fps),
             "frames_held": frames,
@@ -526,23 +704,28 @@ class StreamProcessor:
             return chosen_frame, chosen_analysis
 
         with self._dvr_lock:
-            nearby = [(t, f) for (t, f) in self._dvr if abs(t - chosen_at) <= window]
-        if len(nearby) < 2:
+            nearby_entries = [entry for entry in self._dvr if abs(entry[0] - chosen_at) <= window]
+        if len(nearby_entries) < 2:
             return chosen_frame, chosen_analysis
 
         # Cheap proxy first: sharpness over the subject region, normalised the same way
         # the analyzer does it so the numbers mean the same thing.
         faces = chosen_analysis.faces or []
-        rect = getattr(faces[0], "subject_bbox", None) if faces else None
-        if not rect:
-            rect = chosen_analysis.face_bbox
+        primary_face = next((f for f in faces if getattr(f, "is_selected", True)), faces[0]) if faces else None
+        rect = getattr(primary_face, "subject_bbox", None) if primary_face else None
+        if not rect or rect[2] <= 0 or rect[3] <= 0:
+            rect = (getattr(primary_face, "bbox", None) if primary_face else None) or chosen_analysis.face_bbox
         if not rect:
             return chosen_frame, chosen_analysis
         rx, ry, rw, rh = rect
         height = self.analyzer.thresholds.sharpness_face_height
 
         scored = []
-        for t, f in nearby:
+        for entry in nearby_entries:
+            t = entry[0]
+            f = self._decode_dvr_frame(entry)
+            if f is None:
+                continue
             roi = f[max(0, ry):ry + rh, max(0, rx):rx + rw]
             if roi.size == 0:
                 continue
@@ -557,16 +740,23 @@ class StreamProcessor:
         if self._refine_analyzer is None:
             self._refine_analyzer = PersonQualityAnalyzer(
                 self.config.weights, self.config.thresholds,
-                max_people_target=self.config.max_people_target,
+                max_people_target=self.analyzer.max_people_target,
+                selected_person_ids=list(self.analyzer.selected_person_ids),
                 pose_hand_interval=1,
                 require_temporal_stability=False,
                 use_ml_preference=getattr(self.config, "use_ml_preference", True),
                 ml_weight=getattr(self.config, "ml_weight", 0.35),
-                require_exact_people_count=getattr(self.config, "require_exact_people_count", False),
-                capture_prop_moments=getattr(self.config, "capture_prop_moments", True),
+                require_exact_people_count=self.analyzer.require_exact_people_count,
+                capture_prop_moments=getattr(self.analyzer, "capture_prop_moments", True),
+                fast_reject=True,
             )
+            self._refine_analyzer.preference_model = self.analyzer.preference_model
         else:
+            self._refine_analyzer.max_people_target = self.analyzer.max_people_target
+            self._refine_analyzer.selected_person_ids = set(self.analyzer.selected_person_ids)
+            self._refine_analyzer.require_exact_people_count = self.analyzer.require_exact_people_count
             self._refine_analyzer.capture_prop_moments = getattr(self.analyzer, "capture_prop_moments", True)
+            self._refine_analyzer.preference_model = self.analyzer.preference_model
 
         started_qualified = chosen_analysis.is_qualified
         best_frame, best_analysis = chosen_frame, chosen_analysis
@@ -584,10 +774,12 @@ class StreamProcessor:
         if best_analysis is not chosen_analysis:
             print(f"[Refine] {chosen_analysis.overall_score:.0%} -> {best_score:.0%} "
                   f"(sharpness {chosen_analysis.laplacian_variance:.0f} -> "
-                  f"{best_analysis.laplacian_variance:.0f}) from {len(nearby)} buffered frames")
+                  f"{best_analysis.laplacian_variance:.0f}) from {len(nearby_entries)} buffered frames")
         return best_frame, best_analysis
 
-    def _would_improve_retained(self, score: float, now: float, is_prop_moment: bool = False) -> bool:
+    def _would_improve_retained(self, score: float, now: float,
+                                is_prop_moment: bool = False,
+                                is_smiling: bool = False) -> bool:
         """Is this capture worth writing, given what is already kept?
 
         This replaced a check that compared each candidate against the *last saved*
@@ -613,6 +805,7 @@ class StreamProcessor:
         prop_cap = min(max(0, int(getattr(self.config, "max_prop_captures", 2))), max(0, n - 1)) if prop_enabled else 0
         kept_props = [c for c in kept if getattr(c, "is_prop_moment", False)]
         non_props = [c for c in kept if not getattr(c, "is_prop_moment", False)]
+        has_kept_smile = any(getattr(getattr(c, "analysis", None), "is_smiling", False) for c in kept)
 
         spacing = max(0.0, float(getattr(self.config, "min_capture_spacing_sec", 0.0)))
         if spacing > 0:
@@ -626,6 +819,8 @@ class StreamProcessor:
                         return score > max(c.overall_score for c in nearby_props)
                     if len(kept_props) < prop_cap:
                         return True
+                if is_smiling and n >= 3 and not has_kept_smile and score >= self.config.thresholds.min_overall_score:
+                    return True
                 return score > max(c.overall_score for c in nearby)
 
         if is_prop_moment and prop_enabled:
@@ -633,6 +828,11 @@ class StreamProcessor:
                 return True
             if kept_props:
                 return score > min(c.overall_score for c in kept_props) or score > min(c.overall_score for c in kept)
+
+        # Expression diversity: when the gallery has 0 smiles across >=3 slots, admit a
+        # qualified smiling shot so a warm smile isn't locked out by 5 neutral shots.
+        if is_smiling and n >= 3 and not has_kept_smile and score >= self.config.thresholds.min_overall_score:
+            return True
 
         if not is_prop_moment and prop_enabled and kept_props and len(kept_props) <= prop_cap and non_props:
             return score > min(c.overall_score for c in non_props)
@@ -667,9 +867,12 @@ class StreamProcessor:
             return
 
         is_prop = bool(getattr(best_analysis, "is_prop_moment", False))
+        is_smile = bool(getattr(best_analysis, "is_smiling", False))
 
         # === Would this actually improve what we're keeping? ===
-        if not self._would_improve_retained(best_analysis.overall_score, cand_time, is_prop_moment=is_prop):
+        if not self._would_improve_retained(
+            best_analysis.overall_score, cand_time, is_prop_moment=is_prop, is_smiling=is_smile
+        ):
             return
 
         # All checks passed — either save now, or send it for review first.
@@ -790,10 +993,13 @@ class StreamProcessor:
                 result.blended_score = round(min(result.blended_score, analysis.overall_score * 0.5), 3)
 
             is_prop = bool(getattr(analysis, "is_prop_moment", False))
+            is_smile = bool(getattr(analysis, "is_smiling", False))
 
             # Re-check against the kept set with the blended score: the review took a
             # few seconds, and a better capture may have landed meanwhile.
-            if not self._would_improve_retained(result.blended_score, actual_time, is_prop_moment=is_prop):
+            if not self._would_improve_retained(
+                result.blended_score, actual_time, is_prop_moment=is_prop, is_smiling=is_smile
+            ):
                 return
 
             self.save_screenshot(frame, analysis, review=result, captured_at=actual_time)
@@ -820,6 +1026,7 @@ class StreamProcessor:
             if removed:
                 self.saved_captures = keep
                 self.captures_count = len([c for c in keep if not getattr(c, "from_video_scan", False)])
+                self._persist_manifest()
         return removed
 
     def set_capture_pinned(self, filepath: str, pinned: Optional[bool] = None) -> Optional[bool]:
@@ -834,6 +1041,8 @@ class StreamProcessor:
                     break
             if new_state is False and self.config.single_winner_mode:
                 self.prune_to_best_n(self.config.max_retained_captures)
+            elif new_state is not None:
+                self._persist_manifest()
         return new_state
 
     def clear_captures(self, mode: str = "unpinned") -> Dict[str, int]:
@@ -910,6 +1119,7 @@ class StreamProcessor:
 
             self.saved_captures = keep
             self.captures_count = len([c for c in keep if not getattr(c, "from_video_scan", False)])
+            self._persist_manifest()
 
         if mode in ("unpinned", "all"):
             if hasattr(self, "candidate_buffer") and self.candidate_buffer is not None:
@@ -977,6 +1187,7 @@ class StreamProcessor:
                 self.prune_to_best_n(self.config.max_retained_captures)
             else:
                 self.captures_count += 1
+                self._persist_manifest()
                 if self.on_capture_callback:
                     self.on_capture_callback(capture_item)
             
@@ -1001,6 +1212,7 @@ class StreamProcessor:
                 kept_live = sorted(pinned_items, key=lambda item: item.overall_score, reverse=True)
                 self.saved_captures = kept_live + scan_items
                 self.captures_count = len(kept_live)
+                self._persist_manifest()
                 return
 
             # Best first, but five shots from the same ten seconds are one shot with
@@ -1026,6 +1238,31 @@ class StreamProcessor:
                         ):
                             continue
                         winners.append(c)
+
+            # Expression diversity: when retaining >=3 shots and no smile is in winners yet,
+            # reserve 1 slot for the strongest qualified smiling shot so a warm smile is kept.
+            min_qual_score = float(getattr(getattr(self.config, "thresholds", None), "min_overall_score", 0.55))
+            if n >= 3 and len(winners) < n and not any(
+                getattr(getattr(w, "analysis", None), "is_smiling", False) for w in winners
+            ):
+                smile_candidates = [
+                    c for c in ordered
+                    if c not in winners
+                    and getattr(getattr(c, "analysis", None), "is_smiling", False)
+                    and c.overall_score >= min_qual_score
+                ]
+                picked_smile = False
+                for enforce in (True, False):
+                    if picked_smile:
+                        break
+                    for c in smile_candidates:
+                        if enforce and spacing > 0 and any(
+                            abs(c.captured_at - w.captured_at) < spacing for w in winners
+                        ):
+                            continue
+                        winners.append(c)
+                        picked_smile = True
+                        break
 
             for enforce in (True, False):
                 for c in ordered:
@@ -1055,7 +1292,9 @@ class StreamProcessor:
 
             self.saved_captures = kept_live + scan_items
             self.captures_count = len(kept_live)
+            self._persist_manifest()
 
         # Notify callback with the champion winner
-        if kept_live and self.on_capture_callback:
-            self.on_capture_callback(kept_live[0])
+        cb = getattr(self, "on_capture_callback", None)
+        if kept_live and cb:
+            cb(kept_live[0])

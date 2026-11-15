@@ -83,6 +83,7 @@ class VideoRecordingScanner:
             ml_weight=getattr(self.config, "ml_weight", 0.35),
             require_exact_people_count=getattr(self.config, "require_exact_people_count", False),
             capture_prop_moments=getattr(self.config, "capture_prop_moments", True),
+            fast_reject=True,
         )
 
     @staticmethod
@@ -136,6 +137,43 @@ class VideoRecordingScanner:
             return f"{hours:02d}:{minutes:02d}:{secs:02d}"
         return f"{minutes:02d}:{secs:02d}"
 
+    @staticmethod
+    def parse_timestamp_sec(raw: Any) -> Optional[float]:
+        """Parses seconds, 'MM:SS', or 'HH:MM:SS' into float seconds, or None if blank.
+
+        Raises ValueError on malformed or negative timestamp input.
+        """
+        if raw is None:
+            return None
+        if isinstance(raw, (int, float)):
+            val = float(raw)
+            if val < 0:
+                raise ValueError(f"Timestamp must be non-negative (got {raw})")
+            return val
+        s = str(raw).strip()
+        if not s:
+            return None
+        if ":" in s:
+            parts = [p.strip() for p in s.split(":")]
+            if len(parts) not in (2, 3):
+                raise ValueError(f"Invalid timestamp '{raw}' (use seconds, MM:SS, or HH:MM:SS)")
+            try:
+                nums = [float(p) for p in parts]
+            except ValueError as e:
+                raise ValueError(f"Invalid timestamp '{raw}' (use seconds, MM:SS, or HH:MM:SS)") from e
+            if any(n < 0 for n in nums):
+                raise ValueError(f"Timestamp must be non-negative (got '{raw}')")
+            if len(nums) == 2:
+                return nums[0] * 60.0 + nums[1]
+            return nums[0] * 3600.0 + nums[1] * 60.0 + nums[2]
+        try:
+            val = float(s)
+        except ValueError as e:
+            raise ValueError(f"Invalid timestamp '{raw}' (use seconds, MM:SS, or HH:MM:SS)") from e
+        if val < 0:
+            raise ValueError(f"Timestamp must be non-negative (got '{raw}')")
+        return val
+
     def scan_video(
         self,
         video_path: str,
@@ -146,6 +184,8 @@ class VideoRecordingScanner:
         output_dir: Optional[str] = None,
         progress_callback: Optional[Callable[[ScanProgress], None]] = None,
         cancel_event: Optional[threading.Event] = None,
+        start_sec: float = 0.0,
+        end_sec: Optional[float] = None,
     ) -> List[CapturedScreenshot]:
         """Scans the video file, analyzes sampled frames, selects the top diverse thumbnails,
         and saves them to output_dir.
@@ -205,13 +245,29 @@ class VideoRecordingScanner:
         total_frames = info.total_frames
         total_duration = info.duration_sec
 
+        start_s = max(0.0, float(start_sec or 0.0))
+        if total_duration > 0 and start_s >= total_duration:
+            start_s = 0.0
+        start_frame = min(max(0, int(round(start_s * video_fps))), max(0, total_frames - 1))
+        if end_sec is not None and float(end_sec) > start_s:
+            end_s = min(total_duration, float(end_sec)) if total_duration > 0 else float(end_sec)
+            end_frame = min(total_frames, max(start_frame + 1, int(round(end_s * video_fps))))
+        else:
+            end_s = total_duration
+            end_frame = total_frames
+
+        if start_frame > 0:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+        span_frames = max(1, end_frame - start_frame)
+
         champion_score = 0.0
         champion_frame: Optional[np.ndarray] = None
         champion_analysis: Optional[AnalysisResult] = None
 
         start_time = time.time()
         frames_analyzed = 0
-        current_frame_idx = 0
+        current_frame_idx = start_frame
 
         # Candidates are kept as best-per-time-bucket rather than in one flat list.
         # A flat list holds every qualifying frame at full resolution — ~6 MB each at
@@ -260,10 +316,10 @@ class VideoRecordingScanner:
             progress_callback(ScanProgress(
                 status="scanning",
                 progress_pct=0.0,
-                current_frame_idx=0,
-                total_frames=total_frames,
-                current_time_sec=0.0,
-                total_duration_sec=total_duration,
+                current_frame_idx=start_frame,
+                total_frames=end_frame,
+                current_time_sec=start_s,
+                total_duration_sec=end_s,
                 fps_speed=0.0,
                 estimated_time_remaining_sec=0.0,
                 total_candidates_analyzed=0,
@@ -272,7 +328,7 @@ class VideoRecordingScanner:
 
         last_progress_emit = time.time()
 
-        while True:
+        while current_frame_idx < end_frame:
             if cancel_event and cancel_event.is_set():
                 break
 
@@ -280,7 +336,7 @@ class VideoRecordingScanner:
             # Laplacian filters. cap.grab() advances the demuxer/decoder state in <0.1ms,
             # whereas cap.read() + BGR conversion + 1080p Laplacian on every skipped frame
             # bottlenecks 60fps 1080p videos to ~0.5x real-time (~1 hour for a 36m video).
-            if current_frame_idx % frame_step != 0:
+            if (current_frame_idx - start_frame) % frame_step != 0:
                 if not cap.grab():
                     break
                 current_frame_idx += 1
@@ -298,23 +354,24 @@ class VideoRecordingScanner:
 
             # Progress notification throttled to ~5 updates/sec
             now = time.time()
-            if now - last_progress_emit >= 0.20 or current_frame_idx >= total_frames - frame_step:
+            if now - last_progress_emit >= 0.20 or current_frame_idx >= end_frame - frame_step:
                 last_progress_emit = now
                 elapsed = now - start_time
-                fps_speed = (current_frame_idx + 1) / elapsed if elapsed > 0 else 0.0
+                frames_done = max(1, current_frame_idx - start_frame + 1)
+                fps_speed = frames_done / elapsed if elapsed > 0 else 0.0
                 
-                frames_remaining = max(0, total_frames - current_frame_idx)
+                frames_remaining = max(0, end_frame - current_frame_idx)
                 eta_sec = frames_remaining / fps_speed if fps_speed > 0 else 0.0
-                pct = min(100.0, (current_frame_idx / float(max(1, total_frames))) * 100.0)
+                pct = min(100.0, ((current_frame_idx - start_frame) / float(span_frames)) * 100.0)
 
                 if progress_callback:
                     progress_callback(ScanProgress(
                         status="scanning",
                         progress_pct=pct,
                         current_frame_idx=current_frame_idx,
-                        total_frames=total_frames,
+                        total_frames=end_frame,
                         current_time_sec=current_time_sec,
-                        total_duration_sec=total_duration,
+                        total_duration_sec=end_s,
                         fps_speed=fps_speed,
                         estimated_time_remaining_sec=eta_sec,
                         total_candidates_analyzed=frames_analyzed,
@@ -383,15 +440,16 @@ class VideoRecordingScanner:
 
         # Final progress emit
         final_status = "cancelled" if is_cancelled else "completed"
+        done_frames = max(0, current_frame_idx - start_frame)
         if progress_callback:
             progress_callback(ScanProgress(
                 status=final_status,
-                progress_pct=100.0 if not is_cancelled else min(100.0, (current_frame_idx / float(max(1, total_frames))) * 100.0),
+                progress_pct=100.0 if not is_cancelled else min(100.0, (done_frames / float(span_frames)) * 100.0),
                 current_frame_idx=current_frame_idx,
-                total_frames=total_frames,
-                current_time_sec=info.duration_sec,
-                total_duration_sec=total_duration,
-                fps_speed=(current_frame_idx / (time.time() - start_time)) if (time.time() - start_time) > 0 else 0.0,
+                total_frames=end_frame,
+                current_time_sec=end_s if not is_cancelled else (current_frame_idx / video_fps),
+                total_duration_sec=end_s,
+                fps_speed=(done_frames / (time.time() - start_time)) if (time.time() - start_time) > 0 else 0.0,
                 estimated_time_remaining_sec=0.0,
                 total_candidates_analyzed=frames_analyzed,
                 best_score_found=champion_score,
@@ -511,6 +569,19 @@ class VideoRecordingScanner:
                     if any(abs(cand.timestamp_sec - sel.timestamp_sec) < min_interval_sec for sel in selected):
                         continue
                     selected.append(cand)
+
+        # Reserve 1 slot for a warm smiling expression when top_n >= 3 and none selected yet
+        if top_n >= 3 and len(selected) < top_n and not any(
+            getattr(sel.analysis, "is_smiling", False) for sel in selected
+        ):
+            smile_pref = [c for c in preferred if getattr(c.analysis, "is_smiling", False)]
+            for cand in smile_pref:
+                if any(c.frame_idx == cand.frame_idx for c in selected):
+                    continue
+                if any(abs(cand.timestamp_sec - sel.timestamp_sec) < min_interval_sec for sel in selected):
+                    continue
+                selected.append(cand)
+                break
 
         _take(preferred, enforce_gap=True)
         _take(fallback, enforce_gap=True)

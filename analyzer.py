@@ -116,6 +116,8 @@ class SingleFaceAnalysis:
     tongue_out_score: float = 0.0
     eye_squint_score: float = 0.0
     eye_look_down_score: float = 0.0      # Gaze dropped, distinct from the head being down
+    eye_gaze_away_score: float = 0.0      # Conjugate horizontal gaze away from lens (0..1)
+    mouth_velocity: float = 0.0           # Frame-to-frame mouth delta in live capture
     mesh_from_blendshapes: bool = False   # True when the 478-pt mesh actually resolved
     disqualified_reasons: List[str] = field(default_factory=list)
 
@@ -213,6 +215,8 @@ class AnalysisResult:
     is_hand_blurry: bool = False
     is_hand_weird: bool = False
     is_looking_down: bool = False
+    eye_gaze_away_score: float = 0.0
+    mouth_velocity: float = 0.0
     hands_detected_count: int = 0
     
     # Primary Face Bounding Box & Landmarks
@@ -247,7 +251,8 @@ class PersonQualityAnalyzer:
                  ml_weight: float = 0.35,
                  min_consecutive_qualified: int = 2,
                  require_exact_people_count: bool = False,
-                 capture_prop_moments: bool = True):
+                 capture_prop_moments: bool = True,
+                 fast_reject: bool = False):
         self.weights = weights or QualityWeights()
         self.thresholds = thresholds or QualityThresholds()
         self.max_people_target = max(1, min(6, max_people_target))  # Clamp between 1 and 6
@@ -263,6 +268,7 @@ class PersonQualityAnalyzer:
         self.min_consecutive_qualified = max(1, int(min_consecutive_qualified))
         self.require_exact_people_count = bool(require_exact_people_count)
         self.capture_prop_moments = bool(capture_prop_moments)
+        self.fast_reject = bool(fast_reject)
 
         # Hand/pose re-detection cadence, and the cached results reused in between.
         # The cached landmarks are re-matched against the current faces every frame, so
@@ -299,6 +305,7 @@ class PersonQualityAnalyzer:
         self._last_detected_faces: List[np.ndarray] = []
         self._smooth_bboxes: Dict[int, Tuple[float, float, float, float]] = {}  # Per-person EMA smoothed bboxes
         self._bbox_ema_alpha: float = 0.20
+        self._prev_mouth_state: Dict[int, Tuple[float, float, float]] = {}
         
         self._ensure_models_exist()
 
@@ -321,16 +328,6 @@ class PersonQualityAnalyzer:
         # Model construction is the only place the native layer is chatty.
         with _quiet_native_startup():
             self._init_landmarkers()
-
-        # 3D Canonical Head Model for solvePnP
-        self.model_3d_points = np.array([
-            (0.0, 0.0, 0.0),             # Nose tip
-            (0.0, -330.0, -65.0),        # Chin
-            (-225.0, 170.0, -135.0),     # Right eye center
-            (225.0, 170.0, -135.0),      # Left eye center
-            (-150.0, -150.0, -125.0),    # Right mouth corner
-            (150.0, -150.0, -125.0)      # Left mouth corner
-        ], dtype=np.float64)
 
     def _init_landmarkers(self):
         """Builds the MediaPipe face / hand / pose landmarkers.
@@ -502,6 +499,27 @@ class PersonQualityAnalyzer:
         elif f_res.is_weird_mouth:
             raw_score *= max(0.20, 0.55 / p_mouth)
 
+        # Temporal mouth velocity: penalise mid-consonant lip/jaw travel in live capture,
+        # and give a tiny tie-breaker nudge to calm speech pauses with a settled mouth.
+        mouth_vel = getattr(f_res, "mouth_velocity", 0.0) or 0.0
+        if mouth_vel > 0.14:
+            vel_pen = min(1.0, (mouth_vel - 0.14) / 0.30)
+            raw_score *= max(0.78, 1.0 - 0.22 * vel_pen)
+        elif (getattr(self, "require_temporal_stability", False)
+              and f_res.mesh_from_blendshapes
+              and mouth_vel <= 0.035
+              and jaw <= 0.18
+              and not f_res.is_awkward_expression
+              and not f_res.is_blinking):
+            raw_score = min(1.0, raw_score * 1.025)
+
+        # Off-axis horizontal eye gaze: speaker's head faces forward, but eyes dart
+        # sharply sideways off-stage or to a confidence monitor.
+        gaze_away = getattr(f_res, "eye_gaze_away_score", 0.0) or 0.0
+        if not prop_active and gaze_away > 0.48:
+            side_pen = min(1.0, (gaze_away - 0.48) / 0.42)
+            raw_score *= max(0.65, 1.0 - 0.35 * side_pen)
+
         # Gaze dropped & head bowed: NEVER waive a bowed head or hidden eyes, even if
         # holding a prop! A usable thumbnail requires visible eyes and an engaged head.
         # Note: eye_look_down_score alone is NOT used to trigger effective_looking_down
@@ -640,6 +658,8 @@ class PersonQualityAnalyzer:
                         del self._tracked_slots[pid]
                         if pid in self._smooth_bboxes:
                             del self._smooth_bboxes[pid]
+                        if hasattr(self, '_prev_mouth_state') and pid in self._prev_mouth_state:
+                            del self._prev_mouth_state[pid]
         else:
             self._tracked_slots = {}
 
@@ -668,6 +688,8 @@ class PersonQualityAnalyzer:
             result.face_detected = False
             result.people_detected_count = 0
             self._smooth_bboxes.clear()
+            if hasattr(self, '_prev_mouth_state'):
+                self._prev_mouth_state.clear()
             return result
 
         result.face_detected = True
@@ -695,14 +717,6 @@ class PersonQualityAnalyzer:
         result.is_hand_weird = False
         result.hands_detected_count = 0
         
-        mp_image = None
-        if self.face_landmarker is not None or self.hand_landmarker is not None or self.pose_landmarker is not None:
-            try:
-                rgb_proc = cv2.cvtColor(proc_frame, cv2.COLOR_BGR2RGB)
-                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_proc)
-            except Exception:
-                pass
-
         # 1. MediaPipe FaceLandmarker with 52 Blendshapes (Mouth, Lip Licking, Talking & Blink Analysis)
         # Run per detected face on an upscaled crop. Run on the whole frame it finds
         # nothing whenever the subject is more than a few feet from the camera, which
@@ -726,8 +740,50 @@ class PersonQualityAnalyzer:
         else:
             self._blink_suppressed = False
 
+        # First active selected face drives telemetry, ML features, hand sharpness & crops;
+        # fall back to analyzed_faces[0] only when all detected faces are unselected.
+        selected_faces_early = [f for f in analyzed_faces if f.is_selected]
+        primary_ref = selected_faces_early[0] if selected_faces_early else analyzed_faces[0]
+
+        # Early-exit gate for offline video scanning & DVR burst refinement: when every
+        # selected face already fails a hard facial disqualifier that pose/hand/prop logic
+        # cannot rescue, skip full-frame HandLandmarker, PoseLandmarker, and Sobel/Canny cutout.
+        skip_heavy_models = False
+        if getattr(self, "fast_reject", False):
+            penalties = getattr(self.preference_model, "learned_penalties", {}) or {}
+            p_blur = float(penalties.get("blur", 1.0))
+            eff_min_sharp = self.thresholds.min_sharpness_laplacian * (1.0 + 0.15 * (p_blur - 1.0))
+            max_yaw_any = self.thresholds.max_yaw_deg * 1.35
+
+            def _has_fatal_face_flaw(f_chk: SingleFaceAnalysis) -> bool:
+                eff_down = (
+                    f_chk.is_looking_down
+                    or f_chk.pitch_deg < -14.0
+                    or (f_chk.pitch_deg < -10.0 and f_chk.eye_look_down_score > 0.58)
+                )
+                return (
+                    f_chk.is_blinking
+                    or f_chk.is_licking_lips
+                    or eff_down
+                    or abs(f_chk.yaw_deg) > max_yaw_any
+                    or (f_chk.laplacian_variance > 0.0 and f_chk.laplacian_variance < eff_min_sharp)
+                )
+
+            skip_heavy_models = (not selected_faces_early) or all(
+                _has_fatal_face_flaw(f_chk) for f_chk in selected_faces_early
+            )
+
+        mp_image = None
+        if not skip_heavy_models and (self.hand_landmarker is not None or self.pose_landmarker is not None):
+            try:
+                rgb_proc = cv2.cvtColor(proc_frame, cv2.COLOR_BGR2RGB)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_proc)
+            except Exception:
+                pass
+
         # 2. Hand Tracking
-        if self.hand_landmarker is not None and mp_image is not None:
+        faces_for_hand_check = selected_faces_early if selected_faces_early else analyzed_faces
+        if not skip_heavy_models and self.hand_landmarker is not None and mp_image is not None:
             try:
                 if self._detail_tick % self.pose_hand_interval == 0:
                     self._cached_hand_result = self.hand_landmarker.detect(mp_image)
@@ -744,8 +800,8 @@ class PersonQualityAnalyzer:
                             xs.append(px)
                             ys.append(py)
                             
-                            # Check against all detected face bboxes
-                            for f_item in analyzed_faces:
+                            # Check against selected face bboxes (or all if none selected)
+                            for f_item in faces_for_hand_check:
                                 bx, by, bw, bh = f_item.bbox
                                 if bx <= px <= bx + bw and by <= py <= by + bh:
                                     result.hands_covering_face = True
@@ -776,7 +832,7 @@ class PersonQualityAnalyzer:
                                         or hand_lap_var < result.hand_laplacian_variance):
                                     result.hand_laplacian_variance = round(hand_lap_var, 1)
 
-                                face_lap = analyzed_faces[0].laplacian_variance
+                                face_lap = primary_ref.laplacian_variance
                                 # A gesturing hand smears while the face stays sharp, so the
                                 # giveaway is the ratio, not an absolute floor.
                                 if (hand_lap_var < self.thresholds.min_hand_sharpness or
@@ -788,7 +844,7 @@ class PersonQualityAnalyzer:
                         pinky_tip = np.array(pts_full_res[20])
                         hand_span = np.linalg.norm(index_tip - pinky_tip)
                         
-                        primary_bbox = analyzed_faces[0].bbox
+                        primary_bbox = primary_ref.bbox
                         if primary_bbox is not None:
                             bx, by, bw, bh = primary_bbox
                             if min_y <= by + int(bh * 0.85) and max_x >= bx - int(bw * 0.5) and min_x <= bx + int(bw * 1.5) and hand_span > bw * 0.65:
@@ -799,7 +855,7 @@ class PersonQualityAnalyzer:
         result.hand_pose_score = 1.0
 
         # 3. Pose & Shoulder Tracking
-        if self.pose_landmarker is not None and mp_image is not None:
+        if not skip_heavy_models and self.pose_landmarker is not None and mp_image is not None:
             try:
                 if self._detail_tick % self.pose_hand_interval == 0:
                     self._cached_pose_result = self.pose_landmarker.detect(mp_image)
@@ -894,16 +950,18 @@ class PersonQualityAnalyzer:
             except Exception:
                 pass
 
-        self._detail_tick += 1
+        if not skip_heavy_models:
+            self._detail_tick += 1
 
         # Finalize score and qualification across all analyzed faces (incorporating shoulder metrics)
-        # Cutout scoring needs the pose landmarks matched above, so it runs here.
+        # Cutout scoring needs the pose landmarks matched above, so it runs here unless fast-rejected.
         for f_item in analyzed_faces:
-            self._compute_cutout_score(frame, f_item, result.hand_skeletons)
+            if not skip_heavy_models:
+                self._compute_cutout_score(frame, f_item, result.hand_skeletons)
             self._finalize_face_score(f_item)
 
-        # Populate root level fields from Primary (First) Face for telemetry & backward compatibility
-        primary = analyzed_faces[0]
+        # Populate root level fields from first SELECTED face (falling back to face 0 only if none selected)
+        primary = primary_ref
         result.face_bbox = primary.bbox
         result.head_pose_score = primary.head_pose_score
         result.eye_openness_score = primary.eye_openness_score
@@ -932,6 +990,8 @@ class PersonQualityAnalyzer:
         result.is_weird_mouth = primary.is_weird_mouth
         result.is_talking_or_open = primary.is_talking_or_open
         result.is_looking_down = primary.is_looking_down
+        result.eye_gaze_away_score = primary.eye_gaze_away_score
+        result.mouth_velocity = primary.mouth_velocity
         result.laplacian_variance = primary.laplacian_variance
         result.face_brightness = primary.face_brightness
         result.cutout_score = primary.cutout_score
@@ -1905,6 +1965,24 @@ class PersonQualityAnalyzer:
         blink_r = g('eyeBlinkRight', 0.0)
         squint = (g('eyeSquintLeft', 0.0) + g('eyeSquintRight', 0.0)) / 2.0
         look_down = (g('eyeLookDownLeft', 0.0) + g('eyeLookDownRight', 0.0)) / 2.0
+        look_left = (g('eyeLookOutLeft', 0.0) + g('eyeLookInRight', 0.0)) / 2.0
+        look_right = (g('eyeLookInLeft', 0.0) + g('eyeLookOutRight', 0.0)) / 2.0
+        gaze_away = max(look_left, look_right)
+
+        # Temporal mouth velocity across consecutive live frames for this person slot
+        prev_mouth = getattr(self, "_prev_mouth_state", {}).get(f_item.person_id)
+        curr_mouth = (float(jaw_open), float(pucker), float(funnel))
+        if self.require_temporal_stability and prev_mouth is not None:
+            mouth_vel = (
+                abs(curr_mouth[0] - prev_mouth[0])
+                + 0.6 * abs(curr_mouth[1] - prev_mouth[1])
+                + 0.6 * abs(curr_mouth[2] - prev_mouth[2])
+            )
+            f_item.mouth_velocity = round(mouth_vel, 3)
+        else:
+            f_item.mouth_velocity = 0.0
+        if hasattr(self, "_prev_mouth_state"):
+            self._prev_mouth_state[f_item.person_id] = curr_mouth
 
         # Exact lip licking detection (tongue actually protruding or lower lip sucked)
         is_licking = (tongue_out > 0.16) or (roll_lower > 0.55 and jaw_open > 0.15)
@@ -1951,6 +2029,7 @@ class PersonQualityAnalyzer:
         # notes with a level head still photographs fine, so it is tracked separately and
         # only nudges the score. is_looking_down stays reserved for the head itself.
         f_item.eye_look_down_score = round(look_down, 2)
+        f_item.eye_gaze_away_score = round(gaze_away, 2)
         f_item.smile_ratio = round(smile_score, 2)
         f_item.mar = round(jaw_open, 2)
         f_item.jaw_open_score = jaw_open
@@ -1995,7 +2074,27 @@ class PersonQualityAnalyzer:
             exposure_score = 0.5 + 0.5 * (mean_brightness - min_b) / (ideal_low - min_b)
         else:
             exposure_score = 0.5 + 0.5 * (max_b - mean_brightness) / (max_b - ideal_high)
-        
+
+        # RGB channel quality checks on central skin area: catch single-channel spotlight
+        # highlight clipping (e.g. R=254 while grey=160) and heavy stage LED colour washes.
+        if face_roi.ndim == 3 and face_roi.shape[2] == 3 and face_roi.shape[0] >= 12 and face_roi.shape[1] >= 12:
+            rh, rw = face_roi.shape[:2]
+            center = face_roi[int(rh * 0.18):max(int(rh * 0.18) + 2, int(rh * 0.82)),
+                              int(rw * 0.18):max(int(rw * 0.18) + 2, int(rw * 0.82))]
+            if center.size >= 12:
+                clip_frac = float(np.mean(np.max(center, axis=2) >= 250))
+                if clip_frac > 0.12:
+                    exposure_score *= max(0.40, 1.0 - 1.10 * (clip_frac - 0.12))
+
+                mean_b = float(np.mean(center[:, :, 0]))
+                mean_g = float(np.mean(center[:, :, 1]))
+                mean_r = float(np.mean(center[:, :, 2]))
+                # Unnatural LED colour wash (deep blue/violet, pure magenta/red, or green cast)
+                if (mean_b - mean_g > 35.0 and mean_b > 90.0) or (
+                    mean_r - mean_g > 85.0 and mean_g < 95.0
+                ) or (mean_g - max(mean_r, mean_b) > 45.0):
+                    exposure_score *= 0.62
+
         return round(max(0.0, min(1.0, exposure_score)), 2), round(mean_brightness, 1)
 
     def _compute_centering_score(self, fx: int, fy: int, fw: int, fh: int,

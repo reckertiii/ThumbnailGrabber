@@ -15,7 +15,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # directory hides the baked weights, forcing a re-download on every start - and
 # failing the container outright on a host with no outbound internet.
 ENV TG_MODELS_DIR=/opt/tg-models
-# User ratings do need to survive restarts, so they stay on the mounted volume.
+# User ratings, saved camera settings, and UI/gallery manifests persist here.
 ENV TG_DATA_DIR=/app/models
 
 # System runtime libraries for OpenCV, MediaPipe, FFMPEG and timezones.
@@ -41,16 +41,11 @@ WORKDIR /app
 
 # Install Python dependencies
 COPY requirements.txt .
-# Filter out desktop GUI dependencies (PyQt6) in container for minimal image size
 RUN pip install --no-cache-dir --upgrade pip && \
-    grep -v -i "pyqt" requirements.txt > /tmp/reqs-docker.txt && \
-    pip install --no-cache-dir -r /tmp/reqs-docker.txt && \
-    rm /tmp/reqs-docker.txt
+    pip install --no-cache-dir -r requirements.txt
 
 # Copy application source code. Tests are intentionally not shipped in the runtime image.
-# main.py is included for the headless CLI scanner; it only imports PyQt6 inside the
-# GUI branch, so it runs fine in this image without the desktop dependency.
-COPY analyzer.py config.py overlay.py preference_model.py stream_processor.py video_scanner.py ai_judge.py camera_probe.py camera_store.py main.py ./
+COPY analyzer.py config.py overlay.py preference_model.py stream_processor.py video_scanner.py ai_judge.py camera_probe.py camera_store.py settings_store.py main.py ./
 COPY web/ ./web/
 
 # Create directories for baked models, persistent user data, and captures
@@ -66,6 +61,9 @@ RUN python -c "from analyzer import PersonQualityAnalyzer; PersonQualityAnalyzer
 VOLUME ["/app/captures", "/app/models"]
 
 EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=25s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=4)"
 
 # Run FastAPI web server
 CMD ["python", "-m", "web.server", "--host", "0.0.0.0", "--port", "8000"]

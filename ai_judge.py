@@ -224,7 +224,7 @@ class AIJudge:
         self.config = config
         self.enabled = bool(getattr(config, "ai_judge_enabled", False))
         self.backend = str(getattr(config, "ai_judge_backend", "auto")).strip().lower()
-        self.model = getattr(config, "ai_judge_model", "claude-opus-5")
+        self.model = getattr(config, "ai_judge_model", "claude-sonnet-4-6")
         self.effort = getattr(config, "ai_judge_effort", "medium")
         self.ollama_url = str(getattr(config, "ai_judge_ollama_url", "http://localhost:11434")).rstrip("/")
         self.ollama_model = getattr(config, "ai_judge_ollama_model", "qwen3-vl:4b")
@@ -341,14 +341,16 @@ class AIJudge:
     def expired(self) -> bool:
         return self.seconds_remaining <= 0
 
-    def reset_window(self) -> None:
+    def reset_window(self, min_hours: Optional[float] = None) -> None:
         """Re-arms the judge for another full window without restarting the app."""
+        if min_hours is not None and min_hours > 0 and self.active_seconds > 0:
+            self.active_seconds = max(self.active_seconds, float(min_hours) * 3600.0)
         self.started_at = time.time()
         self._expiry_handled = False
         if self.enabled:
             print(f"[AIJudge] Woken for another {self.active_seconds / 3600:.1f}h.")
 
-    def wake(self) -> None:
+    def wake(self, min_hours: Optional[float] = None) -> None:
         """Re-arms the window and pulls the model back into memory.
 
         Resetting the timer alone left Ollama idle at a few MB until the first
@@ -357,7 +359,7 @@ class AIJudge:
         load is started here and runs on its own thread -- it can take minutes,
         which is far too long to hold an HTTP request open.
         """
-        self.reset_window()
+        self.reset_window(min_hours=min_hours)
         self.preload_async()
 
     def preload_async(self) -> None:

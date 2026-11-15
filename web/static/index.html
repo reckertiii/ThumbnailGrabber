@@ -12,12 +12,18 @@
   <span id="statusDot" class="dot">&#9679;</span>
   <span id="statusText" class="status-text">Connecting…</span>
   <h1>AI Thumbnail Selector</h1>
+  <button id="activeSourcePill" type="button" class="source-pill" title="Active video source — click to configure camera">No camera</button>
   <span class="spacer"></span>
   <button id="btnOpenScanModal" class="btn btn-purple">📼 Scan Video File</button>
-  <label class="src-label" for="src">Source</label>
-  <input id="src" type="text" placeholder="rtsp://… , 0, or file path">
-  <button id="btnSource" class="btn">Connect Stream</button>
-  <button id="btnOpenCamera" class="btn btn-purple">📷 Camera…</button>
+  <button id="btnOpenCamera" class="btn btn-slate">📷 Camera…</button>
+  <select id="selCaptureLimit" class="capture-limit-select" title="Auto-stop capture timer so capture never runs indefinitely if forgotten">
+    <option value="60">⏱ Max: 1h</option>
+    <option value="90">⏱ Max: 1.5h</option>
+    <option value="120" selected>⏱ Max: 2h</option>
+    <option value="180">⏱ Max: 3h</option>
+    <option value="240">⏱ Max: 4h</option>
+    <option value="0">⏱ No limit</option>
+  </select>
   <button id="btnStartStop" class="btn btn-start">▶ Start Capture</button>
 </header>
 
@@ -110,7 +116,7 @@
 
     <div class="card">
       <h2>Frame Buffer</h2>
-      <div class="row" style="align-items:center;gap:8px">
+      <div class="row" style="align-items:center;gap:8px;display:flex">
         <input type="range" id="sldBuffer" min="0" max="20" step="1" value="5" style="flex:1">
         <span id="outBuffer" style="min-width:42px;text-align:right">5s</span>
       </div>
@@ -131,6 +137,7 @@
   <div class="gallery-header">
     <h2>Captured Best Screenshots</h2>
     <div class="gallery-actions">
+      <button id="btnDownloadZip" class="btn btn-zip" title="Download all visible gallery thumbnails as a single .zip file">⬇ Download ZIP</button>
       <button id="btnClearUnpinned" class="btn btn-clear-service" title="Delete all unpinned shots from the gallery and output folder so you are ready for the next service (📌 Saved shots are kept)">🧹 Clear Top Shots (Keep Pinned)</button>
       <button id="btnClearPinned" class="btn btn-clear-pinned" title="Delete all 📌 Saved (pinned) shots from the gallery and output folder">🗑️ Delete Pinned Shots</button>
     </div>
@@ -141,12 +148,12 @@
 <div id="folderModal" class="modal hidden">
   <div class="modal-inner" style="max-width:640px">
     <div class="modal-header">
-      <h2>Choose Output Folder</h2>
+      <h2 id="folderModalTitle">Choose Output Folder</h2>
       <button id="btnFolderCloseX" class="btn-close">✕</button>
     </div>
 
     <div class="modal-section">
-      <div class="row">
+      <div class="file-pick-row">
         <input type="text" id="folderPath" placeholder="Type or paste a path, then press Enter">
         <button id="btnFolderGo" class="btn">Go</button>
       </div>
@@ -156,9 +163,31 @@
     </div>
 
     <div class="modal-footer">
-      <label class="chk"><input type="checkbox" id="folderCreate"> Create it if it doesn't exist</label>
+      <label class="chk" id="folderCreateWrap"><input type="checkbox" id="folderCreate"> Create it if it doesn't exist</label>
       <button id="btnFolderUse" class="btn btn-green">Use This Folder</button>
       <button id="btnFolderClose" class="btn">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<div id="videoBrowserModal" class="modal hidden">
+  <div class="modal-inner" style="max-width:680px">
+    <div class="modal-header">
+      <h2>📂 Browse Server Video Files</h2>
+      <button id="btnVidBrowseCloseX" class="btn-close">✕</button>
+    </div>
+    <div class="modal-section">
+      <div class="file-pick-row">
+        <input type="text" id="vidBrowsePath" placeholder="Server directory path">
+        <button id="btnVidBrowseGo" class="btn">Go</button>
+      </div>
+      <div id="vidBrowseShortcuts" class="folder-shortcuts"></div>
+      <div id="vidBrowseList" class="folder-list"></div>
+      <div id="vidBrowseNote" class="scan-status">Click a video file to select it.</div>
+    </div>
+    <div class="modal-footer">
+      <span class="spacer"></span>
+      <button id="btnVidBrowseClose" class="btn">Close</button>
     </div>
   </div>
 </div>
@@ -170,25 +199,38 @@
       <button id="btnModalCloseX" class="btn-close">✕</button>
     </div>
     
-    <p class="hint">Analyze an entire video recording offline with AI head pose, eye openness, expressions, and posture scoring to pick out the best thumbnails.</p>
+    <p class="hint">Analyze a recorded video with head pose, eye-gaze, speech-pause, expression, and cutout scoring to extract the best thumbnails.</p>
 
     <div class="modal-section">
       <h3>1. Select Video File</h3>
       <div class="file-pick-row">
-        <input type="text" id="scanVideoPath" placeholder="Server file path, e.g. /app/captures/recording.mp4 or C:\Videos\recording.mp4">
-        <button id="btnCheckPath" class="btn">Inspect Path</button>
+        <input type="text" id="scanVideoPath" placeholder="Server video path (or click Browse Server…)">
+        <button id="btnBrowseServerVideo" type="button" class="btn btn-slate">📂 Browse Server…</button>
+        <button id="btnCheckPath" type="button" class="btn">Inspect</button>
       </div>
       <div class="upload-row">
-        <span class="muted">Or upload from device:</span>
+        <span class="muted">Or upload from your computer:</span>
         <input type="file" id="videoFileInput" accept="video/*">
-        <button id="btnUploadVideo" class="btn btn-purple">⬆ Upload & Scan</button>
+        <button id="btnUploadVideo" type="button" class="btn btn-purple">⬆ Upload Video</button>
+      </div>
+      <div id="uploadProgWrap" class="upload-progress hidden">
+        <div class="bar"><div id="uploadProgBar" class="bar-fill"></div></div>
+        <div id="uploadProgText" class="muted" style="font-size:11px;margin-top:4px">Uploading…</div>
       </div>
       <div id="scanVideoMeta" class="meta-banner hidden"></div>
     </div>
 
     <div class="modal-section">
-      <h3>2. Scan Configuration</h3>
+      <h3>2. Scan Configuration &amp; Time Trim</h3>
       <div class="scan-grid">
+        <div class="scan-field">
+          <label for="scanStartTime">Start Time (Skip Worship / Intro)</label>
+          <input type="text" id="scanStartTime" class="scan-text-input" placeholder="00:00 (e.g. 22:30 or 1:05:00)">
+        </div>
+        <div class="scan-field">
+          <label for="scanEndTime">End Time (Optional Trim)</label>
+          <input type="text" id="scanEndTime" class="scan-text-input" placeholder="End of video (e.g. 58:00)">
+        </div>
         <div class="scan-field">
           <label for="scanTopN">Top Thumbnails to Pick</label>
           <input type="number" id="scanTopN" min="1" max="50" value="5">
@@ -215,15 +257,16 @@
     </div>
 
     <div class="modal-section">
-      <h3>3. Output Folder</h3>
-      <div class="row">
-        <code id="scanOutputDir" class="path">—</code>
-        <button id="btnScanPickFolder" class="btn">Change…</button>
+      <h3>3. Scan Output Folder</h3>
+      <div class="file-pick-row" style="align-items:center;margin-bottom:0">
+        <code id="scanOutputDir" class="path" style="flex:1">—</code>
+        <button id="btnScanPickFolder" type="button" class="btn">Change…</button>
+        <button id="btnScanResetFolder" type="button" class="btn btn-slate hidden">Use Live Folder</button>
       </div>
     </div>
 
     <div class="modal-section">
-      <h3>4. Scanning Progress & Live Preview</h3>
+      <h3>4. Scanning Progress &amp; Live Preview</h3>
       <div class="bar"><div id="scanProgBar" class="bar-fill"></div></div>
       <div id="scanStatusText" class="scan-status">Ready to scan.</div>
       
@@ -272,6 +315,7 @@
       <div class="lb-feedback-actions">
         <label class="chk lb-remove-chk"><input type="checkbox" id="lbRemoveBad" checked> Delete photo when marking 👎 Bad</label>
         <span class="spacer"></span>
+        <button type="button" id="lbBtnDownload" class="btn btn-zip">⬇ Download</button>
         <button type="button" id="lbBtnPin" class="btn btn-pin-lg">📌 Keep</button>
         <button type="button" id="lbBtnFav" class="btn btn-fav-lg">⭐ Best Shot</button>
         <button type="button" id="lbBtnBad" class="btn btn-rej-lg">👎 Bad Shot — Teach AI</button>
@@ -285,7 +329,7 @@
 
 
 <div id="cameraModal" class="modal hidden">
-  <div class="modal-inner" style="max-width:560px">
+  <div class="modal-inner" style="max-width:580px">
     <div class="modal-header">
       <h2>Connect to Camera</h2>
       <button id="btnCamCloseX" class="btn-close">✕</button>
@@ -331,19 +375,31 @@
       <div id="camFileFields" class="hidden">
         <div class="cam-grid">
           <label for="camFile">File path</label>
-          <input type="text" id="camFile" placeholder="/app/captures/service.mp4">
+          <div class="file-pick-row" style="margin-bottom:0">
+            <input type="text" id="camFile" placeholder="/videos/service.mp4">
+            <button id="btnCamBrowseFile" type="button" class="btn btn-slate">📂 Browse…</button>
+          </div>
         </div>
-        <p class="cam-note">As the server sees it, not as your own machine does.</p>
+        <p class="cam-note">Loops a video file stored on the server as a simulated live feed.</p>
       </div>
+
+      <details class="quick-url-details">
+        <summary>Advanced: Connect raw stream URL directly</summary>
+        <div class="file-pick-row" style="margin-top:8px;margin-bottom:0">
+          <input id="src" type="text" placeholder="rtsp://user:pass@host:554/stream">
+          <button id="btnSource" type="button" class="btn">Connect URL</button>
+        </div>
+      </details>
 
       <div id="camResult" class="cam-result hidden"></div>
     </div>
     <div class="modal-footer">
       <span id="camActive" class="muted"></span>
       <span class="spacer"></span>
-      <button id="btnCamTest" class="btn">Test</button>
-      <button id="btnCamConnect" class="btn btn-green">Connect</button>
-      <button id="btnCamClose" class="btn">Cancel</button>
+      <button id="btnCamForget" type="button" class="btn btn-danger-outline" title="Remove saved camera settings and revert to environment default">Forget Saved</button>
+      <button id="btnCamTest" type="button" class="btn">Test</button>
+      <button id="btnCamConnect" type="button" class="btn btn-green">Connect</button>
+      <button id="btnCamClose" type="button" class="btn">Cancel</button>
     </div>
   </div>
 </div>

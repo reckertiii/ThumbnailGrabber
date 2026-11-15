@@ -1,327 +1,113 @@
 # Installing on TrueNAS SCALE
 
-Deploys the web UI as a container on TrueNAS, using the Ollama app already running on
-the same box for the AI judge. The desktop app is not part of this — the container
-ships without Qt.
+Deploys Thumbnail Grabber as a 24/7 container on TrueNAS SCALE, pairing with the TrueNAS Ollama app for local vision AI judging and exposing captured PNGs over SMB ( plus one-click `.zip` downloads directly in the browser).
 
-Everything below assumes the NAS is at `192.168.32.104`. Substitute your own.
+Everything below assumes the NAS is at `192.168.32.104` with ZFS pool `Main` (`/mnt/Main`). Substitute your own IP and pool name.
 
 ---
 
-## 1. Before you start
+## 1. Before You Start
 
 You need:
 
 - **TrueNAS SCALE** with the Apps service running.
-- **The Ollama app**, with a vision model pulled. From its shell:
+- **The Ollama app** (optional, for local AI Judge), with a vision model pulled from its shell:
   ```bash
   ollama pull qwen3-vl:30b
   ```
-  That is a 20 GB download and needs roughly 20 GB of RAM to run. `qwen3-vl:4b`
-  (3.3 GB) works on a smaller box and judges less well.
-- **The camera's address and streaming credentials.** You enter these in the app, not
-  here — see §4. You do not need to know the RTSP path; the app finds it.
-
-  What does matter is that the NAS can reach the camera at all, since the two are
-  often on different VLANs. Check from a TrueNAS shell before deploying:
+  `qwen3-vl:30b` (MoE, ~20 GB RAM) runs fast on CPU with strong judgment; `qwen3-vl:4b` (~4 GB RAM) works well on smaller boxes.
+- **Network reachability to your PTZ/RTSP camera.** Verify from a TrueNAS shell (especially if cameras sit on an AV VLAN):
   ```bash
   curl -v telnet://<camera-ip>:554
   ```
-- **Note Ollama's port.** The catalog app usually remaps it to something in the 30000s
-  rather than 11434. Confirm with:
+- **Confirm Ollama's node port** (usually in the `30000`s on TrueNAS):
   ```bash
   curl http://192.168.32.104:30068/api/tags
   ```
-  It should list `qwen3-vl:30b`.
 
 ---
 
-## 2. Create datasets
+## 2. Create Datasets
 
-Two persistent locations are needed. Under **Datasets**, create:
+Create persistent datasets under your pool (for example `/mnt/Main/apps`):
 
-| Dataset | Holds | Notes |
+| Path | Holds | Notes |
 |---|---|---|
-| `captures` | Saved screenshots and subject crops | Grows over time; put it where there is room |
-| `tg-models` | Your ⭐/👎 ratings | Small. **Not** the ML weights — those are baked into the image |
-
-The ML model weights (~17 MB) live at `/opt/tg-models` inside the image, deliberately
-*not* on a mounted path. Mounting over them would hide them and force a re-download on
-every start, which fails outright on a box with no outbound internet.
+| `/mnt/Main/apps/capture` (or campus shares) | Saved full-resolution PNG screenshots | Share over SMB or download via `.zip` in the Web UI |
+| `/mnt/Main/apps/tg-models` | Saved camera credentials (`camera.json`), UI settings, per-folder gallery/pin manifests, and ⭐/👎 ML ratings | Small, survives every container update. (**Not** the ~17 MB MediaPipe weights — those are pre-baked at `/opt/tg-models` inside the image) |
 
 ---
 
-## 3. Deploy the container
+## 3. Deploy the Container
 
-**Apps → Discover Apps → Custom App.**
+Use **[deploy/truenas-compose.yml](deploy/truenas-compose.yml)** via **Apps → Discover Apps → Custom App → Install via YAML**, or configure the fields directly:
 
-**Image**
+- **Image**: `ghcr.io/reckertiii/thumbnailgrabber:latest`
+- **Container Port**: `8000` → **Host Port**: `9080` (TrueNAS requires `>= 9000`)
+- **Bind Mounts** (mount each ZFS dataset at the **identical path** inside the container so paths match in the Web UI, TrueNAS, and SMB):
+  - `/mnt/Main/apps:/mnt/Main/apps`
+  - Add any additional campus/media datasets both under `volumes:` and in `TG_OUTPUT_ROOTS` / `TG_VIDEO_ROOTS`.
 
-| Field | Value |
-|---|---|
-| Repository | `ghcr.io/reckertiii/thumbnailgrabber` |
-| Tag | `latest` |
-| Pull policy | `IfNotPresent` — see §8 if you make the repo private |
+> **Important:** ZFS paths are **case-sensitive** (`/mnt/Main` vs `/mnt/main`), and Linux bind mounts are **not recursive** — mount each child ZFS dataset individually rather than mounting `/mnt/Main` alone. Check dataset mountpoints with `zfs list -o name,mountpoint`.
 
-**Port**
+### Recommended Environment Variables
 
-| Field | Value |
-|---|---|
-| Container port | `8000` |
-| Node port | `9080` — TrueNAS requires 9000 or above; any free port in that range works |
-
-**Storage**
-
-| Host path | Mount path |
-|---|---|
-| `/mnt/main/apps` | `/mnt/main/apps` |
-
-Mounted at the same path inside the container as outside, so a folder is called the
-same thing in the picker, in the TrueNAS UI and over SMB — no translating paths in
-your head. Any folder inside it can be chosen without redeploying.
-
-**Host paths are case sensitive.** A pool shown as `Main` lives at `/mnt/Main`, and
-`/mnt/main` is a different path. Docker does not reject a host path that does not
-exist — it creates an empty directory and mounts that, so the app writes to the
-system drive while the pool stays empty and the shares show nothing. Copy the pool
-name exactly as `zfs list` prints it.
-
-**Mount datasets, not the pool root.** A bind mount is not recursive: mounting
-`/mnt/main` carries the `main` dataset alone, and every child dataset arrives as the
-bare empty directory its mountpoint sits on. The app then creates its folders inside
-that empty directory, the host has the real dataset mounted over the top, and the
-captures are invisible over SMB while the app insists they exist. List which paths
-are datasets before deciding what to mount:
-
-```bash
-zfs list -o name,mountpoint
-```
-
-Add a line per dataset you want reachable, and extend `TG_OUTPUT_ROOTS` to match.
-
-**Environment variables**
-
-| Name | Value | Why |
+| Name | Example Value | Purpose |
 |---|---|---|
-| `TG_STREAM_SOURCE` | *optional* | First-run default only. A camera connected in the UI is saved and overrides it, so you can leave this out and avoid putting the password in the app config |
-| `TG_OUTPUT_DIR` | `/mnt/main/apps/capture` | Where captures land. Must sit under the mount above |
-| `TG_DATA_DIR` | `/mnt/main/apps/tg-models` | Saved camera and your ⭐/👎 ratings. Under the mount, so they survive the app being recreated |
-| `TG_OUTPUT_ROOTS` | `/mnt/main/apps` | How far the folder picker may browse. Colon-separated for several |
-| `OLLAMA_HOST` | `http://192.168.32.104:30068` | The Ollama app. Use the NAS LAN IP, **not** `localhost` — inside a container that is the container itself |
-| `TG_AI_JUDGE_OLLAMA_MODEL` | `qwen3-vl:30b` | Must match what you pulled |
-| `TG_AI_JUDGE_OLLAMA_NUM_THREAD` | match the Ollama app's CPU limit | Ollama otherwise spawns one thread per host core, overruns its quota and is throttled — measured ~3× slower |
-| `TG_AI_JUDGE_ACTIVE_HOURS` | `2` | Judge stops and releases the model after this |
-| `TZ` | `America/New_York` | Capture filenames use local time |
+| `TG_STREAM_SOURCE` | `""` | Leave blank to configure the camera cleanly in the Web UI without storing passwords in YAML |
+| `TG_OUTPUT_DIR` | `/mnt/Main/apps/capture` | Default capture folder |
+| `TG_DATA_DIR` | `/mnt/Main/apps/tg-models` | Persists camera config, UI settings, confirmed folder, gallery pins, and ML ratings |
+| `TG_OUTPUT_ROOTS` | `/mnt/Main/apps:/mnt/Main/Grace Shared` | Colon-separated allowlist for the output folder picker |
+| `TG_VIDEO_ROOTS` | `/mnt/Main/apps:/mnt/Main/Grace Shared` | Colon-separated allowlist for the server video browser & scanner |
+| `TG_CAPTURE_MAX_MINUTES` | `120` | Automatically stops capture after 2 hours (adjustable in the top bar) so capture never runs all week if forgotten |
+| `TG_IDLE_STANDBY` | `1` | Drops CPU to ~0% and frees DVR RAM when not capturing and no browser is open |
+| `TG_WEB_PASSWORD` | `""` | Optional HTTP Basic Auth password if exposed beyond a trusted LAN |
+| `OLLAMA_HOST` | `http://192.168.32.104:30068` | NAS LAN IP + Ollama port (never `localhost`) |
+| `TG_AI_JUDGE_BACKEND` | `ollama` | Uses local Ollama vision model |
+| `TG_AI_JUDGE_OLLAMA_MODEL` | `qwen3-vl:30b` | Must match pulled Ollama tag |
+| `TG_AI_JUDGE_OLLAMA_NUM_THREAD` | `20` | Match your Ollama app's CPU core limit to avoid throttling |
+| `TG_AI_JUDGE_ACTIVE_HOURS` | `2` | Unloads the Ollama model when idle |
+| `TZ` | `America/New_York` | Local timestamps on saved filenames |
 
-Optional, worth setting if the port is reachable beyond your LAN — **the web UI has no
-authentication**:
+### Memory & CPU Resources
 
-| Name | Value |
-|---|---|
-| `TG_VIDEO_ROOTS` | `/app/captures` — limits which directories the video scanner may read |
-| `TG_OUTPUT_ROOTS` | `/app/captures` — limits where the output-folder picker may browse |
-
-**Resources.** Give it 4 GB RAM and 4 CPUs to start. The frame buffer alone defaults to
-about 0.9 GB — see §7.
-
-Deploy.
+Give the container **2–4 GB RAM** and **4+ CPUs**. Because the rolling DVR buffer stores frames as Q95 JPEG in RAM, a 5-second 1080p buffer at 30 FPS uses only ~130 MB (and releases to 0 MB automatically during Idle Standby).
 
 ---
 
-## 4. First run
+## 4. First Run
 
-Open `http://192.168.32.104:9080`.
+Open `http://192.168.32.104:9080`:
 
-That is the node port from §3. The container still listens on 8000 internally;
-only the outside port changed.
-
-Do these three things in order:
-
-1. **Connect the camera.** Press **📷 Camera…** and fill in the address, username
-   and password. Leave **Stream path** blank and press **Test** — the usual paths are
-   tried and the one that answers is filled in. Then press **Connect**.
-
-   The test says which part is wrong rather than just failing: a rejected password,
-   a path that does not exist, a closed port, an unreachable address. Connect refuses
-   outright if the camera says no, so a mistyped password cannot take down a stream
-   that was working.
-
-   The camera is saved to `/app/models/camera.json`, mode 0600, and used on every
-   restart — so it is entered once, not after every redeploy.
-2. **AI judge says `qwen3-vl:30b via local`** with minutes remaining. If it says "no
-   Ollama at…", the host or port is wrong.
-3. **Capture is refused until you confirm the output folder.** This is deliberate — on a
-   hosted instance the default is whatever the image set, and a whole service written to
-   the wrong place is only noticed afterwards.
-
-   Click **Output Folder → Change Folder…**, navigate to `/app/captures`, and press
-   **Use This Folder**. Choosing the folder already shown counts. Asked once per
-   container start.
-
-**Start Capture** is now available.
+1. **Connect the Camera**: Click **`📷 Camera…`**, enter the camera's IP, username, and password, leave **Stream path** blank, and press **Test** — the app probes standard RTSP paths (including Sony SRG `/media/video1`), fills in the working path, and saves credentials to `TG_DATA_DIR/camera.json` (`0600`) when you click **Connect**.
+2. **Confirm Output Folder**: Click **`Output Folder → Change Folder…`**, choose your target dataset folder (e.g. `/mnt/Main/apps/capture`), and click **Use This Folder**. Your confirmation is saved to `TG_DATA_DIR/ui_settings.json` so container updates won't force re-confirmation.
+3. **Choose Auto-Stop Window & Start Capture**: Pick your desired capture timer in the top bar (default `⏱ Max: 2h`) and click **`▶ Start Capture`**. This automatically wakes the AI Judge, preloads the Ollama model in the background, counts down on the Stop button, and stops + unloads automatically when time expires.
 
 ---
 
-## 5. Verify it works end to end
+## 5. Offline Video Scanning on TrueNAS
 
-With someone in frame, within a minute or two you should see in the app logs:
+To pull thumbnails from a recorded service MP4/MKV already on a NAS share:
 
-```
-[Capture] Score=82% Sharp=0.94(141) Cutout=0.94 Subject=71%h …
-[AIJudge] Kept (73% -> judge 90% = 82%, 31.2s): A strong frame with …
-```
-
-Each keeper writes two files to `/app/captures`: the full frame, and a `_subject.png`
-crop framed to the speaker, ready to drop into a background remover.
-
-If the gallery stays empty, the readout tells you why — the Score line ends with either
-`✅ capturing` or `⏸ holding: <reason>`.
+1. Click **`📼 Scan Video File`** → **`📂 Browse Server…`** to pick any video inside `TG_VIDEO_ROOTS` without typing Linux paths (or upload a file from your laptop with a live progress bar).
+2. Optionally enter **Start Time** (e.g. `22:00` to skip worship/announcements) and **End Time** (`58:00`).
+3. Optionally pick a separate **Scan Output Folder** without disturbing your live capture folder.
+4. Click **`▶ Start Scan`**.
 
 ---
 
-## 6. Reach the captures from Windows and Mac
+## 6. Accessing Captures (Browser `.zip` or SMB Share)
 
-The app writes to the NAS, because that is the only disk it has. To work on the
-PNGs you share that dataset and mount it on each machine, where it behaves like any
-other folder -- open a `_subject.png` straight from it into your background remover.
-
-A browser cannot be given a folder on your own machine to write into, which is why
-this is done at the filesystem level rather than in the app.
-
-### Share it on TrueNAS
-
-1. **Credentials -> Local Users.** Either note an existing user or add one for this.
-   In a shell, `id <username>` prints the uid and gid.
-2. **Set `user:` in the compose file to those numbers** (or the app's Run-As
-   settings, if you deployed through the GUI). The container otherwise runs as root
-   and writes files nobody else can delete -- you could open them from Windows but
-   not clear them out. Redeploy after changing it.
-3. **Datasets -> your `captures` dataset -> Edit Permissions.** Give that user
-   Full Control, and apply recursively if captures already exist.
-4. **Shares -> Windows (SMB) Shares -> Add.**
-
-   | Field | Value |
-   |---|---|
-   | Path | your `captures` dataset |
-   | Name | `tgcaptures` |
-   | Purpose | Default share parameters |
-
-   Save, and enable the SMB service when prompted.
-
-### Mount it on Windows
-
-File Explorer -> This PC -> **Map network drive**, pick a letter, and enter:
-
-```
-\\192.168.32.104\tgcaptures
-```
-
-Tick **Reconnect at sign-in** and **Connect using different credentials**, then give
-the NAS username and password. Or from a terminal:
-
-```
-net use Z: \\192.168.32.104\tgcaptures /persistent:yes
-```
-
-### Mount it on Mac
-
-Finder -> Go -> **Connect to Server** (Cmd-K):
-
-```
-smb://192.168.32.104/tgcaptures
-```
-
-Connect, authenticate, and tick **Remember this password in my keychain**. To have it
-mount at login, drag the mounted volume into **System Settings -> General -> Login
-Items**.
-
-### Notes
-
-- **Use the share, don't move it.** `TG_OUTPUT_DIR` must stay `/app/captures`. The
-  gallery, the star and thumbs-down ratings, and the AI judge all read back from
-  there, so pointing the app somewhere else to "save locally" breaks them.
-- **Copy, don't cut, during a service.** The app keeps its own list of what it has
-  saved; deleting files it is still ranking makes the gallery show gaps.
-- **Both platforms, one share.** SMB is native to Windows and macOS, so the same
-  share serves every machine with no per-machine browser setup.
+- **Directly in Browser**: Click **`⬇`** on any gallery card to download that PNG, or **`⬇ Download ZIP`** in the gallery header to download all top shots in one archive.
+- **Over SMB (Windows / macOS)**:
+  1. Set `user: "<uid>:<gid>"` in `truenas-compose.yml` matching your SMB dataset owner (`id <username>`) so Windows/macOS users can delete or rename files over SMB.
+  2. Share the dataset under **Shares → Windows (SMB) Shares** and mount `\\192.168.32.104\<share>` on Windows or `smb://192.168.32.104/<share>` on macOS.
 
 ---
 
-## 7. Tune the frame buffer
+## 7. Troubleshooting
 
-The buffer keeps recent frames so a chosen moment can be re-examined at full frame rate
-for its sharpest version. It is the largest allocation in the process, so size it
-against the readout rather than a guess:
-
-```
-Buffer: 150/150 frames · 890 MB held · 2.5s covered · camera 60.4fps
-```
-
-**Watch the "covered" figure.** The buffer is sized in frames, so a camera running
-faster than the configured rate gives less depth than asked for — a 60 fps camera with
-the buffer set for 30 holds half the seconds. The readout names the value to set, and
-raising it raises memory in proportion. Slider is in the UI; 0 turns the buffer off.
-
----
-
-## 8. After you make the repo private
-
-Repo visibility and **package** visibility are separate. A private repo publishes a
-private image, and TrueNAS then needs a token to pull it.
-
-Easiest fix: **GitHub → your profile → Packages → `thumbnailgrabber` → Package settings
-→ change visibility to public.** Source stays private, pulls keep working, no token.
-
-Alternatives: set the app's pull policy to `IfNotPresent` so it never re-pulls, or add a
-GitHub personal access token as a registry credential in TrueNAS.
-
----
-
-## 9. If something is wrong
-
-**Stream says Disconnected.** Press **📷 Camera…** and then **Test**. It
-reports the actual cause — rejected credentials, wrong stream path, closed port,
-unreachable address — instead of a generic failure.
-
-If it reports the address as unreachable, confirm it from a TrueNAS shell rather than
-your desktop, since camera and NAS are frequently on different VLANs:
-```bash
-curl -v telnet://<camera-ip>:554
-```
-
-**The camera is forgotten after a restart.** It is saved to `/app/models/camera.json`,
-so this means that mount is missing or not writable. Check the app runs as the user
-that owns the dataset (§6) and that `/app/models` is mounted.
-
-**Judge says "no Ollama at…".** Check the port — the catalog app usually remaps 11434:
-```bash
-curl http://192.168.32.104:30068/api/tags
-```
-
-**Judge says "up but 'qwen3-vl:30b' is not pulled".** Exactly what it says; pull it in
-the Ollama app's shell.
-
-**Reviews take minutes.** Almost always `TG_AI_JUDGE_OLLAMA_NUM_THREAD` not matching the
-Ollama app's CPU limit. Expect roughly 30 s per review on 20 cores.
-
-**Judge says "asleep — 2.0h window elapsed".** Working as designed; it released the
-model to free the RAM. Press **Wake** in the UI, or restart the app.
-
-**Nothing captures though the score looks high.** Read the Score line's `⏸ holding:`
-reason. Most often the output folder has not been confirmed since the last restart.
-
-**The UI looks stale after an update.** It shouldn't — the server sends `no-cache` — but
-a hard reload (Ctrl-Shift-R) settles it.
-
----
-
-## 10. Updating
-
-```bash
-docker pull ghcr.io/reckertiii/thumbnailgrabber:latest
-```
-then restart the app. Captures and ratings survive — both are on mounted datasets.
-
-Note that ratings are versioned against the scoring metrics. If an update changes what a
-feature means, the old ratings are discarded on load with a message, because mixing them
-would quietly skew every score. You then re-rate a dozen or so captures.
+- **`Camera Standby (Power off)`**: Normal when your PTZ camera or PoE switch is powered off between services! The server quietly checks TCP port 554 every 15 seconds and reconnects automatically as soon as the camera powers on.
+- **`0 fps · 💤 Idle Standby`**: Normal when capture is stopped and no browser had the feed open — waking happens automatically within milliseconds of viewing or starting capture.
+- **Output Folder Warning ("not on a mounted volume")**: Means the chosen path is inside the container's ephemeral filesystem rather than a mounted ZFS dataset (often caused by `/mnt/main` vs `/mnt/Main` casing or mounting a parent pool instead of the child dataset).
+- **Reviews take several minutes**: Set `TG_AI_JUDGE_OLLAMA_NUM_THREAD` to match the CPU limit configured on your TrueNAS Ollama app.
